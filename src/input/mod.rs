@@ -77,6 +77,20 @@ impl KeyEvent {
             0x2E => "Delete".into(),
             0x5B => "Super_L".into(),
             0x5C => "Super_R".into(),
+            // OEM punctuation keys (niri/XKB-ish names): these are
+            // bindable ("Slash", "Minus", ...) — without the mapping
+            // they'd come out as "VK_BF" and never match a combo.
+            0xBA => "Semicolon".into(),
+            0xBB => "Equal".into(),
+            0xBC => "Comma".into(),
+            0xBD => "Minus".into(),
+            0xBE => "Period".into(),
+            0xBF => "Slash".into(),
+            0xC0 => "Grave".into(),
+            0xDB => "BracketLeft".into(),
+            0xDC => "Backslash".into(),
+            0xDD => "BracketRight".into(),
+            0xDE => "Quote".into(),
             0x60..=0x69 => format!("KP_{}", vk - 0x60),
             0x6A => "KP_Multiply".into(),
             0x6B => "KP_Add".into(),
@@ -408,6 +422,18 @@ mod tests {
         assert_eq!(KeyEvent::key_name(0x70), "F1");
         assert_eq!(KeyEvent::key_name(0x20), "space");
         assert_eq!(KeyEvent::key_name(0x31), "1");
+        // OEM punctuation must map to names the config can bind —
+        // the default Mod+Shift+Slash (toggle-overview) depends on it.
+        assert_eq!(KeyEvent::key_name(0xBF), "Slash");
+        assert_eq!(KeyEvent::key_name(0xBD), "Minus");
+        assert_eq!(KeyEvent::key_name(0xBB), "Equal");
+        // ... and the resulting combos must hit the default binds.
+        let binds = crate::config::Config::default().binds;
+        let slash = ev(0xBF, true, true, false, true);
+        assert_eq!(
+            action_for(&binds, &slash),
+            Some(crate::config::Action::ToggleOverview)
+        );
     }
 
     #[test]
