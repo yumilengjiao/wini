@@ -10,9 +10,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, RegisterClassW,
-    SetTimer, SetWindowLongPtrW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, GWLP_USERDATA,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, RegisterClassW, SetTimer,
+    SetWindowLongPtrW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, GWLP_USERDATA,
 };
 
 use crate::input::{self, KeyEvent, MouseEvent};
@@ -142,9 +141,13 @@ impl MessageWindow {
             let _ = RegisterClassW(&wc);
 
             // Message-only child window: never visible, never activated,
-            // invisible to hits. HWND_MESSAGE = -3.
+            // invisible to hits. HWND_MESSAGE = -3. Note: no exotic
+            // ex-styles — WS_EX_LAYERED makes message-only creation
+            // fail outright (Win32 error 1410), and transparency is
+            // meaningless for a window that never renders or gets
+            // hit-tested.
             let hwnd = CreateWindowExW(
-                WINDOW_EX_STYLE(WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0 | WS_EX_NOACTIVATE.0),
+                WINDOW_EX_STYLE(0),
                 class_name,
                 w!(""),
                 WINDOW_STYLE(0),
@@ -156,8 +159,16 @@ impl MessageWindow {
                 None,
                 Some(hinstance.into()),
                 None,
-            )
-            .ok()?;
+            );
+            if hwnd.is_err() {
+                let err = windows::Win32::Foundation::GetLastError();
+                log::error!(
+                    "message window CreateWindowExW failed: Win32 error {}",
+                    err.0
+                );
+                return None;
+            }
+            let hwnd = hwnd.ok()?;
 
             Some(MessageWindow { hwnd })
         }
