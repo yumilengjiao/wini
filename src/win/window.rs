@@ -57,7 +57,11 @@ pub fn is_manageable(hwnd: HWND) -> bool {
         if !api::is_visible(hwnd) {
             return false;
         }
-        if GetWindow(hwnd, GW_OWNER).map_or(true, |o| o.0.is_null()) {
+        // Reject windows that have an owner (dialogs, popups): we only
+        // manage independent top-level windows. Note GetWindow(GW_OWNER)
+        // returns Ok(null-HWND) for ownerless windows — reject only when
+        // the owner is a real, non-null window.
+        if GetWindow(hwnd, GW_OWNER).is_ok_and(|o| !o.0.is_null()) {
             return false;
         }
         let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
