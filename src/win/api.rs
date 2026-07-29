@@ -141,3 +141,59 @@ pub fn close_handle(handle: HANDLE) {
         let _ = windows::Win32::Foundation::CloseHandle(handle);
     }
 }
+
+/// Force a background process to bring `hwnd` to the foreground.
+///
+/// Plain `SetForegroundWindow` is silently rejected by the OS when the
+/// caller isn't the foreground process (foreground lock). The classic
+/// workaround is to attach our input queue to the current foreground
+/// thread (and the target's) with `AttachThreadInput`, which lifts the
+/// lock, then bring the window up and detach again.
+/// Returns true when the window ended up in the foreground.
+pub fn force_set_foreground(hwnd: HWND) -> bool {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    };
+
+    unsafe {
+        if hwnd.0.is_null() || !IsWindow(Some(hwnd)).as_bool() {
+            return false;
+        }
+        let me = GetCurrentThreadId();
+        let fg = GetForegroundWindow();
+        let fg_thread = if fg.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, None)
+        };
+        let target_thread = GetWindowThreadProcessId(hwnd, None);
+
+        // Attach to the foreground thread (lifts the foreground lock) and
+        // to the target's thread so SetFocus reaches its queue.
+        let attach_fg = fg_thread != 0 && fg_thread != me;
+        let attach_target = target_thread != 0 && target_thread != me && target_thread != fg_thread;
+        if attach_fg {
+            let _ = AttachThreadInput(me, fg_thread, true);
+        }
+        if attach_target {
+            let _ = AttachThreadInput(me, target_thread, true);
+        }
+
+        let _ = BringWindowToTop(hwnd);
+        let ok = SetForegroundWindow(hwnd).as_bool();
+        if !ok {
+            // Fall back to at least moving the keyboard focus.
+            let _ = SetFocus(Some(hwnd));
+        }
+
+        if attach_target {
+            let _ = AttachThreadInput(me, target_thread, false);
+        }
+        if attach_fg {
+            let _ = AttachThreadInput(me, fg_thread, false);
+        }
+        ok
+    }
+}

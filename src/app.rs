@@ -179,6 +179,7 @@ impl AppState {
                 }
             }
             WinEvent::Foreground(hwnd) => {
+                log::debug!("foreground event -> {hwnd:?}");
                 if self.focused != Some(hwnd) {
                     self.focused = Some(hwnd);
                     let id = hwnd.0 as isize;
@@ -485,10 +486,7 @@ impl AppState {
             self.reflow();
             // Real focus follows too (Windows couples focus and
             // foreground; failing is harmless, e.g. foreground lock).
-            unsafe {
-                let _ =
-                    windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-            }
+            crate::win::api::force_set_foreground(hwnd);
         }
     }
 
@@ -1202,9 +1200,8 @@ impl AppState {
             return;
         };
         let hwnd = windows::Win32::Foundation::HWND(focused_id as *mut _);
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-        }
+        let ok = crate::win::api::force_set_foreground(hwnd);
+        log::debug!("sync_focus_to_os: force_set_foreground({focused_id}) -> {ok}");
     }
 
     /// Recompute geometry for every monitor's active workspace and push
