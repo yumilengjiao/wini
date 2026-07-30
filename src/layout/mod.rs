@@ -42,6 +42,12 @@ pub struct Tile {
     /// Height hint: proportional weight for auto height distribution.
     /// 1.0 = equal share. Fixed heights arrive later with sizing actions.
     pub height_weight: f64,
+    /// Minimum size the real window enforces (WM_GETMINMAXINFO),
+    /// physical px. The layout must never compute a smaller tile:
+    /// apps like Windows Terminal silently clamp SetWindowPos to
+    /// their minimum, which would make them overlap neighbors.
+    pub min_w: f64,
+    pub min_h: f64,
 }
 
 impl Tile {
@@ -49,6 +55,8 @@ impl Tile {
         Tile {
             id,
             height_weight: 1.0,
+            min_w: 0.0,
+            min_h: 0.0,
         }
     }
 }
@@ -149,6 +157,20 @@ impl Workspace {
             }
         }
         None
+    }
+
+    /// Record the minimum size the real window enforces
+    /// (WM_GETMINMAXINFO). Returns true when a tile's minimum grew,
+    /// i.e. the layout needs a reflow to honor it.
+    pub fn set_min_size(&mut self, id: WindowId, min_w: f64, min_h: f64) -> bool {
+        let Some((ci, ti)) = self.find(id) else {
+            return false;
+        };
+        let tile = &mut self.columns[ci].tiles[ti];
+        let grew = min_w > tile.min_w + 0.5 || min_h > tile.min_h + 0.5;
+        tile.min_w = tile.min_w.max(min_w);
+        tile.min_h = tile.min_h.max(min_h);
+        grew
     }
 
     /// Add a window as a new column at the end (niri's default placement)

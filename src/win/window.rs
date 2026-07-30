@@ -37,6 +37,11 @@ pub struct WindowInfo {
     pub class: String,
     pub exe: String,
     pub rect: RECT,
+    /// The window's minimum size (WM_GETMINMAXINFO ptMinTrackSize),
+    /// (0, 0) when it doesn't care. Apps like Windows Terminal silently
+    /// clamp SetWindowPos to this, so the layout must respect it or
+    /// columns visually overlap.
+    pub min_size: (f64, f64),
 }
 
 impl WindowInfo {
@@ -111,6 +116,7 @@ pub fn snapshot(hwnd: HWND) -> WindowInfo {
         class: api::window_class(hwnd),
         exe: api::window_exe(hwnd),
         rect,
+        min_size: api::min_track_size(hwnd),
     }
 }
 

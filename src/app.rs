@@ -262,6 +262,19 @@ impl AppState {
                     ml.active_workspace_mut().fullscreen_id = Some(id);
                 }
             }
+        // Honor the window's enforced minimum size: apps like Windows
+        // Terminal clamp SetWindowPos to their minimum track size, so
+        // tiles narrower than that would visually overlap neighbors.
+        let (min_w, min_h) = info.min_size;
+        if min_w > 0.0 || min_h > 0.0 {
+            for ml in self.layout.monitors.iter_mut() {
+                for ws in ml.workspaces.iter_mut() {
+                    if ws.set_min_size(id, min_w, min_h) {
+                        log::debug!("window {id} enforces min size {min_w}x{min_h}");
+                    }
+                }
+            }
+        }
         log::debug!(
             "layout: window {id} -> monitor {device}, column {}",
             self.layout
@@ -1299,6 +1312,7 @@ impl AppState {
             }
         }
         for (id, x, y, w, h) in targets {
+            log::debug!("reflow target: {id} -> ({x:.0}, {y:.0}, {w:.0}x{h:.0})");
             self.animator.set_target(id, x, y, w, h);
         }
         // The fullscreen window must cover its tile siblings.
@@ -1314,11 +1328,10 @@ impl AppState {
     }
 
     /// Advance all animations one frame and push geometry to windows.
-    /// Called from the timer tick on the main thread.
+    /// Called from the timer tick on the main thread. Never early-
+    /// returns: at-rest rects whose target changed still owe their
+    /// final frame (see `Animator::tick`).
     fn tick_animations(&mut self) {
-        if !self.animator.is_animating() {
-            return;
-        }
         for (id, x, y, w, h) in self.animator.tick() {
             let rect = crate::layout::geometry::TileRect { id, x, y, w, h };
             placement::apply_geometry(&[rect]);

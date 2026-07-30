@@ -142,6 +142,37 @@ pub fn close_handle(handle: HANDLE) {
     }
 }
 
+/// The window's minimum track size (WM_GETMINMAXINFO), in physical
+/// pixels. Apps that enforce a minimum size (e.g. Windows Terminal)
+/// silently clamp SetWindowPos to it — the layout must respect that
+/// or columns visually overlap their neighbors. Returns (0, 0) when
+/// the window doesn't answer (default/none).
+pub fn min_track_size(hwnd: HWND) -> (f64, f64) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SendMessageTimeoutW, MINMAXINFO, SMTO_ABORTIFHUNG, WM_GETMINMAXINFO,
+    };
+    let mut mmi = MINMAXINFO::default();
+    let res = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_GETMINMAXINFO,
+            WPARAM(0),
+            LPARAM(&mut mmi as *mut _ as isize),
+            SMTO_ABORTIFHUNG,
+            100,
+            None,
+        )
+    };
+    if res.0 != 0 {
+        (
+            mmi.ptMinTrackSize.x.max(0) as f64,
+            mmi.ptMinTrackSize.y.max(0) as f64,
+        )
+    } else {
+        (0.0, 0.0)
+    }
+}
+
 /// Force a background process to bring `hwnd` to the foreground.
 ///
 /// Plain `SetForegroundWindow` is silently rejected by the OS when the

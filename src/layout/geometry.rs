@@ -82,10 +82,20 @@ pub fn column_widths(ws: &Workspace, params: &LayoutParams, view_width: f64) -> 
     ws.columns
         .iter()
         .map(|c| {
-            if c.is_full_width {
-                view_width
+            // Never narrower than the largest minimum of the column's
+            // windows: apps clamp SetWindowPos to their minimum track
+            // size, which would visually overlap the next column.
+            let min_w = c.tiles.iter().map(|t| t.min_w).fold(0.0, f64::max);
+            if c.is_maximized {
+                // A maximized column occupies a full-work-area slot in
+                // scroll space (content area + both edge paddings), so
+                // the view can scroll to and away from it like any
+                // other column (niri semantics).
+                (view_width + params.edge_padding * 2.0).max(min_w)
+            } else if c.is_full_width {
+                view_width.max(min_w)
             } else {
-                resolve_width(c.width, params, view_width)
+                resolve_width(c.width, params, view_width).max(min_w)
             }
         })
         .collect()
@@ -241,8 +251,11 @@ pub fn tile_heights(ws: &Workspace, ci: usize, params: &LayoutParams, area_h: f6
             used += h;
             h
         };
-        out.push((y, share.max(1.0)));
-        y += share + params.gaps;
+        // Respect the window's enforced minimum height; advance by the
+        // clamped height so tiles never stack on top of each other.
+        let h = share.max(1.0).max(tile.min_h);
+        out.push((y, h));
+        y += h + params.gaps;
     }
     out
 }
@@ -295,23 +308,27 @@ pub fn compute_workspace_geometry(
     for (ci, col) in ws.columns.iter().enumerate() {
         let (col_x_off, col_w, col_h, col_pad) = if col.is_maximized {
             // Maximized column: the whole work area, no padding/gaps.
-            (0.0f64, aw, ah, 0.0f64)
+            // It keeps its scroll-space position — focusing another
+                       // column scrolls it out of view instead of pinning it
+            // over the viewport.
+            (xs[ci] - vp, aw, ah, 0.0f64)
         } else {
             (xs[ci] - vp, widths[ci], view_height, 0.0)
         };
         let screen_x = if col.is_maximized {
-            ax
+            ax + col_x_off
         } else {
             ax + params.edge_padding + col_x_off
         };
         let base_y = if col.is_maximized { ay } else { ay + params.edge_padding };
         let heights = if col.is_maximized {
+            // Only the first tile is visible; extra tiles render below
+            // the monitor like niri (each maximized tile is full-size).
             vec![(0.0, col_h)]
         } else {
             tile_heights(ws, ci, params, col_h)
         };
-        for (ti, &(y, h)) in heights.iter().enumerate() {
-            let tile = &col.tiles[ti];
+        for (tile, &(y, h)) in col.tiles.iter().zip(heights.iter()) {
             out.push(TileRect {
                 id: tile.id,
                 x: (screen_x + col_pad).round() as i32,
@@ -532,6 +549,53 @@ mod tests {
         assert_eq!(rects.len(), 1);
         // Full monitor rect, no padding.
         assert_eq!((rects[0].x, rects[0].y, rects[0].w, rects[0].h), (0, 0, W as i32, H as i32));
+    }
+
+    #[test]
+    fn min_size_widens_column() {
+        let mut ws = Workspace::new();
+        ws.add_window(1);
+        ws.add_window(2);
+        assert!(ws.set_min_size(2, 500.0, 68.0));
+        let p = params();
+        let view_w = W - 16.0;
+        let widths = column_widths(&ws, &p, view_w);
+        // Column 2 widened to the window's enforced minimum; column 1
+        // keeps its proportion width.
+        assert_eq!(widths[1], 500.0);
+        assert_eq!(widths[0], 246.0);
+        // Heights honor the minimum too.
+        let rects = compute_workspace_geometry(&ws, &p, area());
+        let second = rects.iter().find(|r| r.id == 2).unwrap();
+        assert!(second.h >= 68, "min height respected: {second:?}");
+    }
+
+    #[test]
+    fn maximized_column_scrolls_with_view() {
+        let mut ws = Workspace::new();
+        for i in 1..=3 {
+            ws.add_window(i);
+        }
+        // Column 3 (focused) maximized: covers the whole area.
+        assert!(ws.toggle_maximized());
+        let p = params();
+        let view_w = W - 16.0;
+        refresh_view_offset(&mut ws, &p, view_w, None);
+        let rects = compute_workspace_geometry(&ws, &p, area());
+        let max_rect = rects.iter().find(|r| r.id == 3).unwrap();
+        assert_eq!((max_rect.x, max_rect.y, max_rect.w, max_rect.h), (0, 0, W as i32, H as i32));
+
+        // Focus the first column: the view scrolls left and the
+        // maximized column must move with it (not stay pinned on top
+        // of the viewport).
+        ws.focus_column(DirH::Left);
+        ws.focus_column(DirH::Left);
+        refresh_view_offset(&mut ws, &p, view_w, None);
+        let rects = compute_workspace_geometry(&ws, &p, area());
+        let max_rect = rects.iter().find(|r| r.id == 3).unwrap();
+        assert!(max_rect.x > 0, "maximized column scrolled: {max_rect:?}");
+        let first = rects.iter().find(|r| r.id == 1).unwrap();
+        assert!(first.x >= 0 && first.x + first.w <= W as i32, "first column visible: {first:?}");
     }
 
     #[test]

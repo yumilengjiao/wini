@@ -129,6 +129,11 @@ pub struct AnimatedRect {
     pub y: Val,
     pub w: Val,
     pub h: Val,
+    /// False when the rect's target changed but the final (at-rest)
+    /// geometry has not been pushed to the window yet. Guarantees
+    /// every `set_target` results in at least one `SetWindowPos`, even
+    /// when the animation snaps or finishes between ticks.
+    at_rest_pushed: bool,
 }
 
 impl AnimatedRect {
@@ -138,6 +143,7 @@ impl AnimatedRect {
             y: Val::to(y, params),
             w: Val::to(w, params),
             h: Val::to(h, params),
+            at_rest_pushed: false,
         }
     }
 
@@ -146,6 +152,7 @@ impl AnimatedRect {
         self.y.retarget(y);
         self.w.retarget(w);
         self.h.retarget(h);
+        self.at_rest_pushed = false;
     }
 
     pub fn finished(&self) -> bool {
@@ -207,22 +214,30 @@ impl Animator {
         self.params = params;
     }
 
+    #[allow(dead_code)] // kept as API; tests and future callers use it
     pub fn is_animating(&self) -> bool {
         self.rects.values().any(|r| !r.finished())
     }
 
-    /// Sample all in-flight animations. Returns (id, rect) pairs that
-    /// still need a SetWindowPos this frame.
+    /// Sample all animations. Returns (id, rect) pairs that need a
+    /// `SetWindowPos` this frame: in-flight ones every frame, and
+    /// at-rest ones exactly once after their target changed (the final
+    /// frame — without it a window would stop one frame short of its
+    /// target, or not move at all when the change snapped).
     pub fn tick(&mut self) -> Vec<(isize, i32, i32, i32, i32)> {
         let mut out = Vec::new();
-        for (id, r) in &self.rects {
-            if !r.finished() {
+        for (id, r) in self.rects.iter_mut() {
+            if r.finished() {
+                if !r.at_rest_pushed {
+                    let (x, y, w, h) = r.value();
+                    out.push((*id, x, y, w, h));
+                    r.at_rest_pushed = true;
+                }
+            } else {
                 let (x, y, w, h) = r.value();
                 out.push((*id, x, y, w, h));
             }
         }
-        // Garbage-collect finished animations occasionally.
-        self.rects.retain(|_, r| !r.finished());
         out
     }
 
@@ -288,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn animator_ticks_and_gc() {
+    fn animator_ticks_and_final_frame() {
         let mut a = Animator::new(AnimParams {
             duration: Duration::from_millis(1),
             easing: Easing::Linear,
@@ -296,11 +311,16 @@ mod tests {
         a.set_target(1, 0.0, 0.0, 100.0, 100.0);
         assert!(a.is_animating());
         std::thread::sleep(Duration::from_millis(10));
+        // After finish: the final frame is still delivered once...
         let ticks = a.tick();
-        // After finish: no ticks, GC'd.
-        assert!(ticks.is_empty());
+        assert_eq!(ticks, vec![(1, 0, 0, 100, 100)]);
         assert!(!a.is_animating());
-        assert!(a.rects.is_empty());
+        // ...and only once.
+        assert!(a.tick().is_empty());
+        // A snapped retarget (target == current) still pushes once.
+        a.set_target(1, 0.0, 0.0, 100.0, 100.0);
+        assert_eq!(a.tick(), vec![(1, 0, 0, 100, 100)]);
+        assert!(a.tick().is_empty());
     }
 
     #[test]
