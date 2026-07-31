@@ -1,2 +1,6 @@
 /target
 niri
+# local session notes and scratch tools — never commit
+PROGRESS.md
+SESSION-STATUS.md
+repro.ps1
