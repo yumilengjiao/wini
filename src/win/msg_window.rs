@@ -21,6 +21,9 @@ use std::collections::HashMap;
 pub const WM_APP_KEY: u32 = 0x8000; // WM_APP
 /// Custom message: a mouse event forwarded from a hook.
 pub const WM_APP_MOUSE: u32 = 0x8001;
+/// Custom message: an animation frame tick from the high-resolution
+/// timer thread. `wparam` carries the timer id.
+pub const WM_APP_ANIM_FRAME: u32 = 0x8002;
 /// Animation frame timer id.
 pub const TIMER_ANIM: usize = 1;
 /// Config hot-reload poll timer id.
@@ -190,12 +193,44 @@ impl MessageWindow {
 
     /// Start a periodic timer whose handler runs on the main thread
     /// during message dispatch. `id` identifies it (TIMER_ANIM, ...).
+    /// Uses WM_TIMER: ~15.6ms granularity, delivered only when the
+    /// queue is idle — fine for slow polls (config), not for animation.
     pub fn start_timer(&self, id: usize, period_ms: u32, handler: impl Fn() + 'static) {
         // Safety: main thread only; wnd_proc runs on the main thread
         // during message dispatch.
         unsafe {
             TIMER_HANDLER.insert(id, Box::new(handler));
             let _ = SetTimer(Some(self.hwnd), id, period_ms, None);
+        }
+    }
+
+    /// Start a high-resolution periodic timer: a dedicated thread with
+    /// a CREATE_WAITABLE_TIMER_HIGH_RESOLUTION timer posts
+    /// WM_APP_ANIM_FRAME every period, and the handler runs on the
+    /// main thread during message dispatch like `start_timer`.
+    /// Posted messages are normal-priority (never starved by WinEvents
+    /// like WM_TIMER), and the high-res timer isn't quantized to the
+    /// ~15.6ms scheduler tick — this is the animation frame clock.
+    pub fn start_hires_timer(&self, id: usize, period_ms: u32, handler: impl Fn() + 'static) {
+        // Safety: main thread only; wnd_proc runs on the main thread
+        // during message dispatch.
+        unsafe {
+            TIMER_HANDLER.insert(id, Box::new(handler));
+        }
+        let hwnd = self.hwnd;
+        // HWND is not Send: pass the raw handle as an isize. The thread
+        // lives for the process lifetime; after the message window is
+        // destroyed, PostMessage simply fails harmlessly.
+        let target = hwnd.0 as isize;
+        let spawn = std::thread::Builder::new()
+            .name("anim-clock".into())
+            .spawn(move || anim_clock_thread(target, id, period_ms));
+        if spawn.is_err() {
+            // No threads: fall back to a plain timer.
+            // Safety: main thread only.
+            unsafe {
+                let _ = SetTimer(Some(hwnd), id, period_ms, None);
+            }
         }
     }
 
@@ -206,6 +241,69 @@ impl MessageWindow {
         // during message dispatch.
         unsafe {
             MOUSE_HANDLER.set(Box::new(handler));
+        }
+    }
+}
+
+/// Body of the high-resolution clock thread: post `WM_APP_ANIM_FRAME`
+/// to the message window every `period_ms`, as accurately as the OS
+/// allows. `target` is the message window's HWND address (HWND itself
+/// is not Send).
+fn anim_clock_thread(target: isize, id: usize, period_ms: u32) {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::Threading::{
+        CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+    let hwnd = HWND(target as *mut _);
+    let timer = (|| -> windows::core::Result<_> {
+        let t = unsafe {
+            CreateWaitableTimerExW(
+                None,
+                windows::core::PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                // TIMER_ALL_ACCESS
+                0x001F_0003,
+            )?
+        };
+        // Negative due time = relative, in 100ns units: fire almost
+        // immediately, then every period_ms.
+        let due: i64 = -10_000;
+        unsafe { SetWaitableTimer(t, &due, period_ms as i32, None, None, false)? };
+        Ok(t)
+    })();
+    let Ok(timer) = timer else {
+        // No high-resolution timers (pre Win10 1803): a steady sleep
+        // loop still keeps a far more regular cadence than coalesced
+        // WM_TIMER.
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(period_ms as u64));
+            unsafe {
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    WM_APP_ANIM_FRAME,
+                    WPARAM(id),
+                    LPARAM(0),
+                );
+            }
+        }
+    };
+    loop {
+        let r = unsafe { WaitForSingleObject(timer, u32::MAX) };
+        if r != WAIT_OBJECT_0 {
+            // Handle closed / error: stop ticking.
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(timer) };
+            return;
+        }
+        unsafe {
+            let _ = PostMessageW(
+                Some(hwnd),
+                WM_APP_ANIM_FRAME,
+                WPARAM(id),
+                LPARAM(0),
+            );
         }
     }
 }
@@ -245,6 +343,16 @@ extern "system" fn wnd_proc(
             if let Some(handler) = MOUSE_HANDLER.get() {
                 let ev = input::decode_mouse_message(wparam.0, lparam.0);
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(ev)));
+            }
+        }
+        return LRESULT(0);
+    }
+    if msg == WM_APP_ANIM_FRAME {
+        // Safety: reads the handler on the same (main) thread that set
+        // it, outside any mutation window.
+        unsafe {
+            if let Some(handler) = TIMER_HANDLER.get(wparam.0) {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(handler));
             }
         }
         return LRESULT(0);

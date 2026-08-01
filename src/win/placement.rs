@@ -7,9 +7,10 @@
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, HWND_TOP, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE, SW_SHOW, GWL_STYLE,
-    WINDOW_LONG_PTR_INDEX, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, HWND_TOP, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE, SW_SHOW,
+    GWL_STYLE, WINDOW_LONG_PTR_INDEX, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
+    WS_THICKFRAME,
 };
 
 use crate::layout::geometry::TileRect;
@@ -77,7 +78,10 @@ pub fn set_shown(hwnd: HWND, shown: bool) {
 }
 
 /// Move/resize windows to their computed tiles. Skips dead handles
-/// silently (a close race with WinEvents is normal).
+/// silently (a close race with WinEvents is normal). The move is
+/// async (`SWP_ASYNCWINDOWPOS`): without it, SetWindowPos blocks until
+/// the target window's own message loop services the move — one busy
+/// app (e.g. a terminal under load) stalls the whole animation frame.
 pub fn apply_geometry(rects: &[TileRect]) {
     for r in rects {
         let hwnd = HWND(r.id as *mut core::ffi::c_void);
@@ -92,7 +96,7 @@ pub fn apply_geometry(rects: &[TileRect]) {
                 r.y,
                 r.w,
                 r.h,
-                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
             )
         };
         if ok.is_err() {

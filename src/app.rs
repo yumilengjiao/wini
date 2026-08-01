@@ -1478,7 +1478,7 @@ impl App {
         // reload polls the file once a second.
         {
             let anim_state = Rc::clone(&state);
-            msg_window.start_timer(TIMER_ANIM, ANIM_TIMER_MS, move || {
+            msg_window.start_hires_timer(TIMER_ANIM, ANIM_TIMER_MS, move || {
                 anim_state.borrow_mut().tick_animations();
             });
             let cfg_state = Rc::clone(&state);
