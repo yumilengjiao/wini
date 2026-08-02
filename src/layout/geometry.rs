@@ -43,13 +43,20 @@ pub struct LayoutParams {
 
 impl Default for LayoutParams {
     fn default() -> Self {
-        // Niri defaults: gaps 8, default column width 25% of the view,
+        // Niri defaults: gaps 8, default column width half the view
+        // (niri's default config: default-column-width { proportion 0.5 }),
         // center focused column on overflow.
         LayoutParams {
             gaps: 8.0,
             edge_padding: 8.0,
-            default_column_width: ColumnWidth::Proportion(0.25),
-            preset_column_widths: Vec::new(),
+            default_column_width: ColumnWidth::Proportion(0.5),
+            // Niri's default presets (1/3, 1/2, 2/3 of the output) for
+            // switch-preset-column-width (Mod+R).
+            preset_column_widths: vec![
+                ColumnWidth::Proportion(0.33333),
+                ColumnWidth::Proportion(0.5),
+                ColumnWidth::Proportion(0.66667),
+            ],
             center_focused_column: CenterFocused::OnOverflow,
         }
     }

@@ -682,6 +682,9 @@ impl AppState {
                         None => changed = ws.cycle_column_width(&presets),
                     }
                 }
+                SwitchPresetColumnWidth => {
+                    changed = ws.cycle_column_width(&presets);
+                }
                 SetWindowHeight(spec) => {
                     if let Some(change) = SizeChange::parse(&spec) {
                         changed = ws.set_window_height(&change);

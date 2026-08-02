@@ -82,6 +82,9 @@ pub enum Action {
     ConsumeOrExpelWindowLeft,
     ConsumeOrExpelWindowRight,
     SetColumnWidth(String),
+    /// niri's switch-preset-column-width (Mod+R): cycle the focused
+    /// column through layout.preset-column-widths.
+    SwitchPresetColumnWidth,
     ToggleFullWidth,
     MaximizeColumn,
     ToggleWindowedFullscreen,
@@ -253,6 +256,8 @@ impl Default for Config {
                 bind("Mod+End", Action::FocusColumnLast),
                 bind("Mod+F", Action::MaximizeColumn),
                 bind("Mod+Shift+F", Action::ToggleWindowedFullscreen),
+                // Cycle preset column widths (niri: 1/3, 1/2, 2/3).
+                bind("Mod+R", Action::SwitchPresetColumnWidth),
                 bind("Mod+V", Action::ToggleWindowFloating),
                 bind("Mod+Q", Action::CloseWindow),
                 bind("Mod+Shift+Slash", Action::ToggleOverview),
@@ -657,6 +662,7 @@ fn parse_action(node: &KdlNode) -> Option<Action> {
         "consume-or-expel-window-left" => Action::ConsumeOrExpelWindowLeft,
         "consume-or-expel-window-right" => Action::ConsumeOrExpelWindowRight,
         "set-column-width" => Action::SetColumnWidth(arg.unwrap_or_default()),
+        "switch-preset-column-width" => Action::SwitchPresetColumnWidth,
         "set-window-height" => Action::SetWindowHeight(arg.unwrap_or_default()),
         "toggle-full-width" => Action::ToggleFullWidth,
         "maximize-column" => Action::MaximizeColumn,
