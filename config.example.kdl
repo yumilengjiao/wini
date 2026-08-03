@@ -41,10 +41,33 @@ layout {
 }
 
 animations {
-    window-movement { duration-ms 250; easing "ease-out-cubic"; }
-    window-open    { duration-ms 150; easing "ease-out-cubic"; }
-    view-offset    { duration-ms 250; easing "ease-out-expo"; }
+    // Uncomment to turn off all animations.
     // off
+
+    // Slow down all animations by this factor (values below 1 speed
+    // them up instead).
+    // slowdown 3.0
+
+    // Spring physics (the default for movement and resize): carries
+    // velocity through retargets for the niri feel.
+    window-movement {
+        spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
+    }
+
+    // Timed easing instead: duration-ms + curve.
+    view-offset {
+        duration-ms 100
+        curve "ease-out-expo"
+    }
+
+    // Custom cubic-bezier curve: curve "cubic-bezier" x1 y1 x2 y2.
+    window-open {
+        duration-ms 150
+        curve "cubic-bezier" 0.05 0.7 0.1 1.0
+    }
+
+    // Per-animation off: just this one lands instantly.
+    // window-close { off }
 }
 
 // Rules for newly opened windows; first match wins. `match` values

@@ -8,7 +8,7 @@ use std::rc::Rc;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, PostQuitMessage, PostThreadMessageW, TranslateMessage, MSG,
+    DispatchMessageW, GetMessageW, MSG, PostQuitMessage, PostThreadMessageW, TranslateMessage,
     WM_QUIT,
 };
 
@@ -19,7 +19,9 @@ use crate::layout::geometry::{self, LayoutParams};
 use crate::layout::{DirH, DirV, Edge, Layout, SizeChange};
 use crate::win::events::{EventHooks, WinEvent};
 use crate::win::monitor::{self, Monitor};
-use crate::win::msg_window::{MessageWindow, ANIM_TIMER_MS, CONFIG_TIMER_MS, TIMER_ANIM, TIMER_CONFIG};
+use crate::win::msg_window::{
+    ANIM_TIMER_MS, CONFIG_TIMER_MS, MessageWindow, TIMER_ANIM, TIMER_CONFIG,
+};
 use crate::win::placement;
 use crate::win::window::{WindowInfo, WindowRegistry};
 
@@ -121,9 +123,7 @@ impl AppState {
                     self.reflow();
                 }
             }
-            WinEvent::Hidden(hwnd)
-            | WinEvent::Cloaked(hwnd)
-            | WinEvent::MinimizeStarted(hwnd) => {
+            WinEvent::Hidden(hwnd) | WinEvent::Cloaked(hwnd) | WinEvent::MinimizeStarted(hwnd) => {
                 if let Some(info) = self.windows.remove(hwnd) {
                     log::info!("window hidden: \"{}\"", info.title);
                     let id = hwnd.0 as isize;
@@ -149,7 +149,10 @@ impl AppState {
             }
             WinEvent::MoveSizeStart(hwnd) => {
                 if self.windows.contains(hwnd) {
-                    log::debug!("user interaction started on window {id}", id = hwnd.0 as isize);
+                    log::debug!(
+                        "user interaction started on window {id}",
+                        id = hwnd.0 as isize
+                    );
                     self.interacting_window = Some(hwnd);
                     self.interact_start_rect = crate::win::api::window_rect(hwnd);
                     // The ring would lag behind the dragged window;
@@ -159,7 +162,10 @@ impl AppState {
             }
             WinEvent::MoveSizeEnd(hwnd) => {
                 if self.interacting_window == Some(hwnd) {
-                    log::debug!("user interaction ended on window {id}", id = hwnd.0 as isize);
+                    log::debug!(
+                        "user interaction ended on window {id}",
+                        id = hwnd.0 as isize
+                    );
                     self.interacting_window = None;
                     let id = hwnd.0 as isize;
                     if let Some(fs) = self.floating.get_mut(&id) {
@@ -214,26 +220,27 @@ impl AppState {
         // open-floating: keep the window at its current position,
         // outside the tiling grid.
         if rule.as_ref().is_some_and(|r| r.open_floating)
-            && let Some((x, y, w, h)) = crate::win::api::window_rect(hwnd) {
-                let ws_idx = self
-                    .layout
-                    .monitor(&device)
-                    .map(|m| m.active_workspace_idx)
-                    .unwrap_or(0);
-                self.floating.insert(
-                    id,
-                    FloatState {
-                        device,
-                        workspace_idx: ws_idx,
-                        x,
-                        y,
-                        w,
-                        h,
-                    },
-                );
-                log::debug!("window-rule: {id} opens floating");
-                return;
-            }
+            && let Some((x, y, w, h)) = crate::win::api::window_rect(hwnd)
+        {
+            let ws_idx = self
+                .layout
+                .monitor(&device)
+                .map(|m| m.active_workspace_idx)
+                .unwrap_or(0);
+            self.floating.insert(
+                id,
+                FloatState {
+                    device,
+                    workspace_idx: ws_idx,
+                    x,
+                    y,
+                    w,
+                    h,
+                },
+            );
+            log::debug!("window-rule: {id} opens floating");
+            return;
+        }
 
         match rule.as_ref().and_then(|r| r.open_workspace) {
             Some(n) => {
@@ -251,17 +258,17 @@ impl AppState {
         // open-maximized / open-fullscreen: flag the new column/window.
         if let Some(r) = rule
             && let Some(ml) = self.layout.monitor_mut(&device)
-                && let Some((ci, _)) = ml.active_workspace().find(id)
-            {
-                if r.open_maximized {
-                    let col = &mut ml.active_workspace_mut().columns[ci];
-                    col.is_maximized = true;
-                    col.is_full_width = true;
-                }
-                if r.open_fullscreen {
-                    ml.active_workspace_mut().fullscreen_id = Some(id);
-                }
+            && let Some((ci, _)) = ml.active_workspace().find(id)
+        {
+            if r.open_maximized {
+                let col = &mut ml.active_workspace_mut().columns[ci];
+                col.is_maximized = true;
+                col.is_full_width = true;
             }
+            if r.open_fullscreen {
+                ml.active_workspace_mut().fullscreen_id = Some(id);
+            }
+        }
         // Honor the window's enforced minimum size: apps like Windows
         // Terminal clamp SetWindowPos to their minimum track size, so
         // tiles narrower than that would visually overlap neighbors.
@@ -306,10 +313,7 @@ impl AppState {
     /// desktop is left as we found it.
     fn restore_all(&mut self) {
         let ids: Vec<isize> = self.original_rects.keys().copied().collect();
-        log::info!(
-            "exiting: restoring geometry of {} window(s)",
-            ids.len()
-        );
+        log::info!("exiting: restoring geometry of {} window(s)", ids.len());
         for id in ids {
             let hwnd = HWND(id as *mut _);
             if !crate::win::api::is_alive(hwnd) {
@@ -358,8 +362,7 @@ impl AppState {
     fn click_in_overview(&mut self, hwnd: HWND) -> bool {
         let id = hwnd.0 as isize;
         let in_overview = self.layout.monitors.iter().any(|m| {
-            m.active_workspace().is_overview
-                && m.workspace_of(id) == Some(m.active_workspace_idx)
+            m.active_workspace().is_overview && m.workspace_of(id) == Some(m.active_workspace_idx)
         });
         if !in_overview {
             return false;
@@ -524,15 +527,12 @@ impl AppState {
         }
         // Find the device of the focused window (fallback: monitor
         // under the cursor).
-        let focused_id = self
-            .focused
-            .map(|h| h.0 as isize)
-            .or_else(|| {
-                let cursor_mon = monitor::monitor_at_cursor(&self.monitors)?;
-                self.layout
-                    .monitor(&cursor_mon.device)
-                    .and_then(|m| m.active_workspace().focused_id())
-            });
+        let focused_id = self.focused.map(|h| h.0 as isize).or_else(|| {
+            let cursor_mon = monitor::monitor_at_cursor(&self.monitors)?;
+            self.layout
+                .monitor(&cursor_mon.device)
+                .and_then(|m| m.active_workspace().focused_id())
+        });
 
         let Some(id) = focused_id else { return };
 
@@ -611,15 +611,16 @@ impl AppState {
                     _ => {}
                 }
                 // Keep at least 100 px of the float on its monitor.
-                if touched
-                    && let Some(m) = self.monitors.iter().find(|m| m.device == fs.device) {
-                        fs.x = fs
-                            .x
-                            .clamp(m.work.left as f64 - fs.w + 100.0, m.work.right as f64 - 100.0);
-                        fs.y = fs
-                            .y
-                            .clamp(m.work.top as f64 - fs.h + 100.0, m.work.bottom as f64 - 100.0);
-                    }
+                if touched && let Some(m) = self.monitors.iter().find(|m| m.device == fs.device) {
+                    fs.x = fs.x.clamp(
+                        m.work.left as f64 - fs.w + 100.0,
+                        m.work.right as f64 - 100.0,
+                    );
+                    fs.y = fs.y.clamp(
+                        m.work.top as f64 - fs.h + 100.0,
+                        m.work.bottom as f64 - 100.0,
+                    );
+                }
             }
             if touched {
                 self.reflow();
@@ -784,12 +785,10 @@ impl AppState {
     /// ring, animation tuning, binds and the Mod key.
     fn apply_config(&mut self, cfg: Config) {
         let mod_changed = cfg.mod_key != self.config.mod_key;
-        // `animations { off; }` forces zero duration -> instant snaps.
-        let mut anim_params = cfg.animations.window_movement;
-        if !cfg.animations.enabled {
-            anim_params.duration = std::time::Duration::ZERO;
-        }
-        self.animator.set_params(anim_params);
+        self.animator.set_params(
+            cfg.animations.movement_params(),
+            cfg.animations.resize_params(),
+        );
         self.params = cfg.layout.clone();
         if mod_changed {
             input::set_mod_key(cfg.mod_key.clone());
@@ -874,8 +873,7 @@ impl AppState {
     fn on_display_change(&mut self) {
         log::info!("display topology changed; re-enumerating monitors");
         let new_monitors = monitor::enumerate();
-        let new_devices: Vec<String> =
-            new_monitors.iter().map(|m| m.device.clone()).collect();
+        let new_devices: Vec<String> = new_monitors.iter().map(|m| m.device.clone()).collect();
 
         let gone: Vec<String> = self
             .monitors
@@ -895,18 +893,12 @@ impl AppState {
                 }
                 match self.layout.monitors.first().map(|m| m.device.clone()) {
                     Some(target) => {
-                        log::info!(
-                            "rehoming {} window(s) from {device} to {target}",
-                            ids.len()
-                        );
+                        log::info!("rehoming {} window(s) from {device} to {target}", ids.len());
                         for id in ids {
                             self.layout.add_window(&target, id);
                         }
                     }
-                    None => log::warn!(
-                        "no monitor left; {} window(s) left in place",
-                        ids.len()
-                    ),
+                    None => log::warn!("no monitor left; {} window(s) left in place", ids.len()),
                 }
             }
         }
@@ -1165,9 +1157,9 @@ impl AppState {
     /// Run a command (niri spawn). The first token is the executable,
     /// the rest is passed as parameters.
     fn spawn(&self, cmd: &str) {
-        use windows::core::HSTRING;
         use windows::Win32::UI::Shell::ShellExecuteW;
         use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        use windows::core::HSTRING;
         let (app, args) = match cmd.split_once(' ') {
             Some((a, rest)) => (a, Some(rest.to_string())),
             None => (cmd, None),
@@ -1178,16 +1170,7 @@ impl AppState {
             Some(a) => windows::core::PCWSTR(a.as_ptr()),
             None => windows::core::PCWSTR::null(),
         };
-        let r = unsafe {
-            ShellExecuteW(
-                None,
-                None,
-                &app,
-                params,
-                None,
-                SW_SHOWNORMAL,
-            )
-        };
+        let r = unsafe { ShellExecuteW(None, None, &app, params, None, SW_SHOWNORMAL) };
         // ShellExecuteW returns a small value (<= 32) on failure.
         if r.0 as usize <= 32 {
             log::warn!("spawn {cmd:?} failed (code {})", r.0 as isize);
@@ -1206,9 +1189,7 @@ impl AppState {
                     .iter()
                     .find_map(|m| m.workspace_of(id).map(|_| m.device.clone()))
             })
-            .or_else(|| {
-                monitor::monitor_at_cursor(&self.monitors).map(|m| m.device.clone())
-            })
+            .or_else(|| monitor::monitor_at_cursor(&self.monitors).map(|m| m.device.clone()))
         else {
             return;
         };
@@ -1384,12 +1365,14 @@ impl App {
             .and_then(|m| m.modified())
             .ok();
 
-        // Animation tuning: `animations { off; }` forces zero duration,
-        // which makes every retarget land instantly.
-        let mut anim_params = cfg.animations.window_movement;
-        if !cfg.animations.enabled {
-            anim_params.duration = std::time::Duration::ZERO;
-        }
+        // Animation tuning: `animations { off; }` maps every kind to
+        // the instant easing, which makes every retarget land
+        // immediately. Movement and resize get their own params
+        // (niri tunes them separately).
+        let animator = Animator::new(
+            cfg.animations.movement_params(),
+            cfg.animations.resize_params(),
+        );
 
         let overlay = crate::win::overlay::OverlayWindow::new();
         if overlay.is_none() {
@@ -1416,7 +1399,7 @@ impl App {
             original_rects: std::collections::HashMap::new(),
             overlay,
             focus_border,
-            animator: Animator::new(anim_params),
+            animator,
         }));
 
         // Adopt existing windows through the same window-rule path as
@@ -1447,8 +1430,7 @@ impl App {
         // and dispatch forwarded events to bound actions.
         {
             let mod_key = state.borrow().config.mod_key.clone();
-            input::install(mod_key, msg_window.hwnd())
-                .map_err(AppError::from)?;
+            input::install(mod_key, msg_window.hwnd()).map_err(AppError::from)?;
         }
         // Mouse: wheel binds + optional focus-follows-mouse.
         {

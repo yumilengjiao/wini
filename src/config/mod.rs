@@ -18,9 +18,15 @@
 //! }
 //!
 //! animations {
-//!     window-movement { duration-ms 250; easing "ease-out-cubic"; }
-//!     view-offset    { duration-ms 250; easing "ease-out-expo"; }
 //!     // off
+//!     // slowdown 3.0
+//!     window-movement {
+//!         spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
+//!     }
+//!     view-offset {
+//!         duration-ms 100
+//!         curve "ease-out-expo"
+//!     }
 //! }
 //!
 //! binds {
@@ -44,9 +50,9 @@
 
 use std::path::PathBuf;
 
-use crate::anim::{AnimParams, Easing};
-use crate::layout::geometry::{CenterFocused, LayoutParams};
+use crate::anim::{AnimKind, AnimParams, Curve, SpringParams};
 use crate::layout::ColumnWidth;
+use crate::layout::geometry::{CenterFocused, LayoutParams};
 
 use kdl::{KdlDocument, KdlNode};
 
@@ -110,30 +116,87 @@ pub enum ModKey {
 }
 
 /// Animation tuning, per animation kind (niri-style `animations` node).
+/// Kinds we can't drive (window-open/close need shader-level compositing;
+/// workspace-switch needs workspace slide rendering) are parsed and
+/// validated so configs port over, but not animated yet.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnimationsConfig {
     /// Master switch (`animations { off; }` disables everything by
-    /// forcing zero-duration animations).
+    /// forcing instant geometry).
     pub enabled: bool,
-    pub window_movement: AnimParams,
-    pub window_open: AnimParams,
-    pub view_offset: AnimParams,
+    /// Niri's global `slowdown` multiplier: values > 1 slow every
+    /// animation down (durations scale by it).
+    pub slowdown: f64,
+    /// Window moves (x/y).
+    pub window_movement: AnimKind,
+    /// Window resizes (w/h).
+    pub window_resize: AnimKind,
+    /// Viewport scrolling (focus column left/right).
+    pub view_offset: AnimKind,
+    /// Parsed but not animated (open/close fade needs compositing).
+    pub window_open: AnimKind,
+    /// Parsed but not animated.
+    pub window_close: AnimKind,
+    /// Parsed but not animated (needs workspace slide rendering).
+    pub workspace_switch: AnimKind,
 }
 
 impl Default for AnimationsConfig {
     fn default() -> Self {
+        // Niri's defaults: springs for movement/resize/view-offset,
+        // short easings for open/close.
         AnimationsConfig {
             enabled: true,
-            window_movement: AnimParams::default(),
-            window_open: AnimParams {
+            slowdown: 1.0,
+            window_movement: AnimKind::Spring(SpringParams::niri_default()),
+            window_resize: AnimKind::Spring(SpringParams::niri_default()),
+            view_offset: AnimKind::Spring(SpringParams::niri_default()),
+            window_open: AnimKind::Easing {
                 duration: std::time::Duration::from_millis(150),
-                easing: Easing::EaseOutCubic,
+                curve: Curve::EaseOutExpo,
             },
-            view_offset: AnimParams {
-                duration: std::time::Duration::from_millis(250),
-                easing: Easing::EaseOutExpo,
+            window_close: AnimKind::Easing {
+                duration: std::time::Duration::from_millis(150),
+                curve: Curve::EaseOutQuad,
             },
+            workspace_switch: AnimKind::Spring(SpringParams {
+                damping_ratio: 1.0,
+                stiffness: 1000.0,
+                epsilon: 0.0001,
+            }),
         }
+    }
+}
+
+impl AnimationsConfig {
+    fn params(&self, kind: AnimKind) -> AnimParams {
+        AnimParams {
+            kind: if self.enabled {
+                kind
+            } else {
+                // `animations { off; }` forces instant geometry.
+                AnimKind::instant()
+            },
+            slowdown: self.slowdown,
+        }
+    }
+
+    /// Driving parameters for window moves (x/y).
+    pub fn movement_params(&self) -> AnimParams {
+        self.params(self.window_movement)
+    }
+
+    /// Driving parameters for window resizes (w/h).
+    pub fn resize_params(&self) -> AnimParams {
+        self.params(self.window_resize)
+    }
+
+    /// Driving parameters for viewport scrolling. Not wired into the
+    /// animator yet (scrolling animates windows directly) but kept
+    /// for parity.
+    #[allow(dead_code)]
+    pub fn view_offset_params(&self) -> AnimParams {
+        self.params(self.view_offset)
     }
 }
 
@@ -281,18 +344,14 @@ impl Config {
     /// column (our extension; niri has no column-index focus).
     fn with_workspace_binds(mut self) -> Self {
         for n in 1..=9u8 {
-            self.binds.push(bind(
-                &format!("Mod+{n}"),
-                Action::FocusWorkspace(n),
-            ));
+            self.binds
+                .push(bind(&format!("Mod+{n}"), Action::FocusWorkspace(n)));
             self.binds.push(bind(
                 &format!("Mod+Ctrl+{n}"),
                 Action::MoveColumnToWorkspace(n),
             ));
-            self.binds.push(bind(
-                &format!("Mod+Shift+{n}"),
-                Action::FocusColumnIndex(n),
-            ));
+            self.binds
+                .push(bind(&format!("Mod+Shift+{n}"), Action::FocusColumnIndex(n)));
         }
         self
     }
@@ -337,17 +396,14 @@ pub fn load() -> Config {
 /// config when the new one is broken.
 pub fn try_load() -> Result<Config, String> {
     let path = config_path();
-    let source = std::fs::read_to_string(&path)
-        .map_err(|e| format!("missing/unreadable: {e}"))?;
+    let source = std::fs::read_to_string(&path).map_err(|e| format!("missing/unreadable: {e}"))?;
     parse(&source)
 }
 
 /// Parse KDL text into a Config. Unknown nodes/fields are ignored
 /// (forward compatibility, like niri).
 pub fn parse(source: &str) -> Result<Config, String> {
-    let doc: KdlDocument = source
-        .parse()
-        .map_err(|e| format!("KDL syntax: {e}"))?;
+    let doc: KdlDocument = source.parse().map_err(|e| format!("KDL syntax: {e}"))?;
 
     let mut config = Config::default();
     config.binds.clear(); // Config-provided binds replace the defaults.
@@ -373,7 +429,10 @@ pub fn parse(source: &str) -> Result<Config, String> {
 fn parse_input(node: &KdlNode, config: &mut Config) {
     // `input { focus-follows-mouse; }` (a bare flag node).
     if let Some(doc) = node.children()
-        && doc.nodes().iter().any(|n| n.name().value() == "focus-follows-mouse")
+        && doc
+            .nodes()
+            .iter()
+            .any(|n| n.name().value() == "focus-follows-mouse")
     {
         config.focus_follows_mouse = true;
     }
@@ -506,8 +565,9 @@ fn parse_preset_widths(n: &KdlNode) -> Vec<ColumnWidth> {
     let Some(doc) = n.children() else { return out };
     for child in doc.nodes() {
         let w = match child.name().value() {
-            "proportion" => first_float_arg(child)
-                .map(|p| ColumnWidth::Proportion(p.clamp(0.01, 100.0))),
+            "proportion" => {
+                first_float_arg(child).map(|p| ColumnWidth::Proportion(p.clamp(0.01, 100.0)))
+            }
             "fixed" => first_float_arg(child).map(|f| ColumnWidth::Fixed(f.clamp(1.0, 100_000.0))),
             _ => None,
         };
@@ -554,7 +614,20 @@ fn parse_hex_color(s: &str) -> Option<u32> {
     u32::from_str_radix(s, 16).ok()
 }
 
-/// `animations { off; window-movement { duration-ms 200; easing "ease-out-expo"; } }`
+/// `animations { off; slowdown 2.0; window-movement { spring ...; } }`
+///
+/// Follows niri's syntax. Each per-animation node may contain:
+/// - `off` — that animation lands instantly
+/// - `spring damping-ratio=1.0 stiffness=800 epsilon=0.0001` (niri's
+///   property syntax; the nested `spring { damping-ratio 1.0; }` form
+///   is accepted too)
+/// - `duration-ms 250` + `curve "ease-out-expo"`, with
+///   `curve "cubic-bezier" 0.05 0.7 0.1 1.0` for custom curves
+///   (`easing "..."` from our older configs is an alias for `curve`)
+///
+/// Spring and easing parameters must not be mixed (niri errors out;
+/// we warn and keep the first). Unset fields keep their defaults
+/// (niri's merge semantics).
 fn parse_animations(node: &KdlNode, config: &mut Config) {
     // `animations "off";` as an argument, or `animations { off; }`
     // as a child node — either form disables everything.
@@ -570,50 +643,190 @@ fn parse_animations(node: &KdlNode, config: &mut Config) {
     }
     let Some(doc) = node.children() else { return };
     for n in doc.nodes() {
-        let params = match n.name().value() {
-            "window-movement" => &mut config.animations.window_movement,
-            "window-open" => &mut config.animations.window_open,
-            "view-offset" => &mut config.animations.view_offset,
-            other => {
-                log::debug!("ignoring animations node {other:?}");
-                continue;
-            }
-        };
-        let Some(children) = n.children() else { continue };
-        for c in children.nodes() {
-            match c.name().value() {
-                "duration-ms" => {
-                    if let Some(ms) = first_float_arg(c) {
-                        params.duration = std::time::Duration::from_millis(ms.max(0.0) as u64);
-                    }
+        match n.name().value() {
+            "slowdown" => {
+                if let Some(v) = first_float_arg(n) {
+                    config.animations.slowdown = v.max(0.0);
                 }
-                "easing" => {
-                    if let Some(name) = first_string_arg(c) {
-                        match easing_from_name(&name) {
-                            Some(e) => params.easing = e,
-                            None => log::warn!(
-                                "unknown easing {name:?}; expected one of: linear, \
-                                 ease-out-quad, ease-out-cubic, ease-out-expo, ease-out-back"
-                            ),
-                        }
-                    }
-                }
-                _ => {}
             }
+            "window-movement" => parse_anim_kind(n, &mut config.animations.window_movement),
+            "window-resize" => parse_anim_kind(n, &mut config.animations.window_resize),
+            "view-offset" | "horizontal-view-movement" => {
+                parse_anim_kind(n, &mut config.animations.view_offset)
+            }
+            "window-open" => parse_anim_kind(n, &mut config.animations.window_open),
+            "window-close" => parse_anim_kind(n, &mut config.animations.window_close),
+            "workspace-switch" => parse_anim_kind(n, &mut config.animations.workspace_switch),
+            // Kinds we have no rendering for; parsed-and-ignored so
+            // niri configs port over without warnings.
+            "config-error-open" | "config-error-close" | "screenshot-open" | "screenshot-close" => {
+            }
+            other => log::debug!("ignoring animations node {other:?}"),
         }
     }
 }
 
-/// Parse a niri-style easing name.
-fn easing_from_name(name: &str) -> Option<Easing> {
-    Some(match name {
-        "linear" => Easing::Linear,
-        "ease-out-quad" => Easing::EaseOutQuad,
-        "ease-out-cubic" => Easing::EaseOutCubic,
-        "ease-out-expo" => Easing::EaseOutExpo,
-        "ease-out-back" => Easing::EaseOutBack(1.70158),
-        _ => return None,
-    })
+/// Parse one per-animation node (`window-movement { ... }` etc.)
+/// into `slot`, keeping the previous value for anything left unset.
+fn parse_anim_kind(node: &KdlNode, slot: &mut AnimKind) {
+    let Some(children) = node.children() else {
+        return;
+    };
+    let mut off = false;
+    let mut spring: Option<SpringParams> = None;
+    let mut duration_ms: Option<u64> = None;
+    let mut curve: Option<Curve> = None;
+
+    for c in children.nodes() {
+        match c.name().value() {
+            "off" => off = true,
+            "spring" => {
+                if duration_ms.is_some() || curve.is_some() {
+                    log::warn!(
+                        "animations: cannot set both spring and easing \
+                         parameters at once (ignoring spring)"
+                    );
+                    continue;
+                }
+                spring = Some(parse_spring(c));
+            }
+            "duration-ms" => {
+                if spring.is_some() {
+                    log::warn!(
+                        "animations: cannot set both spring and easing \
+                         parameters at once (ignoring duration-ms)"
+                    );
+                    continue;
+                }
+                if let Some(ms) = first_float_arg(c) {
+                    duration_ms = Some(ms.max(0.0) as u64);
+                }
+            }
+            "curve" | "easing" => {
+                if spring.is_some() {
+                    log::warn!(
+                        "animations: cannot set both spring and easing \
+                         parameters at once (ignoring curve)"
+                    );
+                    continue;
+                }
+                if let Some(cv) = parse_curve(c) {
+                    curve = Some(cv);
+                }
+            }
+            other => log::debug!("ignoring animation node {other:?}"),
+        }
+    }
+
+    if off {
+        *slot = AnimKind::instant();
+    } else if let Some(sp) = spring {
+        *slot = AnimKind::Spring(sp);
+    } else if duration_ms.is_some() || curve.is_some() {
+        // Niri's merge rules: unset fields keep the previous value,
+        // except when the default is a spring and the user configured
+        // an easing — then the fallback is 250ms / ease-out-cubic.
+        let (def_dur, def_curve) = match *slot {
+            AnimKind::Easing { duration, curve } => (duration, curve),
+            _ => (std::time::Duration::from_millis(250), Curve::EaseOutCubic),
+        };
+        *slot = AnimKind::Easing {
+            duration: duration_ms
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(def_dur),
+            curve: curve.unwrap_or(def_curve),
+        };
+    }
+    // Nothing configured — keep the default.
+}
+
+/// `spring damping-ratio=1.0 stiffness=800 epsilon=0.0001` (niri's
+/// property syntax) or `spring { damping-ratio 1.0; stiffness 800; }`.
+fn parse_spring(node: &KdlNode) -> SpringParams {
+    let mut p = SpringParams::niri_default();
+    for e in node.entries() {
+        let Some(name) = e.name() else { continue };
+        let Some(v) = entry_float(e) else {
+            log::warn!("spring: property {:?} is not a number", name.value());
+            continue;
+        };
+        match name.value() {
+            "damping-ratio" => p.damping_ratio = v.max(0.0),
+            "stiffness" => p.stiffness = v.max(0.0),
+            "epsilon" => p.epsilon = v.max(0.000001),
+            other => log::warn!("spring: unknown property {other:?}"),
+        }
+    }
+    if let Some(doc) = node.children() {
+        for c in doc.nodes() {
+            match c.name().value() {
+                "damping-ratio" => {
+                    if let Some(v) = first_float_arg(c) {
+                        p.damping_ratio = v.max(0.0);
+                    }
+                }
+                "stiffness" => {
+                    if let Some(v) = first_float_arg(c) {
+                        p.stiffness = v.max(0.0);
+                    }
+                }
+                "epsilon" => {
+                    if let Some(v) = first_float_arg(c) {
+                        p.epsilon = v.max(0.000001);
+                    }
+                }
+                other => log::debug!("ignoring spring node {other:?}"),
+            }
+        }
+    }
+    p
+}
+
+/// `curve "ease-out-expo"` / `curve "cubic-bezier" 0.05 0.7 0.1 1.0`.
+/// `ease-out-back` optionally takes an overshoot amount (default
+/// 1.70158); `linear` and the `ease-out-*` family need no arguments.
+fn parse_curve(node: &KdlNode) -> Option<Curve> {
+    let unnamed: Vec<&kdl::KdlEntry> = node
+        .entries()
+        .iter()
+        .filter(|e| e.name().is_none())
+        .collect();
+    let name = unnamed.first().and_then(|e| e.value().as_string())?;
+    let nums: Vec<f64> = unnamed[1..].iter().filter_map(|e| entry_float(e)).collect();
+    match name {
+        "linear" => Some(Curve::Linear),
+        "ease-out-quad" => Some(Curve::EaseOutQuad),
+        "ease-out-cubic" => Some(Curve::EaseOutCubic),
+        "ease-out-expo" => Some(Curve::EaseOutExpo),
+        "ease-out-back" => Some(Curve::EaseOutBack(nums.first().copied().unwrap_or(1.70158))),
+        "cubic-bezier" => {
+            if nums.len() >= 4 {
+                Some(Curve::CubicBezier(nums[0], nums[1], nums[2], nums[3]))
+            } else {
+                log::warn!(
+                    "curve \"cubic-bezier\" needs 4 control-point values, e.g. \
+                     curve \"cubic-bezier\" 0.05 0.7 0.1 1.0"
+                );
+                None
+            }
+        }
+        other => {
+            log::warn!(
+                "unknown animation curve {other:?}; expected one of: linear, \
+                 ease-out-quad, ease-out-cubic, ease-out-expo, ease-out-back, cubic-bezier"
+            );
+            None
+        }
+    }
+}
+
+/// Numeric value of a KDL entry (integer or float), for named
+/// properties like `damping-ratio=1.0`.
+fn entry_float(e: &kdl::KdlEntry) -> Option<f64> {
+    e.value()
+        .as_integer()
+        .map(|v| v as f64)
+        .or_else(|| e.value().as_float())
 }
 
 fn parse_binds(node: &KdlNode, config: &mut Config) {
@@ -741,15 +954,17 @@ mod tests {
         assert!(matches!(cfg.mod_key, ModKey::Alt));
         assert!(!cfg.focus_follows_mouse);
         assert_eq!(cfg.layout.gaps, 8.0);
-        assert!(cfg
-            .binds
-            .iter()
-            .any(|b| b.combo == "Mod+H" && b.action == Action::FocusColumnLeft));
+        assert!(
+            cfg.binds
+                .iter()
+                .any(|b| b.combo == "Mod+H" && b.action == Action::FocusColumnLeft)
+        );
         // Niri's wheel binds are in the defaults.
-        assert!(cfg
-            .binds
-            .iter()
-            .any(|b| b.combo == "Mod+WheelScrollDown" && b.action == Action::FocusColumnRight));
+        assert!(
+            cfg.binds
+                .iter()
+                .any(|b| b.combo == "Mod+WheelScrollDown" && b.action == Action::FocusColumnRight)
+        );
     }
 
     #[test]
@@ -760,10 +975,7 @@ mod tests {
         assert!(!parse("layout { gaps 8; }").unwrap().focus_follows_mouse);
         // Wheel binds parse like any key.
         let cfg = parse("binds { Mod+WheelScrollDown { focus-column-right; } }").unwrap();
-        assert!(cfg
-            .binds
-            .iter()
-            .any(|b| b.combo == "Mod+WheelScrollDown"));
+        assert!(cfg.binds.iter().any(|b| b.combo == "Mod+WheelScrollDown"));
     }
 
     #[test]
@@ -793,10 +1005,11 @@ mod tests {
         assert_eq!(cfg.layout.center_focused_column, CenterFocused::Always);
         assert_eq!(cfg.layout.default_column_width, ColumnWidth::Fixed(1000.0));
         assert_eq!(cfg.binds.len(), 3);
-        assert!(cfg
-            .binds
-            .iter()
-            .any(|b| b.action == Action::SetColumnWidth("+100".into())));
+        assert!(
+            cfg.binds
+                .iter()
+                .any(|b| b.action == Action::SetColumnWidth("+100".into()))
+        );
     }
 
     #[test]
@@ -809,26 +1022,107 @@ mod tests {
 
     #[test]
     fn animations_config() {
+        // Easing form: duration-ms + curve (niri syntax), plus the
+        // `easing "name"` alias from our older configs.
         let cfg = parse(
             "animations {
-                window-movement { duration-ms 500; easing \"ease-out-expo\"; }
+                window-movement { duration-ms 500; curve \"ease-out-expo\"; }
                 view-offset { duration-ms 0; }
             }",
         )
         .unwrap();
         assert!(cfg.animations.enabled);
-        assert_eq!(cfg.animations.window_movement.duration, std::time::Duration::from_millis(500));
-        assert_eq!(cfg.animations.window_movement.easing, Easing::EaseOutExpo);
-        assert_eq!(cfg.animations.view_offset.duration, std::time::Duration::ZERO);
+        assert_eq!(
+            cfg.animations.window_movement,
+            AnimKind::Easing {
+                duration: std::time::Duration::from_millis(500),
+                curve: Curve::EaseOutExpo,
+            }
+        );
+        assert_eq!(
+            cfg.animations.view_offset,
+            AnimKind::Easing {
+                duration: std::time::Duration::ZERO,
+                curve: Curve::EaseOutCubic, // spring default -> easing fallback
+            }
+        );
         // Defaults intact for untouched kinds.
-        assert_eq!(cfg.animations.window_open.duration, std::time::Duration::from_millis(150));
+        assert_eq!(
+            cfg.animations.window_open,
+            AnimKind::Easing {
+                duration: std::time::Duration::from_millis(150),
+                curve: Curve::EaseOutExpo,
+            }
+        );
 
         let cfg = parse("animations { off; }").unwrap();
         assert!(!cfg.animations.enabled);
+        // Master `off` maps to instant, regardless of the kind.
+        assert_eq!(cfg.animations.movement_params().kind, AnimKind::instant());
 
-        // Unknown easing keeps the old value (soft failure).
-        let cfg = parse("animations { window-open { easing \"bogus\"; } }").unwrap();
-        assert_eq!(cfg.animations.window_open.easing, Easing::EaseOutCubic);
+        // Spring form with niri's property syntax.
+        let cfg = parse(
+            "animations {
+                window-resize { spring damping-ratio=0.8 stiffness=400 epsilon=0.001 }
+            }",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.animations.window_resize,
+            AnimKind::Spring(SpringParams {
+                damping_ratio: 0.8,
+                stiffness: 400.0,
+                epsilon: 0.001,
+            })
+        );
+
+        // Nested spring form and slowdown.
+        let cfg = parse(
+            "animations {
+                slowdown 2.0
+                workspace-switch { spring { damping-ratio 1.0; stiffness 1000; epsilon 0.0001; } }
+            }",
+        )
+        .unwrap();
+        assert_eq!(cfg.animations.slowdown, 2.0);
+        assert_eq!(
+            cfg.animations.workspace_switch,
+            AnimKind::Spring(SpringParams {
+                damping_ratio: 1.0,
+                stiffness: 1000.0,
+                epsilon: 0.0001,
+            })
+        );
+
+        // Custom cubic-bezier curve.
+        let cfg = parse(
+            "animations {
+                window-open { duration-ms 150; curve \"cubic-bezier\" 0.05 0.7 0.1 1.0; }
+            }",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.animations.window_open,
+            AnimKind::Easing {
+                duration: std::time::Duration::from_millis(150),
+                curve: Curve::CubicBezier(0.05, 0.7, 0.1, 1.0),
+            }
+        );
+
+        // Per-animation `off` disables just that one.
+        let cfg = parse("animations { window-movement { off; } }").unwrap();
+        assert!(cfg.animations.enabled);
+        assert_eq!(cfg.animations.window_movement, AnimKind::instant());
+
+        // Unknown curve keeps the old value (soft failure).
+        let cfg = parse("animations { window-open { curve \"bogus\"; } }").unwrap();
+        assert_eq!(
+            cfg.animations.window_open,
+            AnimKind::Easing {
+                duration: std::time::Duration::from_millis(150),
+                curve: Curve::EaseOutExpo,
+            }
+        );
     }
 
     #[test]
@@ -850,11 +1144,18 @@ mod tests {
         assert_eq!(cfg.window_rules.len(), 2);
 
         // Substring, case-insensitive.
-        let r = cfg.match_rule("firefox.exe", "Downloads", "Mozilla").unwrap();
+        let r = cfg
+            .match_rule("firefox.exe", "Downloads", "Mozilla")
+            .unwrap();
         assert!(r.open_floating);
         // Title mismatch: no hit on rule 0; falls through to rule 1.
-        assert!(cfg.match_rule("firefox.exe", "New Tab", "Mozilla").is_none());
-        let r = cfg.match_rule("notepad.exe", "Untitled", "Notepad").unwrap();
+        assert!(
+            cfg.match_rule("firefox.exe", "New Tab", "Mozilla")
+                .is_none()
+        );
+        let r = cfg
+            .match_rule("notepad.exe", "Untitled", "Notepad")
+            .unwrap();
         assert_eq!(r.open_workspace, Some(2));
         assert!(r.open_maximized);
 
@@ -910,10 +1211,7 @@ mod tests {
 
     #[test]
     fn focus_ring_config() {
-        let cfg = parse(
-            r##"layout { focus-ring { width 2; active-color "#ff0000"; } }"##,
-        )
-        .unwrap();
+        let cfg = parse(r##"layout { focus-ring { width 2; active-color "#ff0000"; } }"##).unwrap();
         assert!(cfg.focus_ring.enabled);
         assert_eq!(cfg.focus_ring.width, 2);
         assert_eq!(cfg.focus_ring.active_color, 0xFF_0000);
@@ -923,30 +1221,51 @@ mod tests {
 
         // Bad colors keep the old value (soft failure).
         let cfg = parse(r##"layout { focus-ring { active-color "nope"; } }"##).unwrap();
-        assert_eq!(cfg.focus_ring.active_color, FocusRingConfig::default().active_color);
+        assert_eq!(
+            cfg.focus_ring.active_color,
+            FocusRingConfig::default().active_color
+        );
     }
 
     #[test]
     fn focus_column_index_config() {
         // Default bind: Mod+Shift+N focuses the Nth column.
         let cfg = Config::default();
-        assert!(cfg.binds.iter().any(|b| b.combo == "Mod+Shift+3"
-            && b.action == Action::FocusColumnIndex(3)));
-        assert!(cfg.binds.iter().any(|b| b.combo == "Mod+3"
-            && b.action == Action::FocusWorkspace(3)));
+        assert!(
+            cfg.binds
+                .iter()
+                .any(|b| b.combo == "Mod+Shift+3" && b.action == Action::FocusColumnIndex(3))
+        );
+        assert!(
+            cfg.binds
+                .iter()
+                .any(|b| b.combo == "Mod+3" && b.action == Action::FocusWorkspace(3))
+        );
 
         // `focus-column-index 2;` parses (integer arg, not string).
         let cfg = parse("binds { Mod+M { focus-column-index 2; } }").unwrap();
-        assert!(cfg.binds.iter().any(|b| b.action == Action::FocusColumnIndex(2)));
+        assert!(
+            cfg.binds
+                .iter()
+                .any(|b| b.action == Action::FocusColumnIndex(2))
+        );
 
         // Bare node defaults to 1.
         let cfg = parse("binds { Mod+M { focus-column-index; } }").unwrap();
-        assert!(cfg.binds.iter().any(|b| b.action == Action::FocusColumnIndex(1)));
+        assert!(
+            cfg.binds
+                .iter()
+                .any(|b| b.action == Action::FocusColumnIndex(1))
+        );
 
         // Integer args work for workspace actions too (KDL ints are
         // not strings).
         let cfg = parse("binds { Mod+W { focus-workspace 4; } }").unwrap();
-        assert!(cfg.binds.iter().any(|b| b.action == Action::FocusWorkspace(4)));
+        assert!(
+            cfg.binds
+                .iter()
+                .any(|b| b.action == Action::FocusWorkspace(4))
+        );
     }
 
     #[test]
@@ -954,21 +1273,23 @@ mod tests {
         // Parses as an action; not bound by default (niri doesn't bind
         // it either — users wire it to their screenshot tool).
         let cfg = parse("binds { Mod+P { do-screen-transition; } }").unwrap();
-        assert!(cfg
-            .binds
-            .iter()
-            .any(|b| b.action == Action::DoScreenTransition));
-        assert!(!Config::default()
-            .binds
-            .iter()
-            .any(|b| b.action == Action::DoScreenTransition));
+        assert!(
+            cfg.binds
+                .iter()
+                .any(|b| b.action == Action::DoScreenTransition)
+        );
+        assert!(
+            !Config::default()
+                .binds
+                .iter()
+                .any(|b| b.action == Action::DoScreenTransition)
+        );
     }
 
     #[test]
     fn example_config_parses() {
         // The shipped example must stay valid against the real parser.
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("config.example.kdl");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.kdl");
         let Ok(src) = std::fs::read_to_string(&path) else {
             panic!("missing config.example.kdl next to Cargo.toml");
         };
@@ -979,33 +1300,44 @@ mod tests {
         assert_eq!(cfg.layout.preset_column_widths.len(), 3);
     }
 
-
     /// The snippets in docs/CONFIG.md and config.example.kdl must keep
     /// parsing (guards against both doc drift and KDL dialect traps).
     #[test]
     fn doc_snippets_parse() {
-        let snippets: Vec<(&str, &str)> = vec![        ("focus-ring", r##"layout {
+        let snippets: Vec<(&str, &str)> = vec![
+            (
+                "focus-ring",
+                r##"layout {
     focus-ring {
         // off
         width 4               // thickness
         active-color "#7daea3"
     }
 }
-"##),
-        ("animations", r##"animations {
+"##,
+            ),
+            (
+                "animations",
+                r##"animations {
     window-movement { duration-ms 250; easing "ease-out-cubic"; }
     window-open    { duration-ms 150; easing "ease-out-cubic"; }
     view-offset    { duration-ms 250; easing "ease-out-expo"; }
 }
-"##),
-        ("input", r##"input {
+"##,
+            ),
+            (
+                "input",
+                r##"input {
     focus-follows-mouse
     keyboard-shortcuts {
         Mod "Alt"
     }
 }
-"##),
-        ("layout", r##"layout {
+"##,
+            ),
+            (
+                "layout",
+                r##"layout {
     gaps 8
     edge-padding 8
     center-focused-column "on-overflow"
@@ -1016,12 +1348,16 @@ mod tests {
         fixed 1280
     }
 }
-"##),
-        ("window-rule", r##"window-rule {
+"##,
+            ),
+            (
+                "window-rule",
+                r##"window-rule {
     match app-id="firefox" title="download"
     open-floating
 }
-"##),
+"##,
+            ),
         ];
         for (name, doc) in snippets {
             if let Err(e) = doc.parse::<KdlDocument>() {
@@ -1035,23 +1371,30 @@ mod tests {
     /// sibling nodes that follow. Keep trailing comments off `}` lines.
     #[test]
     fn trailing_comment_after_child_block() {
-        assert!("binds {
+        assert!(
+            "binds {
     a { b; } // c
     d { e; }
 }"
             .parse::<KdlDocument>()
-            .is_err());
-        assert!("binds {
+            .is_err()
+        );
+        assert!(
+            "binds {
     a { b; }
     d { e; }
 }"
             .parse::<KdlDocument>()
-            .is_ok());
+            .is_ok()
+        );
     }
 
     #[test]
     fn proportion_clamped() {
         let cfg = parse("layout { default-column-width { proportion 5000; } }").unwrap();
-        assert_eq!(cfg.layout.default_column_width, ColumnWidth::Proportion(100.0));
+        assert_eq!(
+            cfg.layout.default_column_width,
+            ColumnWidth::Proportion(100.0)
+        );
     }
 }
