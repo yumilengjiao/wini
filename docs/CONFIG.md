@@ -69,19 +69,52 @@ layout {
 
 ## `animations`
 
+Follows niri's animation syntax. Each animation kind is configured
+separately; unset kinds keep their defaults (springs for
+movement/resize/view-offset, short easings for open/close).
+
 ```kdl
 animations {
     // off    - disable all animations (everything snaps)
+    // slowdown 3.0   - slow every animation down by this factor
 
-    window-movement { duration-ms 250; easing "ease-out-cubic"; }
-    window-open    { duration-ms 150; easing "ease-out-cubic"; }
-    view-offset    { duration-ms 250; easing "ease-out-expo"; }
+    // Spring physics: carries velocity through retargets.
+    window-movement {
+        spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
+    }
+
+    // Timed easing instead: duration-ms + curve.
+    view-offset {
+        duration-ms 100
+        curve "ease-out-expo"
+    }
+
+    // Custom cubic-bezier curve.
+    window-open {
+        duration-ms 150
+        curve "cubic-bezier" 0.05 0.7 0.1 1.0
+    }
+
+    // Per-animation off: just this one snaps.
+    // window-close { off }
 }
 ```
 
-Easings: `linear`, `ease-out-quad`, `ease-out-cubic`,
-`ease-out-expo`, `ease-out-back`. Durations are milliseconds; `0`
-disables that animation kind.
+**Kinds:** `window-movement`, `window-resize`, `view-offset`
+(`horizontal-view-movement` also accepted), `workspace-switch`,
+`window-open`, `window-close`. Movement, resize and view-offset drive
+the real animations; open/close/workspace-switch are parsed and
+validated so niri configs port over, but not animated yet.
+
+**Spring parameters:** `damping-ratio` (1.0 = settles without
+bouncing, < 1 bounces, > 1 sluggish), `stiffness` (higher = snappier),
+`epsilon` (rest threshold). Defaults: `1.0 / 800 / 0.0001`.
+
+**Curves:** `linear`, `ease-out-quad`, `ease-out-cubic`,
+`ease-out-expo`, `ease-out-back` (optionally with an overshoot
+amount), and `cubic-bezier` with four control-point values.
+`duration-ms 0` disables that animation kind. Spring and easing
+parameters must not be mixed in one kind.
 
 ## `binds`
 
