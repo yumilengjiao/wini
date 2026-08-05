@@ -406,14 +406,24 @@ pub fn parse(source: &str) -> Result<Config, String> {
     let doc: KdlDocument = source.parse().map_err(|e| format!("KDL syntax: {e}"))?;
 
     let mut config = Config::default();
-    config.binds.clear(); // Config-provided binds replace the defaults.
 
+    let mut has_binds = false;
     for node in doc.nodes() {
         match node.name().value() {
             "input" => parse_input(node, &mut config),
             "layout" => parse_layout(node, &mut config),
             "animations" => parse_animations(node, &mut config),
-            "binds" => parse_binds(node, &mut config),
+            "binds" => {
+                // A binds section replaces ALL default binds (niri
+                // semantics) — but only when actually present: a
+                // config that only tweaks, say, animations keeps the
+                // defaults.
+                if !has_binds {
+                    config.binds.clear();
+                    has_binds = true;
+                }
+                parse_binds(node, &mut config);
+            }
             "window-rule" => parse_window_rule(node, &mut config),
             "spawn-at-startup" => {
                 if let Some(cmd) = first_string_arg(node) {
@@ -1018,6 +1028,20 @@ mod tests {
         // Unknown nodes are fine.
         let cfg = parse("favorites { color \"blue\"; }").unwrap();
         assert_eq!(cfg.layout.gaps, 8.0);
+    }
+
+    #[test]
+    fn config_without_binds_keeps_default_binds() {
+        // A config that only tweaks animations must not wipe the
+        // default key bindings (niri semantics: only an explicit
+        // `binds` section replaces them).
+        let cfg = parse("animations { slowdown 6.0 }").unwrap();
+        assert!(!cfg.binds.is_empty(), "default binds survive");
+
+        // An explicit binds section still replaces everything.
+        let cfg = parse("binds { Mod+Q { quit; } }").unwrap();
+        assert_eq!(cfg.binds.len(), 1);
+        assert_eq!(cfg.binds[0].combo, "Mod+Q");
     }
 
     #[test]
