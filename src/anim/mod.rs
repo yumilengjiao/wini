@@ -257,7 +257,10 @@ impl Val {
     /// Change the target. Springs continue smoothly from the current
     /// value AND velocity (the niri feel); easing curves restart from
     /// the current value. Tiny changes snap instead of animating.
-    pub fn retarget(&mut self, value: f64) {
+    /// `params` are re-read on every retarget so config hot reloads
+    /// take effect on the next move.
+    pub fn retarget(&mut self, value: f64, params: AnimParams) {
+        self.params = params;
         let cur = self.value();
         let vel = self.velocity();
         let snap = match self.params.kind {
@@ -298,24 +301,24 @@ impl Val {
                 self.from + (self.to - self.from) * curve.apply(progress)
             }
             AnimKind::Spring(p) => {
-                spring_value(self.from, self.to, self.v0, &p, elapsed.as_secs_f64())
+                // Slowdown scales the spring's time axis: the same
+                // trajectory, stretched in real time.
+                let t = elapsed.as_secs_f64() / self.params.slowdown.max(0.001);
+                spring_value(self.from, self.to, self.v0, &p, t)
             }
         }
     }
 
     /// Current velocity in px/s, estimated by finite differences.
+    /// Computed in animation time (post-slowdown scaling) so that
+    /// retargets carry the visually-current velocity.
     pub fn velocity(&self) -> f64 {
         let dt = 1.0 / 120.0; // half a frame; fine for carry-over
-        let now = self.start.elapsed().as_secs_f64();
+        let now = self.start.elapsed().as_secs_f64() / self.params.slowdown.max(0.001);
         if now <= dt {
             return self.v0;
         }
-        let prev = self
-            .start
-            .elapsed()
-            .checked_sub(Duration::from_secs_f64(dt))
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
+        let prev = now - dt;
         match self.params.kind {
             AnimKind::Spring(p) => {
                 let a = spring_value(self.from, self.to, self.v0, &p, prev);
@@ -368,11 +371,11 @@ impl AnimatedRect {
         }
     }
 
-    pub fn retarget(&mut self, x: f64, y: f64, w: f64, h: f64) {
-        self.x.retarget(x);
-        self.y.retarget(y);
-        self.w.retarget(w);
-        self.h.retarget(h);
+    pub fn retarget(&mut self, x: f64, y: f64, w: f64, h: f64, movement: AnimParams, resize: AnimParams) {
+        self.x.retarget(x, movement);
+        self.y.retarget(y, movement);
+        self.w.retarget(w, resize);
+        self.h.retarget(h, resize);
         self.at_rest_pushed = false;
     }
 
@@ -422,7 +425,7 @@ impl Animator {
     /// Set/retarget a window's target rect.
     pub fn set_target(&mut self, id: isize, x: f64, y: f64, w: f64, h: f64) {
         match self.rects.get_mut(&id) {
-            Some(r) => r.retarget(x, y, w, h),
+            Some(r) => r.retarget(x, y, w, h, self.movement, self.resize),
             None => {
                 self.rects.insert(
                     id,
@@ -553,7 +556,7 @@ mod tests {
     #[test]
     fn val_finishes_at_target() {
         let mut v = Val::to(100.0, easing_params());
-        v.retarget(200.0);
+        v.retarget(200.0, easing_params());
         std::thread::sleep(Duration::from_millis(300));
         assert!(v.finished());
         assert!((v.value() - 200.0).abs() < 1e-9);
@@ -562,7 +565,7 @@ mod tests {
     #[test]
     fn spring_settles_at_target() {
         let mut v = Val::to(0.0, spring_params());
-        v.retarget(500.0);
+        v.retarget(500.0, spring_params());
         // Niri's default spring settles in well under a second.
         std::thread::sleep(Duration::from_millis(900));
         assert!(v.finished(), "spring finished");
@@ -572,12 +575,12 @@ mod tests {
     #[test]
     fn spring_carries_velocity_on_retarget() {
         let mut v = Val::to(0.0, spring_params());
-        v.retarget(500.0);
+        v.retarget(500.0, spring_params());
         // Mid-flight retarget: the spring must not restart from rest.
         std::thread::sleep(Duration::from_millis(60));
         let vel = v.velocity();
         assert!(vel > 100.0, "moving fast mid-flight: {vel} px/s");
-        v.retarget(400.0);
+        v.retarget(400.0, spring_params());
         // Right after the retarget the velocity estimate still reflects
         // the carried-over motion (sign preserved through the value
         // history: v0 was recorded at retarget time).
@@ -591,7 +594,7 @@ mod tests {
         // Rapid retargeting to the same target keeps values bounded.
         let mut v = Val::to(0.0, spring_params());
         for i in 0..20 {
-            v.retarget(if i % 2 == 0 { 300.0 } else { 301.0 });
+            v.retarget(if i % 2 == 0 { 300.0 } else { 301.0 }, spring_params());
         }
         let val = v.value();
         assert!((-5.0..=320.0).contains(&val), "bounded: {val}");
@@ -619,7 +622,7 @@ mod tests {
     fn animated_rect_values() {
         let mut r = AnimatedRect::new(0.0, 0.0, 100.0, 100.0, fast_params(), fast_params());
         assert_eq!(r.value(), (0, 0, 100, 100));
-        r.retarget(10.0, 20.0, 30.0, 40.0);
+        r.retarget(10.0, 20.0, 30.0, 40.0, fast_params(), fast_params());
         std::thread::sleep(Duration::from_millis(10));
         assert_eq!(r.value(), (10, 20, 30, 40));
         assert!(r.finished());
@@ -656,10 +659,37 @@ mod tests {
             slowdown: 3.0,
         };
         let mut v = Val::to(0.0, p);
-        v.retarget(100.0);
+        v.retarget(100.0, p);
         std::thread::sleep(Duration::from_millis(200));
         assert!(!v.finished(), "still running at 2x the base duration");
         std::thread::sleep(Duration::from_millis(250));
         assert!(v.finished(), "finished by 3x the base duration");
+    }
+
+    #[test]
+    fn slowdown_stretches_spring_trajectory() {
+        // Regression: the spring's position function must run on the
+        // slowed-down time axis, not just the finished() clock —
+        // otherwise slowdown changes nothing visually.
+        let normal = AnimParams {
+            kind: AnimKind::Spring(SpringParams::niri_default()),
+            slowdown: 1.0,
+        };
+        let slowed = AnimParams {
+            kind: AnimKind::Spring(SpringParams::niri_default()),
+            slowdown: 4.0,
+        };
+        let mut a = Val::to(0.0, normal);
+        let mut b = Val::to(0.0, slowed);
+        a.retarget(1000.0, normal);
+        b.retarget(1000.0, slowed);
+        std::thread::sleep(Duration::from_millis(100));
+        // At the same wall-clock instant the slowed spring must have
+        // covered much less distance.
+        let (va, vb) = (a.value(), b.value());
+        assert!(
+            vb < va * 0.75,
+            "slowed spring lags: slow={vb} fast={va}"
+        );
     }
 }
