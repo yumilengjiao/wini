@@ -221,7 +221,9 @@ pub fn view_offset_for_column(
 }
 
 /// Clamp a raw view position so the view never scrolls beyond the first
-/// or last column. When everything fits, the content is centered.
+/// or last column. When everything fits, the content stays aligned to
+/// the left edge (niri's behavior — `always-center-single-column`
+/// defaults to false there).
 pub fn clamp_view_pos(vp: f64, xs: &[f64], widths: &[f64], view_width: f64) -> f64 {
     let Some((&first_x, _)) = xs.first().zip(widths.first()) else {
         return vp;
@@ -229,8 +231,10 @@ pub fn clamp_view_pos(vp: f64, xs: &[f64], widths: &[f64], view_width: f64) -> f
     let last_right = xs.last().unwrap() + widths.last().unwrap();
     let total = last_right - first_x;
     if total <= view_width {
-        // Center the whole content.
-        first_x - (view_width - total) / 2.0
+        // Everything fits: keep the first column at the left edge so
+        // growing/shrinking columns slides the others instead of
+        // recentering the whole line.
+        first_x
     } else {
         vp.clamp(first_x, last_right - view_width)
     }
@@ -467,12 +471,13 @@ mod tests {
     }
 
     #[test]
-    fn clamp_centers_when_content_fits() {
+    fn clamp_left_aligns_when_content_fits() {
         let xs = vec![0.0, 260.0];
         let widths = vec![250.0, 250.0];
-        // Total 510 < 1000: centered.
+        // Total 510 < 1000: pinned to the left edge, not centered
+        // (niri's default).
         let vp = clamp_view_pos(0.0, &xs, &widths, 1000.0);
-        assert_eq!(vp, -(1000.0 - 510.0) / 2.0);
+        assert_eq!(vp, 0.0);
         // Content larger than the view: clamped to [0, last_right - view].
         let xs2 = vec![0.0, 2000.0];
         let widths2 = vec![500.0, 500.0];
@@ -506,12 +511,13 @@ mod tests {
         assert_eq!(rects.len(), 3);
         let content_w = W - 16.0;
         let col_w = 0.25 * content_w;
-        // Content (3 cols + gaps = 3*234+16..) is centered since it fits.
+        // Content (3 cols + gaps) fits: niri keeps it left-aligned —
+        // first column at the left padding, no centering.
         let total = 3.0 * col_w + 16.0;
-        let vp = -(content_w - total) / 2.0;
+        assert!(total < content_w);
         for (i, r) in rects.iter().enumerate() {
             assert_eq!(r.w, col_w as i32);
-            let expected_x = (8.0 + (i as f64 * (col_w + 8.0) - vp)).round() as i32;
+            let expected_x = (8.0 + i as f64 * (col_w + 8.0)).round() as i32;
             assert_eq!(r.x, expected_x);
             assert_eq!(r.y, 8);
             assert_eq!(r.h, H as i32 - 16);

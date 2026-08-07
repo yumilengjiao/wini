@@ -1564,15 +1564,27 @@ impl App {
 
 /// Ctrl+C / window-close: post WM_QUIT to our own thread so the loop
 /// unwinds and hooks get dropped cleanly.
+///
+/// The console ctrl handler runs on a fresh OS thread, so the main
+/// thread's id must be captured at install time — calling
+/// GetCurrentThreadId() inside the handler would target the handler
+/// thread, which has no message loop, and the quit message would
+/// vanish.
+static MAIN_THREAD_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn install_ctrl_c_quit() {
     unsafe extern "system" fn handler(_ctrl_type: u32) -> windows::core::BOOL {
-        let thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        let thread_id = MAIN_THREAD_ID.load(std::sync::atomic::Ordering::Relaxed);
         unsafe {
             let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
         }
         windows::core::BOOL(1)
     }
     unsafe {
+        MAIN_THREAD_ID.store(
+            windows::Win32::System::Threading::GetCurrentThreadId(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if SetConsoleCtrlHandler(Some(handler), true).is_err() {
             log::warn!("failed to install Ctrl+C handler");
         }
