@@ -503,6 +503,64 @@ impl Workspace {
         true
     }
 
+    /// Niri's consume-window-into-column (Mod+Comma): take the top
+    /// window of the column to the RIGHT of the focused one and append
+    /// it to the bottom of the focused column.
+    pub fn consume_window_into_column(&mut self) -> bool {
+        if self.active_column_idx >= self.columns.len() {
+            return false;
+        }
+        let ci = self.active_column_idx;
+        // Needs a column to the right.
+        let si = ci + 1;
+        if si >= self.columns.len() {
+            return false;
+        }
+        let tile = self.columns[si].tiles.remove(0);
+        if self.columns[si].tiles.is_empty() {
+            self.columns.remove(si);
+        }
+        self.columns[ci].tiles.push(tile);
+        self.columns[ci].active_tile_idx = self.columns[ci].tiles.len() - 1;
+        self.active_column_idx = ci;
+        self.view_offset = 0.0;
+        self.activate_prev_column_on_removal = None;
+        true
+    }
+
+    /// Niri's expel-window-from-column (Mod+Period): move the BOTTOM
+    /// window of the focused column out into a new standalone column
+    /// inserted to its right. No-op when the column has a single
+    /// window (niri refuses rather than creating an empty column).
+    pub fn expel_window_from_column(&mut self) -> bool {
+        if self.active_column_idx >= self.columns.len() {
+            return false;
+        }
+        let ci = self.active_column_idx;
+        if self.columns[ci].tiles.len() < 2 {
+            return false;
+        }
+        let ti = self.columns[ci].tiles.len() - 1;
+        let tile = self.columns[ci].tiles.remove(ti);
+        let width = self.columns[ci].width;
+        let col = Column {
+            tiles: vec![tile],
+            active_tile_idx: 0,
+            width,
+            is_full_width: false,
+            is_maximized: false,
+        };
+        self.columns.insert(ci + 1, col);
+        // Focus stays on the (still focused) source column, but its
+        // active tile must be valid after the removal.
+        self.columns[ci].active_tile_idx =
+            self.columns[ci].active_tile_idx.min(self.columns[ci].tiles.len() - 1);
+        self.active_column_idx = ci;
+        self.view_offset = 0.0;
+        self.activate_prev_column_on_removal = None;
+        true
+    }
+
     /// Niri's set-column-width: delta ("+100"/"-100"), fixed
     /// ("1000") or proportion ("50%"). Applied to the focused column.
     pub fn set_column_width(&mut self, spec: &SizeChange) -> bool {
@@ -1026,6 +1084,55 @@ mod tests {
             vec![A, C, B]
         );
         assert_eq!(ws.focused_id(), Some(B));
+    }
+
+    #[test]
+    fn consume_into_and_expel_from_column() {
+        // A | B, C  (A alone; right column stacked B over C)
+        let mut ws = Workspace::new();
+        ws.add_window(A);
+        ws.add_window(B);
+        ws.add_window_to_column(C, 1, 1);
+        // add_window_to_column moved focus to column 1; put it back.
+        ws.active_column_idx = 0;
+        ws.columns[0].active_tile_idx = 0;
+
+        // consume: top window of the right column (B) joins our bottom;
+        // C stays behind as the now-focused column 1.
+        assert!(ws.consume_window_into_column());
+        assert_eq!(ws.columns.len(), 2);
+        assert_eq!(
+            ws.columns[0].tiles.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![A, B]
+        );
+        assert_eq!(
+            ws.columns[1].tiles.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![C]
+        );
+        assert_eq!(ws.focused_id(), Some(B));
+
+        // consume again: C joins our column; only one column remains.
+        assert!(ws.consume_window_into_column());
+        assert_eq!(ws.columns.len(), 1);
+        assert_eq!(
+            ws.columns[0].tiles.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![A, B, C]
+        );
+
+        // expel: bottom window (C) leaves into a new column on the right.
+        assert!(ws.expel_window_from_column());
+        assert_eq!(ws.columns.len(), 2);
+        assert_eq!(
+            ws.columns[0].tiles.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![A, B]
+        );
+        assert_eq!(ws.focused_id(), Some(B));
+
+        // Single-window column: expel refuses (niri behavior).
+        ws.focus_column(DirH::Right);
+        assert!(!ws.expel_window_from_column());
+        // No right neighbor: consume refuses.
+        assert!(!ws.consume_window_into_column());
     }
 
     #[test]

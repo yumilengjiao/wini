@@ -87,6 +87,8 @@ pub enum Action {
     MoveWindowToColumnRight,
     ConsumeOrExpelWindowLeft,
     ConsumeOrExpelWindowRight,
+    ConsumeWindowIntoColumn,
+    ExpelWindowFromColumn,
     SetColumnWidth(String),
     /// niri's switch-preset-column-width (Mod+R): cycle the focused
     /// column through layout.preset-column-widths.
@@ -293,6 +295,8 @@ impl Default for Config {
                 bind("Mod+J", Action::FocusWindowDown),
                 bind("Mod+K", Action::FocusWindowUp),
                 bind("Mod+L", Action::FocusColumnRight),
+                // Move window/column: niri's Mod+Shift = move focus
+                // direction; Mod+Ctrl = move the column itself.
                 bind("Mod+Shift+Left", Action::MoveColumnLeft),
                 bind("Mod+Shift+Down", Action::MoveWindowDown),
                 bind("Mod+Shift+Up", Action::MoveWindowUp),
@@ -301,12 +305,26 @@ impl Default for Config {
                 bind("Mod+Shift+J", Action::MoveWindowDown),
                 bind("Mod+Shift+K", Action::MoveWindowUp),
                 bind("Mod+Shift+L", Action::MoveColumnRight),
-                bind("Mod+Ctrl+Left", Action::MoveWindowToColumnLeft),
-                bind("Mod+Ctrl+Right", Action::MoveWindowToColumnRight),
-                bind("Mod+Ctrl+H", Action::MoveWindowToColumnLeft),
-                bind("Mod+Ctrl+L", Action::MoveWindowToColumnRight),
-                bind("Mod+Ctrl+J", Action::ConsumeOrExpelWindowLeft),
-                bind("Mod+Ctrl+K", Action::ConsumeOrExpelWindowRight),
+                bind("Mod+Ctrl+Left", Action::MoveColumnLeft),
+                bind("Mod+Ctrl+Down", Action::MoveWindowDown),
+                bind("Mod+Ctrl+Up", Action::MoveWindowUp),
+                bind("Mod+Ctrl+Right", Action::MoveColumnRight),
+                bind("Mod+Ctrl+H", Action::MoveColumnLeft),
+                bind("Mod+Ctrl+J", Action::MoveWindowDown),
+                bind("Mod+Ctrl+K", Action::MoveWindowUp),
+                bind("Mod+Ctrl+L", Action::MoveColumnRight),
+                // Consume/expel: niri's brackets, plus our
+                // move-window-to-column extras on Ctrl+Shift.
+                bind("Mod+BracketLeft", Action::ConsumeOrExpelWindowLeft),
+                bind("Mod+BracketRight", Action::ConsumeOrExpelWindowRight),
+                bind("Mod+Ctrl+Shift+Left", Action::MoveWindowToColumnLeft),
+                bind("Mod+Ctrl+Shift+Right", Action::MoveWindowToColumnRight),
+                bind("Mod+Ctrl+Shift+H", Action::MoveWindowToColumnLeft),
+                bind("Mod+Ctrl+Shift+L", Action::MoveWindowToColumnRight),
+                // Consume window from the right into this column / expel
+                // the bottom window out to the right (niri comma/period).
+                bind("Mod+Comma", Action::ConsumeWindowIntoColumn),
+                bind("Mod+Period", Action::ExpelWindowFromColumn),
                 bind("Mod+Page_Down", Action::FocusColumnRight),
                 bind("Mod+Page_Up", Action::FocusColumnLeft),
                 // Mouse wheel: niri's defaults — wheel moves column focus
@@ -884,6 +902,8 @@ fn parse_action(node: &KdlNode) -> Option<Action> {
         "move-window-to-column-right" => Action::MoveWindowToColumnRight,
         "consume-or-expel-window-left" => Action::ConsumeOrExpelWindowLeft,
         "consume-or-expel-window-right" => Action::ConsumeOrExpelWindowRight,
+        "consume-window-into-column" => Action::ConsumeWindowIntoColumn,
+        "expel-window-from-column" => Action::ExpelWindowFromColumn,
         "set-column-width" => Action::SetColumnWidth(arg.unwrap_or_default()),
         "switch-preset-column-width" => Action::SwitchPresetColumnWidth,
         "set-window-height" => Action::SetWindowHeight(arg.unwrap_or_default()),
