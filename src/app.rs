@@ -525,8 +525,12 @@ impl AppState {
             self.begin_screen_transition();
             return;
         }
-        // Find the device of the focused window (fallback: monitor
-        // under the cursor).
+        // Resolve the device for this action: the monitor holding the
+        // focused window. When nothing is focused (e.g. we're on an
+        // empty workspace), fall back to the monitor under the cursor
+        // — workspace switches, spawn and quit must keep working on
+        // an empty workspace (niri semantics: you can always switch
+        // away from an empty one).
         let focused_id = self.focused.map(|h| h.0 as isize).or_else(|| {
             let cursor_mon = monitor::monitor_at_cursor(&self.monitors)?;
             self.layout
@@ -534,11 +538,23 @@ impl AppState {
                 .and_then(|m| m.active_workspace().focused_id())
         });
 
-        let Some(id) = focused_id else { return };
+        let device = focused_id
+            .and_then(|id| {
+                self.layout
+                    .monitors
+                    .iter()
+                    .find_map(|m| m.workspace_of(id).map(|_| m.device.clone()))
+            })
+            .or_else(|| {
+                monitor::monitor_at_cursor(&self.monitors).map(|m| m.device.clone())
+            });
+        let Some(device) = device else { return };
 
         // Floating windows are not in the tiling: handle the small
         // action subset that applies to them directly.
-        if self.floating.contains_key(&id) {
+        if let Some(id) = focused_id
+            && self.floating.contains_key(&id)
+        {
             if matches!(action, Action::ToggleWindowFloating) {
                 let fs = self.floating.get(&id).cloned().unwrap();
                 self.unfloat_window(id, fs);
@@ -630,19 +646,12 @@ impl AppState {
         }
         // Tiling -> float happens before the layout lookup too (the
         // window leaves the layout immediately).
-        if matches!(action, Action::ToggleWindowFloating) {
+        if let Some(id) = focused_id
+            && matches!(action, Action::ToggleWindowFloating)
+        {
             self.float_window(id);
             return;
         }
-
-        let Some(device) = self
-            .layout
-            .monitors
-            .iter()
-            .find_map(|m| m.workspace_of(id).map(|_| m.device.clone()))
-        else {
-            return;
-        };
 
         let mut changed = false;
         // Windowed-fullscreen bookkeeping, applied after the layout
@@ -702,6 +711,10 @@ impl AppState {
                 }
                 FocusWorkspace(n) | WorkspaceSwitch(n) => {
                     let idx = n.saturating_sub(1) as usize;
+                    log::debug!(
+                        "ws switch: target idx={idx} active={} (device {device})",
+                        monitor_layout.active_workspace_idx
+                    );
                     changed = monitor_layout.switch_workspace(idx);
                     if changed {
                         ws_switch = Some(idx);
@@ -732,7 +745,9 @@ impl AppState {
                     unsafe { PostQuitMessage(0) };
                 }
                 CloseWindow => {
-                    self.close_window(id);
+                    if let Some(id) = focused_id {
+                        self.close_window(id);
+                    }
                 }
                 _ => {}
             }
@@ -750,7 +765,26 @@ impl AppState {
                     self.borderless.insert(cur_id);
                 }
             }
-            self.update_focus_view(id);
+            if let Some(idx) = ws_switch {
+                // Focus follows the workspace switch (niri semantics):
+                // adopt the new workspace's focused window, if any.
+                // Otherwise `self.focused` would still point at the old
+                // workspace's window — hidden by reflow — and
+                // sync_focus_to_os would push OS focus onto it.
+                let new_id = self
+                    .layout
+                    .monitor(&device)
+                    .and_then(|ml| ml.workspaces.get(idx))
+                    .and_then(|ws| ws.focused_id());
+                self.focused = new_id.map(|nid| HWND(nid as *mut _));
+                if let Some(nid) = new_id {
+                    // Refresh the view offset of the workspace we
+                    // switched TO, not the one we came from.
+                    self.update_focus_view(nid);
+                }
+            } else if let Some(id) = focused_id {
+                self.update_focus_view(id);
+            }
             self.reflow();
             self.sync_focus_to_os();
         }
