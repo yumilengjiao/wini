@@ -91,6 +91,11 @@ struct AppState {
     borderless: std::collections::HashSet<isize>,
     /// Floating windows (out of the tiling grid).
     floating: std::collections::HashMap<isize, FloatState>,
+    /// Windows WE hid via `set_shown(hwnd, false)` (inactive
+    /// workspaces, invisible floats). Their `EVENT_OBJECT_HIDE` is
+    /// self-inflicted and must not unmanage them — otherwise switching
+    /// workspaces would silently drop every window from the layout.
+    hidden_by_us: std::collections::HashSet<isize>,
     /// Each window's geometry as it was when we started managing it;
     /// restored on exit so the desktop is left as we found it.
     original_rects: std::collections::HashMap<isize, windows::Win32::Foundation::RECT>,
@@ -124,6 +129,13 @@ impl AppState {
                 }
             }
             WinEvent::Hidden(hwnd) | WinEvent::Cloaked(hwnd) | WinEvent::MinimizeStarted(hwnd) => {
+                let id = hwnd.0 as isize;
+                if self.hidden_by_us.contains(&id) {
+                    // We hid this window ourselves (inactive workspace /
+                    // hidden float). Keep managing it.
+                    log::debug!("ignoring self-inflicted hide of {id}");
+                    return;
+                }
                 if let Some(info) = self.windows.remove(hwnd) {
                     log::info!("window hidden: \"{}\"", info.title);
                     let id = hwnd.0 as isize;
@@ -136,9 +148,11 @@ impl AppState {
                 }
             }
             WinEvent::Destroyed(hwnd) => {
+                let dead_id = hwnd.0 as isize;
+                self.hidden_by_us.remove(&dead_id);
                 if let Some(info) = self.windows.remove(hwnd) {
                     log::info!("window closed: \"{}\"", info.title);
-                    let id = hwnd.0 as isize;
+                    let id = dead_id;
                     self.layout.remove_window(id);
                     self.animator.remove(id);
                     self.restore_borders(id);
@@ -1308,12 +1322,15 @@ impl AppState {
                 if crate::win::api::is_alive(hwnd) {
                     placement::set_shown(hwnd, false);
                 }
+                // The hide event for this window is ours; ignore it.
+                self.hidden_by_us.insert(id);
                 self.animator.remove(id);
             } else {
                 if crate::win::api::is_alive(hwnd) {
                     placement::set_shown(hwnd, true);
                     placement::raise(hwnd);
                 }
+                self.hidden_by_us.remove(&id);
                 self.animator.set_target(id, x, y, w, h);
             }
         }
@@ -1322,6 +1339,8 @@ impl AppState {
             if crate::win::api::is_alive(hwnd) {
                 placement::set_shown(hwnd, false);
             }
+            // The hide event for this window is ours; ignore it.
+            self.hidden_by_us.insert(id);
             // No point animating a hidden window.
             self.animator.remove(id);
         }
@@ -1330,6 +1349,7 @@ impl AppState {
             if crate::win::api::is_alive(hwnd) {
                 placement::set_shown(hwnd, true);
             }
+            self.hidden_by_us.remove(id);
         }
         for (id, x, y, w, h) in targets {
             log::debug!("reflow target: {id} -> ({x:.0}, {y:.0}, {w:.0}x{h:.0})");
@@ -1432,6 +1452,7 @@ impl App {
             interact_start_rect: None,
             borderless: std::collections::HashSet::new(),
             floating: std::collections::HashMap::new(),
+            hidden_by_us: std::collections::HashSet::new(),
             original_rects: std::collections::HashMap::new(),
             overlay,
             focus_border,
