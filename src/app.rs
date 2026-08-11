@@ -1319,11 +1319,13 @@ impl AppState {
         for (id, x, y, w, h, visible) in floats {
             let hwnd = HWND(id as *mut _);
             if !visible {
+                // Register BEFORE hiding: if the winevent hook fires
+                // re-entrantly, hidden_by_us must already contain the
+                // id so we don't unmanage our own hide.
+                self.hidden_by_us.insert(id);
                 if crate::win::api::is_alive(hwnd) {
                     placement::set_shown(hwnd, false);
                 }
-                // The hide event for this window is ours; ignore it.
-                self.hidden_by_us.insert(id);
                 self.animator.remove(id);
             } else {
                 if crate::win::api::is_alive(hwnd) {
@@ -1336,11 +1338,11 @@ impl AppState {
         }
         for id in hide_ids {
             let hwnd = HWND(id as *mut _);
+            // Register BEFORE hiding (see the floats loop above).
+            self.hidden_by_us.insert(id);
             if crate::win::api::is_alive(hwnd) {
                 placement::set_shown(hwnd, false);
             }
-            // The hide event for this window is ours; ignore it.
-            self.hidden_by_us.insert(id);
             // No point animating a hidden window.
             self.animator.remove(id);
         }
