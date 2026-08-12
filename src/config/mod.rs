@@ -118,9 +118,9 @@ pub enum ModKey {
 }
 
 /// Animation tuning, per animation kind (niri-style `animations` node).
-/// Kinds we can't drive (window-open/close need shader-level compositing;
-/// workspace-switch needs workspace slide rendering) are parsed and
-/// validated so configs port over, but not animated yet.
+/// Kinds we can't drive (window-open/close need shader-level
+/// compositing) are parsed and validated so configs port over, but
+/// not animated yet.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnimationsConfig {
     /// Master switch (`animations { off; }` disables everything by
@@ -139,7 +139,7 @@ pub struct AnimationsConfig {
     pub window_open: AnimKind,
     /// Parsed but not animated.
     pub window_close: AnimKind,
-    /// Parsed but not animated (needs workspace slide rendering).
+    /// Workspace-switch slide (the vertical canvas slide).
     pub workspace_switch: AnimKind,
 }
 
@@ -200,6 +200,11 @@ impl AnimationsConfig {
     pub fn view_offset_params(&self) -> AnimParams {
         self.params(self.view_offset)
     }
+
+    /// Driving parameters for the workspace-switch slide.
+    pub fn workspace_switch_params(&self) -> AnimParams {
+        self.params(self.workspace_switch)
+    }
 }
 
 /// Niri's `layout { focus-ring { ... } }`: the outline drawn around the
@@ -209,6 +214,10 @@ pub struct FocusRingConfig {
     pub enabled: bool,
     /// Ring thickness in pixels.
     pub width: i32,
+    /// Corner radius in pixels (0 = square corners, niri's default;
+    /// Windows 11 apps are drawn with rounded corners, so ~8-12
+    /// usually matches them visually).
+    pub radius: i32,
     /// Active color as 0xRRGGBB.
     pub active_color: u32,
 }
@@ -218,6 +227,7 @@ impl Default for FocusRingConfig {
         FocusRingConfig {
             enabled: true,
             width: 4,
+            radius: 0,
             active_color: 0x7D_AEA3,
         }
     }
@@ -337,6 +347,10 @@ impl Default for Config {
                 bind("Mod+End", Action::FocusColumnLast),
                 bind("Mod+F", Action::MaximizeColumn),
                 bind("Mod+Shift+F", Action::ToggleWindowedFullscreen),
+                // Real fullscreen: borderless, covering the whole
+                // monitor (the F11 look), distinct from Mod+F's
+                // maximize which keeps the title bar and work area.
+                bind("Mod+M", Action::ToggleWindowedFullscreen),
                 // Cycle preset column widths (niri: 1/3, 1/2, 2/3).
                 bind("Mod+R", Action::SwitchPresetColumnWidth),
                 bind("Mod+V", Action::ToggleWindowFloating),
@@ -497,9 +511,10 @@ fn parse_layout(node: &KdlNode, config: &mut Config) {
                 }
             }
             "edge-padding" => {
-                if let Some(v) = first_float_arg(n) {
-                    config.layout.edge_padding = v;
-                }
+                // Deprecated and ignored: niri has no separate edge
+                // padding — `gaps` is used at the view edges too.
+                // Accepted so old configs keep loading.
+                log::warn!("layout 'edge-padding' is deprecated and ignored; use gaps");
             }
             "center-focused-column" => {
                 if let Some(v) = first_string_arg(n) {
@@ -606,8 +621,8 @@ fn parse_preset_widths(n: &KdlNode) -> Vec<ColumnWidth> {
     out
 }
 
-/// `focus-ring { off; width 4; active-color "#7daea3"; }` (naming
-/// follows niri; a bare `focus-ring 4;` sets the width).
+/// `focus-ring { off; width 4; radius 8; active-color "#7daea3"; }`
+/// (naming follows niri; a bare `focus-ring 4;` sets the width).
 fn parse_focus_ring(n: &KdlNode, config: &mut Config) {
     if let Some(v) = first_float_arg(n) {
         config.focus_ring.width = v.max(1.0) as i32;
@@ -619,6 +634,11 @@ fn parse_focus_ring(n: &KdlNode, config: &mut Config) {
             "width" => {
                 if let Some(v) = first_float_arg(c) {
                     config.focus_ring.width = v.max(1.0) as i32;
+                }
+            }
+            "radius" | "corner-radius" => {
+                if let Some(v) = first_float_arg(c) {
+                    config.focus_ring.radius = v.max(0.0) as i32;
                 }
             }
             "active-color" => {
@@ -1031,7 +1051,6 @@ mod tests {
         let cfg = parse(src).unwrap();
         assert!(matches!(cfg.mod_key, ModKey::Super));
         assert_eq!(cfg.layout.gaps, 12.0);
-        assert_eq!(cfg.layout.edge_padding, 4.0);
         assert_eq!(cfg.layout.center_focused_column, CenterFocused::Always);
         assert_eq!(cfg.layout.default_column_width, ColumnWidth::Fixed(1000.0));
         assert_eq!(cfg.binds.len(), 3);
@@ -1136,6 +1155,19 @@ mod tests {
                 stiffness: 1000.0,
                 epsilon: 0.0001,
             })
+        );
+
+        // The workspace-switch slide can be turned off on its own
+        // (niri's per-kind `off`).
+        let cfg = parse("animations { workspace-switch { off; } }").unwrap();
+        assert_eq!(
+            cfg.animations.workspace_switch_params().kind,
+            AnimKind::instant()
+        );
+        // ...and everything else keeps its defaults.
+        assert_ne!(
+            cfg.animations.movement_params().kind,
+            AnimKind::instant()
         );
 
         // Custom cubic-bezier curve.
@@ -1269,6 +1301,10 @@ mod tests {
             cfg.focus_ring.active_color,
             FocusRingConfig::default().active_color
         );
+
+        let cfg = parse("layout { focus-ring { radius 12; } }").unwrap();
+        assert_eq!(cfg.focus_ring.radius, 12);
+        assert_eq!(FocusRingConfig::default().radius, 0);
     }
 
     #[test]

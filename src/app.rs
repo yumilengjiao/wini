@@ -57,6 +57,73 @@ struct FloatState {
     h: f64,
 }
 
+/// An in-flight workspace-switch slide on one monitor (niri's
+/// vertical canvas, camera model).
+///
+/// Niri does NOT animate each window separately: it animates ONE
+/// value — the workspace render index (the "camera" position on the
+/// vertical strip) — and every workspace's render offset falls out of
+/// that single spring. That is what makes interruptions smooth: a
+/// switch mid-slide retargets the camera from its CURRENT position
+/// (with velocity carry-over), and all windows move in lockstep.
+/// Animating per-window rects instead (what we did before) broke in
+/// three visible ways: windows re-seeded mid-flight jumped, windows
+/// of different workspaces overlapped in wrong Z order, and rapid
+/// switching produced per-window spring state that diverged.
+///
+/// The camera is an index on the workspace strip: `0.0` = workspace 0
+/// fills the view, `1.0` = workspace 1, etc. One strip unit is the
+/// FULL monitor height plus a 10% gap (niri's
+/// `workspace_size_with_gap`: view_size is the whole output — layer
+/// bars float above it — plus `0.1 * height` gap). Tile geometry
+/// stays work-area based as always; only the slide transport uses the
+/// full-height strip, so windows slide clear of the bar zone instead
+/// of stopping right at its edge (the "old workspace's bottom edge
+/// visible under the bar" bug).
+#[derive(Debug, Clone)]
+struct Slide {
+    /// Animated camera position (workspace index on the strip).
+    camera: crate::anim::Val,
+    /// Each participant's final on-work-area tile rects (target
+    /// geometry; workspace idx -> rects). This doubles as the list
+    /// of participants — everything between the previous and the
+    /// target workspace, inclusive (niri sweeps intermediate
+    /// workspaces across the view).
+    finals: Vec<(usize, Vec<crate::layout::geometry::TileRect>)>,
+    /// Strip stride: one workspace unit in pixels (full height × 1.1).
+    /// The camera anchor is implicit: `finals` are work-area rects,
+    /// so at camera position c workspace c's tiles sit at exactly
+    /// their final (settled) positions (dy = 0) — the settle
+    /// handover to reflow() is pixel-exact.
+    stride: f64,
+}
+
+impl Slide {
+    /// Current on-screen rects for every participant window at
+    /// camera position `cam` (idx units on the strip).
+    fn rects_at(&self, cam: f64) -> Vec<crate::layout::geometry::TileRect> {
+        let mut out = Vec::new();
+        for (k, rects) in &self.finals {
+            let dy = ((*k as f64 - cam) * self.stride).round() as i32;
+            for r in rects {
+                out.push(crate::layout::geometry::TileRect {
+                    id: r.id,
+                    x: r.x,
+                    y: r.y + dy,
+                    w: r.w,
+                    h: r.h,
+                });
+            }
+        }
+        out
+    }
+
+    /// Is the camera settled at its target?
+    fn finished(&self) -> bool {
+        self.camera.finished()
+    }
+}
+
 /// Mutable state shared between the message loop and event handlers.
 /// (The config field is consumed by the input module in the next
 /// commits.)
@@ -96,6 +163,9 @@ struct AppState {
     /// self-inflicted and must not unmanage them — otherwise switching
     /// workspaces would silently drop every window from the layout.
     hidden_by_us: std::collections::HashSet<isize>,
+    /// In-flight workspace-switch slides (niri's vertical canvas),
+    /// keyed by monitor device. See [`Slide`] for the camera model.
+    slides: std::collections::HashMap<String, Slide>,
     /// Each window's geometry as it was when we started managing it;
     /// restored on exit so the desktop is left as we found it.
     original_rects: std::collections::HashMap<isize, windows::Win32::Foundation::RECT>,
@@ -212,6 +282,9 @@ impl AppState {
                         self.update_focus_border();
                     }
                 }
+                // The newly-foreground window raises itself while
+                // processing WM_ACTIVATE: nothing to do for the bar
+                // (topmost layer) here yet.
             }
         }
     }
@@ -314,7 +387,7 @@ impl AppState {
                 let Some(mon) = self.monitors.iter().find(|mon| mon.device == m.device) else {
                     continue;
                 };
-                let view_width = (mon.width() as f64 - params.edge_padding * 2.0).max(1.0);
+                let view_width = (mon.work.right - mon.work.left) as f64;
                 let ws = &mut m.workspaces[ws_idx];
                 geometry::refresh_view_offset(ws, &params, view_width, None);
                 return;
@@ -429,6 +502,37 @@ impl AppState {
                 .map(|(id, x, y, w, h)| geometry::TileRect { id, x, y, w, h })
                 .collect();
             placement::apply_geometry(&tiles);
+        }
+        // In-flight workspace slides snap to their endpoints too:
+        // park every participant at its final tile, hide the
+        // non-active workspaces, and drop the slide. Without this,
+        // a slide freezes mid-transport (tick_slides is paused) and
+        // the transition reveal would show a half-scrolled canvas.
+        // `resume_management`'s reflow re-applies the layout after.
+        let slides = std::mem::take(&mut self.slides);
+        for (device, slide) in slides {
+            let cam = slide.camera.target();
+            placement::apply_geometry(&slide.rects_at(cam));
+            let active_idx = self
+                .layout
+                .monitor(&device)
+                .map(|ml| ml.active_workspace_idx);
+            for (k, rs) in &slide.finals {
+                if Some(*k) == active_idx {
+                    continue;
+                }
+                for r in rs {
+                    let hwnd = HWND(r.id as *mut _);
+                    // Register BEFORE hiding (hook race).
+                    self.hidden_by_us.insert(r.id);
+                    if crate::win::api::is_alive(hwnd) {
+                        placement::set_shown(hwnd, false);
+                    }
+                }
+            }
+            log::debug!(
+                "slide[{device}]: snapped to endpoint on suspend (camera={cam:.3})"
+            );
         }
         if let Some(fb) = self.focus_border.as_ref() {
             fb.hide();
@@ -674,6 +778,8 @@ impl AppState {
         let mut fullscreen_now: Option<isize> = None;
         // Workspace we switched to (for the indicator overlay), if any.
         let mut ws_switch: Option<usize> = None;
+        // Workspace we switched FROM (drives the slide direction).
+        let mut ws_prev: Option<usize> = None;
         // Preset column widths for the bare set-column-width (cloned
         // out before the layout borrow below).
         let presets = self.params.preset_column_widths.clone();
@@ -729,27 +835,33 @@ impl AppState {
                         "ws switch: target idx={idx} active={} (device {device})",
                         monitor_layout.active_workspace_idx
                     );
+                    let prev = monitor_layout.active_workspace_idx;
                     changed = monitor_layout.switch_workspace(idx);
                     if changed {
                         ws_switch = Some(idx);
+                        ws_prev = Some(prev);
                     }
                 }
                 MoveWindowToWorkspace(n) => {
                     let idx = n.saturating_sub(1) as usize;
+                    let prev = monitor_layout.active_workspace_idx;
                     changed = monitor_layout
                         .move_focused_window_to_workspace(idx, true)
                         .is_some();
                     if changed {
                         ws_switch = Some(idx);
+                        ws_prev = Some(prev);
                     }
                 }
                 MoveColumnToWorkspace(n) => {
                     let idx = n.saturating_sub(1) as usize;
+                    let prev = monitor_layout.active_workspace_idx;
                     changed = monitor_layout
                         .move_focused_column_to_workspace(idx, true)
                         .is_some();
                     if changed {
                         ws_switch = Some(idx);
+                        ws_prev = Some(prev);
                     }
                 }
                 Spawn(cmd) => {
@@ -796,10 +908,24 @@ impl AppState {
                     // switched TO, not the one we came from.
                     self.update_focus_view(nid);
                 }
-            } else if let Some(id) = focused_id {
-                self.update_focus_view(id);
+                // Workspace-switch slide (niri's vertical canvas): the
+                // old workspace's windows animate out of view while
+                // the new ones slide in from the opposite edge. Falls
+                // back to the plain (instant) reflow when the
+                // animation is `off` in the config, or while the user
+                // is dragging a window.
+                let slidden = ws_prev.is_some_and(|prev_idx| {
+                    self.workspace_slide_reflow(&device, prev_idx, idx)
+                });
+                if !slidden {
+                    self.reflow();
+                }
+            } else {
+                if let Some(id) = focused_id {
+                    self.update_focus_view(id);
+                }
+                self.reflow();
             }
-            self.reflow();
             self.sync_focus_to_os();
         }
         if let Some(idx) = ws_switch {
@@ -891,7 +1017,18 @@ impl AppState {
             fb.hide();
             return;
         }
-        if let Some((x, y, w, h)) = crate::win::api::window_rect(hwnd) {
+        // Hug the window edge. While the window animates, the HWND's
+        // rect is stale: moves go out with SWP_ASYNCWINDOWPOS, so
+        // right after a tick the window is still at the previous
+        // frame's position — reading it makes the ring trail the
+        // window. Use the animator's in-flight rect (what we just
+        // sent).
+        let rect = if let Some((ax, ay, aw, ah)) = self.animator.in_flight_value(id) {
+            Some((ax as f64, ay as f64, aw as f64, ah as f64))
+        } else {
+            crate::win::api::window_rect(hwnd)
+        };
+        if let Some((x, y, w, h)) = rect {
             // Config stores 0xRRGGBB; COLORREF wants 0x00BBGGRR.
             let rgb = ring.active_color;
             let bgr = ((rgb & 0xFF) << 16) | (rgb & 0x00_FF_00) | ((rgb >> 16) & 0xFF);
@@ -1249,6 +1386,179 @@ impl AppState {
         let hwnd = windows::Win32::Foundation::HWND(focused_id as *mut _);
         let ok = crate::win::api::force_set_foreground(hwnd);
         log::debug!("sync_focus_to_os: force_set_foreground({focused_id}) -> {ok}");
+        // SetForegroundWindow/BringWindowToTop put the window above
+        // the desktop bar (yasb/zebar); bringing bars back up is
+        // handled by the bar-raise pass (niri: layer-shell top).
+        let _ = ok;
+    }
+
+    /// Animate a workspace switch as niri does, with a CAMERA model:
+    /// workspaces live on a vertical strip and we animate a single
+    /// value — the camera (workspace render index) — from which every
+    /// participant window's position derives each frame. This is
+    /// niri's `workspace_render_idx()` design verbatim; see [`Slide`]
+    /// for why per-window animation was replaced.
+    ///
+    /// One strip unit is the FULL monitor height + 10% gap (niri's
+    /// `workspace_size_with_gap`): windows slide fully clear of the
+    /// bar zone instead of parking at its edge, and intermediate
+    /// workspaces sweep across the view like niri's. Bars (yasb/...)
+    /// are re-raised above the sliding windows every frame.
+    ///
+    /// Returns false (and does nothing) when the animation is
+    /// disabled (`off`), the monitor is unknown, or management is
+    /// paused — the caller then does a plain reflow.
+    fn workspace_slide_reflow(&mut self, device: &str, prev_idx: usize, idx: usize) -> bool {
+        // While the user drags/resizes (or management is suspended)
+        // reflow is paused; starting a slide then would strand windows
+        // off screen. Plain switch instead.
+        if self.interacting_window.is_some() || self.suspended {
+            return false;
+        }
+        let ws_params = self.config.animations.workspace_switch_params();
+        if ws_params.kind == crate::anim::AnimKind::instant() {
+            return false;
+        }
+        let Some(mon) = self.monitors.iter().find(|m| m.device == device) else {
+            return false;
+        };
+        let Some(ml) = self.layout.monitor(device) else {
+            return false;
+        };
+        let params = self.params.clone();
+
+        // niri's strip geometry: a workspace unit is the FULL output
+        // height (bars are layer-shell overlays above the canvas; the
+        // canvas itself is the whole monitor) plus a 10% gap. The
+        // camera anchor is the WORK-area top: at camera position c,
+        // workspace c's tiles sit at exactly their final (settled)
+        // positions — dy = (k - c) * stride is 0 for the active
+        // workspace at rest, so the settle handover to reflow() is
+        // pixel-exact (no snap).
+        let full_h = (mon.full.bottom - mon.full.top) as f64;
+        let stride = full_h * 1.1;
+        let area = (
+            mon.work.left as f64,
+            mon.work.top as f64,
+            (mon.work.right - mon.work.left) as f64,
+            (mon.work.bottom - mon.work.top) as f64,
+        );
+
+        // Every workspace between old and new (inclusive) takes part.
+        let lo = prev_idx.min(idx);
+        let hi = prev_idx.max(idx);
+        let mut participants: Vec<usize> = Vec::new();
+        let mut finals: Vec<(usize, Vec<geometry::TileRect>)> = Vec::new();
+        for k in lo..=hi {
+            let Some(ws) = ml.workspaces.get(k) else { continue };
+            participants.push(k);
+            finals.push((k, geometry::compute_workspace_geometry(ws, &params, area)));
+        }
+        // Extend an interrupted slide on this monitor with any
+        // participants it had that the new range misses (e.g. 3 -> 2
+        // -> 1: ws3 must keep sliding out while ws2/ws1 slide in) —
+        // with their CURRENT camera-relative rects as finals so they
+        // keep moving coherently instead of freezing mid-view.
+        if let Some(old) = self.slides.get(device) {
+            let cam_now = old.camera.value();
+            let mut old_rects = old.rects_at(cam_now);
+            let covered: std::collections::HashSet<isize> = finals
+                .iter()
+                .flat_map(|(_, rs)| rs.iter().map(|r| r.id))
+                .collect();
+            for (k, rects) in &old.finals {
+                if (lo..=hi).contains(k) {
+                    // Workspaces the new slide covers get fresh
+                    // finals above; drop their rects from the old set
+                    // (they may have moved since).
+                    old_rects.retain(|r| !covered.contains(&r.id));
+                    continue;
+                }
+                participants.push(*k);
+                finals.push((*k, rects.clone()));
+            }
+            // Park the still-relevant old participants exactly where
+            // they are right now, so the camera handover is seamless.
+            let keep: std::collections::HashSet<isize> =
+                old_rects.iter().map(|r| r.id).collect();
+            for (k, rects) in finals.iter_mut() {
+                if !participants.contains(k) || (lo..=hi).contains(k) {
+                    continue;
+                }
+                rects.retain(|r| !keep.contains(&r.id));
+                for r in old_rects.iter().filter(|r| keep.contains(&r.id)) {
+                    if rects.iter().all(|x| x.id != r.id) && ml
+                        .workspaces
+                        .get(*k)
+                        .is_some_and(|ws| ws.window_ids().any(|id| id == r.id))
+                    {
+                        rects.push(*r);
+                    }
+                }
+            }
+        }
+
+        // The camera: starts at the OLD view (or wherever an
+        // interrupted slide currently is — the retarget below then
+        // continues from that position AND velocity, which is what
+        // makes rapid switching smooth instead of stuttery) and
+        // targets the NEW workspace index.
+        let cam_from = match self.slides.get(device) {
+            Some(old) => old.camera.value(),
+            None => prev_idx as f64,
+        };
+        let mut camera = crate::anim::Val::to(cam_from, ws_params);
+        camera.retarget(idx as f64, ws_params);
+
+        // Build the slide record, then materialize one frame at the
+        // camera's current value so windows jump to their
+        // canvas-relative positions immediately (no one-frame flash
+        // of the new workspace's final tiles).
+        let slide = Slide {
+            camera,
+            finals,
+            stride,
+        };
+        placement::apply_geometry(&slide.rects_at(cam_from));
+
+        // Show every participant; hide everything else on this
+        // monitor's inactive workspaces. No `raise` anywhere: all
+        // participants keep their existing relative Z order through
+        // the slide (raising the entering workspace's windows would
+        // visibly cover the ones still sliding out — the rapid
+        // 3 -> 2 -> 1 bug). The bars get re-raised instead.
+        let participant_ids: std::collections::HashSet<isize> = slide
+            .finals
+            .iter()
+            .flat_map(|(_, rs)| rs.iter().map(|r| r.id))
+            .collect();
+        for r in slide.finals.iter().flat_map(|(_, rs)| rs.iter()) {
+            let hwnd = HWND(r.id as *mut _);
+            if crate::win::api::is_alive(hwnd) {
+                self.hidden_by_us.remove(&r.id);
+                placement::set_shown(hwnd, true);
+            }
+        }
+        for k in 0..ml.workspaces.len() {
+            if k == idx {
+                continue;
+            }
+            for id in ml.workspaces[k].window_ids() {
+                if participant_ids.contains(&id) {
+                    continue;
+                }
+                let hwnd = HWND(id as *mut _);
+                // Register BEFORE hiding (hook race; see reflow).
+                self.hidden_by_us.insert(id);
+                if crate::win::api::is_alive(hwnd) {
+                    placement::set_shown(hwnd, false);
+                }
+                self.animator.remove(id);
+            }
+        }
+
+        self.slides.insert(device.to_string(), slide);
+        true
     }
 
     /// Recompute geometry for every monitor's active workspace and push
@@ -1270,9 +1580,29 @@ impl AppState {
             let Some(ml) = self.layout.monitor(&mon.device) else {
                 continue;
             };
+            // A slide in flight on this monitor owns its windows'
+            // geometry: applying final (settled) tile rects mid-slide
+            // would snap the sliding windows to their end positions.
+            // Floats of the active workspace are still managed below
+            // (floats don't take part in the slide), but the tiled
+            // targets for THIS monitor are skipped until the slide
+            // settles (which runs the skipped reflow via
+            // finish_slide).
+            let mut sliding_ids: std::collections::HashSet<isize> =
+                std::collections::HashSet::new();
+            if let Some(slide) = self.slides.get(&mon.device) {
+                sliding_ids.extend(
+                    slide.finals.iter().flat_map(|(_, rs)| rs.iter().map(|r| r.id)),
+                );
+            }
             for (i, ws) in ml.workspaces.iter().enumerate() {
                 if i != ml.active_workspace_idx {
-                    hide_ids.extend(ws.window_ids());
+                    // Windows still taking part in a slide on this
+                    // monitor are hidden by finish_slide once the
+                    // camera settles; don't hide them mid-slide.
+                    hide_ids.extend(
+                        ws.window_ids().filter(|id| !sliding_ids.contains(id)),
+                    );
                 }
             }
             let area = (
@@ -1295,7 +1625,9 @@ impl AppState {
                 } else {
                     (r.x as f64, r.y as f64, r.w as f64, r.h as f64)
                 };
-                targets.push((r.id, x, y, w, h));
+                if !sliding_ids.contains(&r.id) {
+                    targets.push((r.id, x, y, w, h));
+                }
                 show_ids.push(r.id);
             }
             if let Some(fs_id) = fs_id {
@@ -1358,12 +1690,15 @@ impl AppState {
             self.animator.set_target(id, x, y, w, h);
         }
         // The fullscreen window must cover its tile siblings.
-        for id in raise_ids {
-            let hwnd = HWND(id as *mut _);
+        for id in &raise_ids {
+            let hwnd = HWND(*id as *mut _);
             if crate::win::api::is_alive(hwnd) {
                 placement::raise(hwnd);
             }
         }
+        // A windowed-fullscreen window covers the bar zone too (niri:
+        // layer-shell top).
+        let _ = &raise_ids;
         // Kick an immediate frame so first paint is not delayed.
         self.tick_animations();
         self.update_focus_border();
@@ -1378,9 +1713,61 @@ impl AppState {
             let rect = crate::layout::geometry::TileRect { id, x, y, w, h };
             placement::apply_geometry(&[rect]);
         }
+        self.tick_slides();
         // The ring follows the focused window's live rect, so it must
         // move with every animation frame.
         self.update_focus_border();
+    }
+
+    /// Advance every in-flight workspace slide one frame: place all
+    /// participant windows at their camera-derived rects, keep the
+    /// bars above them, and settle finished slides (park the active
+    /// workspace's windows at their final tiles, hide the rest, then
+    /// run the reflow the slide had been holding back — floats and
+    /// any layout changes that happened mid-slide land here).
+    fn tick_slides(&mut self) {
+        if self.slides.is_empty() {
+            return;
+        }
+        let devices: Vec<String> = self.slides.keys().cloned().collect();
+        for device in devices {
+            let Some(slide) = self.slides.get(&device) else {
+                continue;
+            };
+            let cam = slide.camera.value();
+            let rects = slide.rects_at(cam);
+            let done = slide.finished();
+            log::debug!("slide[{device}]: camera={cam:.3} done={done}");
+            placement::apply_geometry(&rects);
+            if done {
+                let slide = self.slides.remove(&device).expect("checked above");
+                log::debug!("slide[{device}]: settled, hiding non-active windows");
+                // Park the final frame first (apply_geometry above
+                // used the settled camera value already). Hide the
+                // non-active participants.
+                let active_idx = self
+                    .layout
+                    .monitor(&device)
+                    .map(|ml| ml.active_workspace_idx);
+                for (k, rs) in &slide.finals {
+                    if Some(*k) == active_idx {
+                        continue;
+                    }
+                    for r in rs {
+                        let hwnd = HWND(r.id as *mut _);
+                        // Register BEFORE hiding (hook race).
+                        self.hidden_by_us.insert(r.id);
+                        if crate::win::api::is_alive(hwnd) {
+                            placement::set_shown(hwnd, false);
+                        }
+                    }
+                }
+                // The slide no longer owns this monitor's geometry:
+                // apply whatever accumulated while it was in flight
+                // (e.g. floats shown/hidden mid-slide).
+                self.reflow();
+            }
+        }
     }
 }
 
@@ -1455,6 +1842,7 @@ impl App {
             borderless: std::collections::HashSet::new(),
             floating: std::collections::HashMap::new(),
             hidden_by_us: std::collections::HashSet::new(),
+            slides: std::collections::HashMap::new(),
             original_rects: std::collections::HashMap::new(),
             overlay,
             focus_border,

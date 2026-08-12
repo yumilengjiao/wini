@@ -29,10 +29,11 @@ pub enum CenterFocused {
 /// Layout tuning parameters (will be driven by config later).
 #[derive(Debug, Clone)]
 pub struct LayoutParams {
-    /// Gap between columns and between tiles, in pixels.
+    /// Gap between columns and between tiles, in pixels. Niri uses this
+    /// single value everywhere — including the breathing room at the
+    /// view edges (via the view-offset alignment logic) — so there is
+    /// no separate edge padding.
     pub gaps: f64,
-    /// Padding between the monitor work area and the content area.
-    pub edge_padding: f64,
     /// Width for columns that don't specify one.
     pub default_column_width: ColumnWidth,
     /// Preset column widths cycled through by a bare `set-column-width`
@@ -45,10 +46,11 @@ impl Default for LayoutParams {
     fn default() -> Self {
         // Niri defaults: gaps 8, default column width half the view
         // (niri's default config: default-column-width { proportion 0.5 }),
-        // center focused column on overflow.
+        // center-focused-column "never" (niri-config layout.rs default:
+        // the view scrolls just enough to fully show the focused
+        // column; on-overflow/always are opt-in).
         LayoutParams {
             gaps: 8.0,
-            edge_padding: 8.0,
             default_column_width: ColumnWidth::Proportion(0.5),
             // Niri's default presets (1/3, 1/2, 2/3 of the output) for
             // switch-preset-column-width (Mod+R).
@@ -57,7 +59,7 @@ impl Default for LayoutParams {
                 ColumnWidth::Proportion(0.5),
                 ColumnWidth::Proportion(0.66667),
             ],
-            center_focused_column: CenterFocused::OnOverflow,
+            center_focused_column: CenterFocused::Never,
         }
     }
 }
@@ -94,11 +96,10 @@ pub fn column_widths(ws: &Workspace, params: &LayoutParams, view_width: f64) -> 
             // size, which would visually overlap the next column.
             let min_w = c.tiles.iter().map(|t| t.min_w).fold(0.0, f64::max);
             if c.is_maximized {
-                // A maximized column occupies a full-work-area slot in
-                // scroll space (content area + both edge paddings), so
-                // the view can scroll to and away from it like any
-                // other column (niri semantics).
-                (view_width + params.edge_padding * 2.0).max(min_w)
+                // A maximized column occupies a full-view slot in scroll
+                // space, so the view can scroll to and away from it like
+                // any other column (niri semantics).
+                view_width.max(min_w)
             } else if c.is_full_width {
                 view_width.max(min_w)
             } else {
@@ -162,20 +163,31 @@ pub fn view_offset_to_show(
     }
 }
 
-/// View offset that centers `(col_x, col_width)` in the view.
+/// View OFFSET (relative to the column at `col_x`) that centers the
+/// column in the view. Niri: `-(view_width - col_width) / 2`; a column
+/// wider than the view left-aligns (offset 0).
 pub fn view_offset_centered(view_width: f64, col_x: f64, col_width: f64) -> f64 {
+    let _ = col_x;
     if view_width <= col_width {
         return 0.0;
     }
-    col_x + (col_width - view_width) / 2.0
+    (col_width - view_width) / 2.0
 }
 
 /// Niri's OnOverflow rule: if the source and target columns (plus a
 /// neighbor for context) fit in the view together, scroll minimally;
-/// otherwise center the target.
+/// otherwise center the target. `cur_vp` is the CURRENT view position
+/// (column-space x at the view's left edge) — the caller recovers it
+/// from the pre-focus-change state (see `refresh_view_offset`).
+/// `area_width` is the full work-area width: like niri's
+/// `working_area.size.w`, the fit test lets columns extend into the
+/// padding zones at the screen edges (two on-screen columns must not
+/// trigger the centered fallback).
+#[allow(clippy::too_many_arguments)]
 pub fn view_offset_for_column(
-    ws: &Workspace,
+    cur_vp: f64,
     params: &LayoutParams,
+    area_width: f64,
     view_width: f64,
     xs: &[f64],
     widths: &[f64],
@@ -190,17 +202,17 @@ pub fn view_offset_for_column(
 
     match params.center_focused_column {
         CenterFocused::Always => centered(),
-        CenterFocused::Never => show(view_pos(ws, xs)),
+        CenterFocused::Never => show(cur_vp),
         CenterFocused::OnOverflow => {
             let Some(prev_idx) = prev_idx else {
-                return show(view_pos(ws, xs));
+                return show(cur_vp);
             };
             if prev_idx == idx {
-                return show(view_pos(ws, xs));
+                return show(cur_vp);
             }
             // Take the neighbor of the target on the side we came from.
             let source_idx = if prev_idx > idx {
-                (idx + 1).min(ws.columns.len() - 1)
+                (idx + 1).min(xs.len() - 1)
             } else {
                 idx.saturating_sub(1)
             };
@@ -211,8 +223,8 @@ pub fn view_offset_for_column(
             } else {
                 source_x - target_x + source_w
             } + params.gaps * 2.0;
-            if span <= view_width {
-                show(view_pos(ws, xs))
+            if span <= area_width {
+                show(cur_vp)
             } else {
                 centered()
             }
@@ -220,23 +232,39 @@ pub fn view_offset_for_column(
     }
 }
 
-/// Clamp a raw view position so the view never scrolls beyond the first
-/// or last column. When everything fits, the content stays aligned to
-/// the left edge (niri's behavior — `always-center-single-column`
-/// defaults to false there).
-pub fn clamp_view_pos(vp: f64, xs: &[f64], widths: &[f64], view_width: f64) -> f64 {
+/// Clamp a raw view position for the "everything fits" case only:
+/// when all columns fit within the view, park the row at the left
+/// edge with the same padding the alignment logic would give the
+/// first column (gaps for a narrow column, 0 for a full-width one),
+/// so growing/shrinking columns slides the others instead of
+/// recentering the whole line.
+///
+/// When the content is wider than the view, this does NOT clamp:
+/// niri renders at whatever `view_pos()` the offset logic produced
+/// (see `columns_with_render_positions`) — the focused-column
+/// alignment (fit/centered) is the only constraint, and centering a
+/// column legitimately shows empty space beyond the last column.
+/// Clamping here used to cancel the OnOverflow centering: the range
+/// ended at `last_right + gaps - view_width`, which is exactly where
+/// the LAST column right-aligns — a centered middle column got
+/// pulled back and the view appeared to never scroll.
+pub fn clamp_view_pos(
+    vp: f64,
+    xs: &[f64],
+    widths: &[f64],
+    view_width: f64,
+    gaps: f64,
+) -> f64 {
     let Some((&first_x, _)) = xs.first().zip(widths.first()) else {
         return vp;
     };
     let last_right = xs.last().unwrap() + widths.last().unwrap();
     let total = last_right - first_x;
     if total <= view_width {
-        // Everything fits: keep the first column at the left edge so
-        // growing/shrinking columns slides the others instead of
-        // recentering the whole line.
-        first_x
+        let pad = ((view_width - widths[0]) / 2.0).clamp(0.0, gaps);
+        first_x - pad
     } else {
-        vp.clamp(first_x, last_right - view_width)
+        vp
     }
 }
 
@@ -277,17 +305,49 @@ pub fn tile_heights(ws: &Workspace, ci: usize, params: &LayoutParams, area_h: f6
 pub fn refresh_view_offset(
     ws: &mut Workspace,
     params: &LayoutParams,
-    view_width: f64,
-    prev_idx: Option<usize>,
+    area_width: f64,
+    prev_idx_hint: Option<usize>,
 ) {
     if ws.columns.is_empty() {
         ws.view_offset = 0.0;
+        ws.pending_view_rebase = None;
         return;
     }
+    let view_width = area_width.max(1.0);
     let idx = ws.active_column_idx;
     let widths = column_widths(ws, params, view_width);
     let xs = column_xs(&widths, params.gaps);
-    ws.view_offset = view_offset_for_column(ws, params, view_width, &xs, &widths, idx, prev_idx);
+    // Where the view is *right now*: focus moves record their
+    // pre-change (column, offset) pair in `pending_view_rebase`
+    // instead of rebasing view_offset (niri computes the new offset
+    // before switching the active column; we defer to here). The pair
+    // also identifies the previously focused column for
+    // center-focused-column=on-overflow.
+    let (cur_vp, prev_idx) = match ws.pending_view_rebase.take() {
+        Some((pidx, poff)) => {
+            let pidx = pidx.min(xs.len() - 1);
+            (xs[pidx] + poff, Some(pidx))
+        }
+        None => (view_pos(ws, &xs), prev_idx_hint),
+    };
+    let new_offset = view_offset_for_column(
+        cur_vp,
+        params,
+        area_width,
+        view_width,
+        &xs,
+        &widths,
+        idx,
+        prev_idx,
+    );
+    log::debug!(
+        "refresh_view_offset: idx={idx} prev={prev_idx:?} cur_vp={cur_vp:.1} \
+         xs={:?} widths={:?} view_w={view_width:.1} -> off={new_offset:.1} (vp={:.1})",
+        xs,
+        widths,
+        xs[idx] + new_offset
+    );
+    ws.view_offset = new_offset;
 }
 
 /// Compute the full on-screen geometry of a workspace, in absolute
@@ -304,34 +364,30 @@ pub fn compute_workspace_geometry(
         return overview_geometry(ws, params, area);
     }
     let (ax, ay, aw, ah) = area;
-    let view_width = (aw - params.edge_padding * 2.0).max(1.0);
-    let view_height = (ah - params.edge_padding * 2.0).max(1.0);
+    // Niri model: the view IS the full work area. There is no separate
+    // content inset — the `gaps` breathing room at the screen edges
+    // comes from the view-offset alignment logic (see
+    // `view_offset_to_show`), and columns fill the full height.
+    let view_width = aw.max(1.0);
+    let view_height = ah.max(1.0);
 
     let widths = column_widths(ws, params, view_width);
     let xs = column_xs(&widths, params.gaps);
-    let vp = clamp_view_pos(view_pos(ws, &xs), &xs, &widths, view_width);
-
-    // Left edge of the content area in screen coordinates.
-    let _origin_x = ax + params.edge_padding;
-    let _origin_y = ay + params.edge_padding;
+    let vp = clamp_view_pos(view_pos(ws, &xs), &xs, &widths, view_width, params.gaps);
 
     let mut out = Vec::new();
     for (ci, col) in ws.columns.iter().enumerate() {
-        let (col_x_off, col_w, col_h, col_pad) = if col.is_maximized {
-            // Maximized column: the whole work area, no padding/gaps.
-            // It keeps its scroll-space position — focusing another
-                       // column scrolls it out of view instead of pinning it
-            // over the viewport.
-            (xs[ci] - vp, aw, ah, 0.0f64)
+        let (col_x_off, col_w, col_h) = if col.is_maximized {
+            // Maximized column: the whole work area, no gaps. It keeps
+            // its scroll-space position — focusing another column
+            // scrolls it out of view instead of pinning it over the
+            // viewport.
+            (xs[ci] - vp, aw, ah)
         } else {
-            (xs[ci] - vp, widths[ci], view_height, 0.0)
+            (xs[ci] - vp, widths[ci], view_height)
         };
-        let screen_x = if col.is_maximized {
-            ax + col_x_off
-        } else {
-            ax + params.edge_padding + col_x_off
-        };
-        let base_y = if col.is_maximized { ay } else { ay + params.edge_padding };
+        let screen_x = ax + col_x_off;
+        let base_y = ay;
         let heights = if col.is_maximized {
             // Only the first tile is visible; extra tiles render below
             // the monitor like niri (each maximized tile is full-size).
@@ -342,7 +398,7 @@ pub fn compute_workspace_geometry(
         for (tile, &(y, h)) in col.tiles.iter().zip(heights.iter()) {
             out.push(TileRect {
                 id: tile.id,
-                x: (screen_x + col_pad).round() as i32,
+                x: screen_x.round() as i32,
                 y: (base_y + y).round() as i32,
                 w: col_w.round().max(1.0) as i32,
                 h: h.round().max(1.0) as i32,
@@ -361,8 +417,8 @@ fn overview_geometry(
     area: (f64, f64, f64, f64),
 ) -> Vec<TileRect> {
     let (ax, ay, aw, ah) = area;
-    let view_width = (aw - params.edge_padding * 2.0).max(1.0);
-    let view_height = (ah - params.edge_padding * 2.0).max(1.0);
+    let view_width = aw.max(1.0);
+    let view_height = ah.max(1.0);
     let widths = column_widths(ws, params, view_width);
     let n = ws.columns.len();
     let total: f64 = widths.iter().sum::<f64>() + params.gaps * (n - 1) as f64;
@@ -402,7 +458,6 @@ mod tests {
     fn params() -> LayoutParams {
         LayoutParams {
             gaps: 8.0,
-            edge_padding: 8.0,
             default_column_width: ColumnWidth::Proportion(0.25),
             preset_column_widths: Vec::new(),
             center_focused_column: CenterFocused::OnOverflow,
@@ -420,7 +475,7 @@ mod tests {
         ws.add_window(2);
         ws.columns[1].width = Some(ColumnWidth::Fixed(300.0));
         let p = params();
-        let ws_w = W - 16.0;
+        let ws_w = W;
         let widths = column_widths(&ws, &p, ws_w);
         assert_eq!(widths, vec![0.25 * ws_w, 300.0]);
         let xs = column_xs(&widths, 8.0);
@@ -438,6 +493,79 @@ mod tests {
         assert_eq!(view_pos(&ws, &xs), xs[1]); // active = col 1, offset 0
         ws.view_offset = -10.0;
         assert_eq!(view_pos(&ws, &xs), xs[1] - 10.0);
+    }
+
+    #[test]
+    fn focus_partially_offscreen_column_scrolls() {
+        // User's scenario: [1 2] 3 — cols 1,2 fully visible, col 3
+        // partially off the right edge. Focusing col 3 (from col 2)
+        // must scroll so col 3 becomes fully visible (right-aligned,
+        // the closer edge). OnOverflow mode, and the 2<->3 span fits
+        // the view, so this goes through the `fit` path.
+        let mut ws = Workspace::new();
+        for id in 1..=3 {
+            ws.add_window(id);
+        }
+        let p = LayoutParams {
+            gaps: 8.0,
+            default_column_width: ColumnWidth::Proportion(0.5),
+            preset_column_widths: Vec::new(),
+            center_focused_column: CenterFocused::OnOverflow,
+        };
+        // Half-width columns: [1 2] 3 with col 3's right edge
+        // partially past the view's right edge (the user's layout:
+        // default-column-width 0.5).
+        let widths = column_widths(&ws, &p, W);
+        let xs = column_xs(&widths, p.gaps);
+        // active=col1, offset 0: view = xs[1]..xs[1]+W. add_window
+        // focuses each new column, so reset active to col 1.
+        ws.active_column_idx = 1;
+        ws.view_offset = 0.0;
+        assert!(
+            xs[2] + widths[2] > xs[1] + W,
+            "col 3 must partially overflow the view"
+        );
+
+        // Focus col 3 (what focus_column(DirH::Right) would do:
+        // rebase, then switch active).
+        ws.rebase_view_to_current();
+        ws.active_column_idx = 2;
+        refresh_view_offset(&mut ws, &p, W, None);
+        let vp = view_pos(&ws, &xs);
+        // After the refresh col 2 (idx 2) must be fully visible:
+        // its right edge within the view. (Niri's OnOverflow centers
+        // here — the 2<->3 span doesn't fit — either way it must be
+        // fully visible; the pre-fix behavior was NO scroll at all,
+        // leaving the column cut off.)
+        assert!(
+            xs[2] + widths[2] <= vp + W + 0.5,
+            "col 3 right edge {:.0} must be <= vp+W = {:.0}",
+            xs[2] + widths[2],
+            vp + W
+        );
+        assert!(xs[2] >= vp - 0.5, "col 3 left edge must be visible");
+    }
+
+    #[test]
+    fn focus_fully_offscreen_column_scrolls() {
+        // Same, but col 3 starts fully off-screen to the right.
+        let mut ws = Workspace::new();
+        for id in 1..=3 {
+            ws.add_window(id);
+        }
+        let p = params();
+        let widths = column_widths(&ws, &p, W);
+        let xs = column_xs(&widths, p.gaps);
+        ws.active_column_idx = 1;
+        // vp such that col 2 is completely hidden.
+        let vp0 = xs[2] + 50.0;
+        ws.view_offset = vp0 - xs[1];
+        refresh_view_offset(&mut ws, &p, W, None);
+        let vp = view_pos(&ws, &xs);
+        assert!(
+            xs[2] + widths[2] <= vp + W + 0.5,
+            "col 3 must be fully visible after focus (vp={vp:.0})"
+        );
     }
 
     #[test]
@@ -465,24 +593,31 @@ mod tests {
 
     #[test]
     fn centered_offset() {
-        // Centering the column at x=400: view pos = col_x - (view-col)/2.
-        assert_eq!(view_offset_centered(1000.0, 400.0, 200.0), 0.0);
+        // Offsets are relative to the column (niri:
+        // -(view - col) / 2); a column at x=400 centered in a 1000-wide
+        // view ends up at screen 400 - (-400) .. +200 = 600..800.
+        assert_eq!(view_offset_centered(1000.0, 400.0, 200.0), -400.0);
         assert_eq!(view_offset_centered(1000.0, 0.0, 200.0), -400.0);
+        // Wider than the view: left-aligned.
+        assert_eq!(view_offset_centered(500.0, 0.0, 800.0), 0.0);
     }
 
     #[test]
     fn clamp_left_aligns_when_content_fits() {
         let xs = vec![0.0, 260.0];
         let widths = vec![250.0, 250.0];
-        // Total 510 < 1000: pinned to the left edge, not centered
-        // (niri's default).
-        let vp = clamp_view_pos(0.0, &xs, &widths, 1000.0);
-        assert_eq!(vp, 0.0);
-        // Content larger than the view: clamped to [0, last_right - view].
+        // Total 510 < 1000: parked at the left edge with a `gaps`
+        // margin (niri's natural leftmost position), not centered.
+        let vp = clamp_view_pos(0.0, &xs, &widths, 1000.0, 8.0);
+        assert_eq!(vp, -8.0);
+        // Content wider than the view: NOT clamped — niri renders at
+        // the alignment-produced view position even when it shows
+        // empty space past the last column (centering a middle
+        // column does exactly that).
         let xs2 = vec![0.0, 2000.0];
         let widths2 = vec![500.0, 500.0];
-        assert_eq!(clamp_view_pos(-50.0, &xs2, &widths2, 1000.0), 0.0);
-        assert_eq!(clamp_view_pos(3000.0, &xs2, &widths2, 1000.0), 1500.0);
+        assert_eq!(clamp_view_pos(-50.0, &xs2, &widths2, 1000.0, 8.0), -50.0);
+        assert_eq!(clamp_view_pos(3000.0, &xs2, &widths2, 1000.0, 8.0), 3000.0);
     }
 
     #[test]
@@ -509,18 +644,18 @@ mod tests {
         let p = params();
         let rects = compute_workspace_geometry(&ws, &p, area());
         assert_eq!(rects.len(), 3);
-        let content_w = W - 16.0;
-        let col_w = 0.25 * content_w;
-        // Content (3 cols + gaps) fits: niri keeps it left-aligned —
-        // first column at the left padding, no centering.
-        let total = 3.0 * col_w + 16.0;
-        assert!(total < content_w);
+        let col_w = 0.25 * W;
+        // Content (3 cols + gaps) fits: niri parks the row at the left
+        // edge with a `gaps` margin (the view offset's padding), no
+        // centering, and columns fill the full height.
+        let total = 3.0 * col_w + 2.0 * 8.0;
+        assert!(total < W);
         for (i, r) in rects.iter().enumerate() {
             assert_eq!(r.w, col_w as i32);
             let expected_x = (8.0 + i as f64 * (col_w + 8.0)).round() as i32;
             assert_eq!(r.x, expected_x);
-            assert_eq!(r.y, 8);
-            assert_eq!(r.h, H as i32 - 16);
+            assert_eq!(r.y, 0);
+            assert_eq!(r.h, H as i32);
         }
     }
 
@@ -549,7 +684,7 @@ mod tests {
         // Toggling off returns to normal full-height geometry.
         ws.toggle_overview();
         let rects = compute_workspace_geometry(&ws, &p, area());
-        assert!(rects.iter().all(|r| r.h == H as i32 - 16));
+        assert!(rects.iter().all(|r| r.h == H as i32));
     }
 
     #[test]
@@ -571,12 +706,12 @@ mod tests {
         ws.add_window(2);
         assert!(ws.set_min_size(2, 500.0, 68.0));
         let p = params();
-        let view_w = W - 16.0;
+        let view_w = W;
         let widths = column_widths(&ws, &p, view_w);
         // Column 2 widened to the window's enforced minimum; column 1
         // keeps its proportion width.
         assert_eq!(widths[1], 500.0);
-        assert_eq!(widths[0], 246.0);
+        assert_eq!(widths[0], 250.0);
         // Heights honor the minimum too.
         let rects = compute_workspace_geometry(&ws, &p, area());
         let second = rects.iter().find(|r| r.id == 2).unwrap();
@@ -592,7 +727,7 @@ mod tests {
         // Column 3 (focused) maximized: covers the whole area.
         assert!(ws.toggle_maximized());
         let p = params();
-        let view_w = W - 16.0;
+        let view_w = W;
         refresh_view_offset(&mut ws, &p, view_w, None);
         let rects = compute_workspace_geometry(&ws, &p, area());
         let max_rect = rects.iter().find(|r| r.id == 3).unwrap();
@@ -619,7 +754,7 @@ mod tests {
         }
         // All columns have default width; total >> view.
         let p = params();
-        let view_w = W - 16.0;
+        let view_w = W;
         let widths = column_widths(&ws, &p, view_w);
         let xs = column_xs(&widths, p.gaps);
         // Focus the last column.
@@ -631,10 +766,47 @@ mod tests {
         ws.focus_column(DirH::Right);
         ws.focus_column(DirH::Right);
         let prev = Some(6usize);
-        let new_off = view_offset_for_column(&ws, &p, view_w, &xs, &widths, 7, prev);
+        // Current view: focused on column 7 with offset 0.
+        let cur_vp = xs[7];
+        let new_off = view_offset_for_column(cur_vp, &p, W, view_w, &xs, &widths, 7, prev);
         let vp = xs[7] + new_off;
         // The last column must be fully visible.
         assert!(vp <= xs[7], "left edge visible: {vp} <= {}", xs[7]);
         assert!(xs[7] + widths[7] <= vp + view_w, "right edge visible");
+    }
+
+    #[test]
+    fn focus_column_keeps_visible_view() {
+        // The reported bug: several quarter-width columns, view showing
+        // the first ones, focus on the first. Focusing right (to the
+        // second, already-visible column) must NOT scroll the view.
+        let mut ws = Workspace::new();
+        for i in 1..=4 {
+            ws.add_window(i);
+        }
+        let p = params();
+        let view_w = W;
+        let widths = column_widths(&ws, &p, view_w);
+        // Three columns fit, four don't (so the view can scroll).
+        assert!(widths[0] * 3.0 + p.gaps * 2.0 <= view_w);
+        assert!(widths[0] * 4.0 + p.gaps * 3.0 > view_w);
+        // Settle the view on the newest (focused) column.
+        refresh_view_offset(&mut ws, &p, view_w, None);
+        let before = geometry_xs(&ws, &p);
+        // Focus the third column (already visible in the settled view).
+        assert!(ws.focus_column(DirH::Left));
+        refresh_view_offset(&mut ws, &p, view_w, None);
+        let after = geometry_xs(&ws, &p);
+        assert_eq!(before, after, "view must not scroll for a visible column");
+        // And the pending rebase was consumed.
+        assert!(ws.pending_view_rebase.is_none());
+    }
+
+    /// Screen-space x of every column's left edge.
+    fn geometry_xs(ws: &Workspace, p: &LayoutParams) -> Vec<i32> {
+        compute_workspace_geometry(ws, p, area())
+            .into_iter()
+            .map(|r| r.x)
+            .collect()
     }
 }

@@ -126,6 +126,14 @@ pub struct Workspace {
     /// intermediate focus change, restore focus (and view offset) to the
     /// previously active column instead of the neighbor.
     activate_prev_column_on_removal: Option<(usize, f64)>,
+    /// (column index, view offset) capturing where the view was before
+    /// the latest change of the active column. Niri computes the new
+    /// view offset *before* switching the active column; we defer that
+    /// to `refresh_view_offset`, which uses this pair to recover the
+    /// pre-change view position (and as `prev_idx` for
+    /// center-focused-column=on-overflow). Consumed by the next
+    /// refresh.
+    pub pending_view_rebase: Option<(usize, f64)>,
 }
 
 impl Workspace {
@@ -137,6 +145,22 @@ impl Workspace {
             fullscreen_id: None,
             is_overview: false,
             activate_prev_column_on_removal: None,
+            pending_view_rebase: None,
+        }
+    }
+
+    /// Record where the view currently is, before the active column
+    /// changes. Call *before* reassigning `active_column_idx` in every
+    /// path that doesn't set a fresh (idx, offset) pair itself: the
+    /// still-unchanged `view_offset` is relative to the OLD active
+    /// column, and only this record lets `refresh_view_offset` recover
+    /// the true current view position afterwards (niri's order of
+    /// operations). If a rebase is already pending (no refresh in
+    /// between), keep the older anchor — `view_offset` hasn't been
+    /// rebased since.
+    fn rebase_view_to_current(&mut self) {
+        if self.pending_view_rebase.is_none() {
+            self.pending_view_rebase = Some((self.active_column_idx, self.view_offset));
         }
     }
 
@@ -182,8 +206,8 @@ impl Workspace {
             Some((self.active_column_idx, self.view_offset))
         };
         self.columns.push(Column::new(id));
+        self.rebase_view_to_current();
         self.active_column_idx = self.columns.len() - 1;
-        self.view_offset = 0.0;
         self.activate_prev_column_on_removal = prev_active;
     }
 
@@ -203,8 +227,8 @@ impl Workspace {
             col.tiles.push(Tile::new(id));
         }
         self.columns.push(col);
+        self.rebase_view_to_current();
         self.active_column_idx = self.columns.len() - 1;
-        self.view_offset = 0.0;
         self.activate_prev_column_on_removal = prev_active;
     }
 
@@ -218,8 +242,8 @@ impl Workspace {
     pub fn insert_column_at(&mut self, idx: usize, id: WindowId) {
         let idx = idx.min(self.columns.len());
         self.columns.insert(idx, Column::new(id));
+        self.rebase_view_to_current();
         self.active_column_idx = idx;
-        self.view_offset = 0.0;
         self.activate_prev_column_on_removal = None;
     }
 
@@ -233,7 +257,10 @@ impl Workspace {
         let tile_idx = tile_idx.min(col.tiles.len());
         col.tiles.insert(tile_idx, Tile::new(id));
         col.active_tile_idx = tile_idx;
-        self.active_column_idx = column_idx;
+        if self.active_column_idx != column_idx {
+            self.rebase_view_to_current();
+            self.active_column_idx = column_idx;
+        }
     }
 
     /// Niri's `toggle-windowed-fullscreen`: the focused window is
@@ -294,8 +321,15 @@ impl Workspace {
                 new_idx
             };
             self.view_offset = new_offset;
+            // The (idx, offset) pair set above is self-consistent;
+            // drop any stale rebase record.
+            self.pending_view_rebase = None;
         } else {
-            self.active_column_idx = ci;
+            if self.active_column_idx != ci {
+                self.rebase_view_to_current();
+                self.active_column_idx = ci;
+            }
+            let col = &mut self.columns[ci];
             col.active_tile_idx = col.active_tile_idx.min(col.tiles.len() - 1);
         }
         true
@@ -306,7 +340,10 @@ impl Workspace {
         let Some((ci, ti)) = self.find(id) else {
             return false;
         };
-        self.active_column_idx = ci;
+        if self.active_column_idx != ci {
+            self.rebase_view_to_current();
+            self.active_column_idx = ci;
+        }
         self.columns[ci].active_tile_idx = ti;
         self.activate_prev_column_on_removal = None;
         true
@@ -321,8 +358,8 @@ impl Workspace {
         };
         match next {
             Some(i) if i < self.columns.len() => {
+                self.rebase_view_to_current();
                 self.active_column_idx = i;
-                self.view_offset = 0.0;
                 self.activate_prev_column_on_removal = None;
                 true
             }
@@ -365,6 +402,13 @@ impl Workspace {
         } else {
             return false;
         };
+        // The swap exchanges the two columns' scroll positions; the
+        // rebase anchor points at the old slot, so the recovered view
+        // position is only approximate — refresh_view_offset still
+        // guarantees the focused column ends up visible (niri adjusts
+        // the camera by the column delta instead; we don't know the
+        // pixel widths here).
+        self.rebase_view_to_current();
         self.columns.swap(i, j);
         self.active_column_idx = j;
         true
@@ -433,6 +477,7 @@ impl Workspace {
         }
         // (The standalone-column branch cannot happen: a neighbor exists,
         // so we always merge into it.)
+        self.rebase_view_to_current();
         self.active_column_idx = ni;
         true
     }
@@ -476,8 +521,8 @@ impl Workspace {
             if self.columns[t].width.is_none() {
                 self.columns[t].width = width;
             }
+            self.rebase_view_to_current();
             self.active_column_idx = t;
-            self.view_offset = 0.0;
             self.activate_prev_column_on_removal = None;
         } else {
             // Expel: standalone column next to the current position.
@@ -496,8 +541,8 @@ impl Workspace {
                 DirH::Right => ci + 1,
             };
             self.columns.insert(at, col);
+            self.rebase_view_to_current();
             self.active_column_idx = at;
-            self.view_offset = 0.0;
             self.activate_prev_column_on_removal = None;
         }
         true
@@ -523,7 +568,6 @@ impl Workspace {
         self.columns[ci].tiles.push(tile);
         self.columns[ci].active_tile_idx = self.columns[ci].tiles.len() - 1;
         self.active_column_idx = ci;
-        self.view_offset = 0.0;
         self.activate_prev_column_on_removal = None;
         true
     }
@@ -556,7 +600,6 @@ impl Workspace {
         self.columns[ci].active_tile_idx =
             self.columns[ci].active_tile_idx.min(self.columns[ci].tiles.len() - 1);
         self.active_column_idx = ci;
-        self.view_offset = 0.0;
         self.activate_prev_column_on_removal = None;
         true
     }
@@ -584,6 +627,10 @@ impl Workspace {
             }
         }
         col.is_full_width = false;
+        // Niri's set_column_width leaves the maximized state: an
+        // explicit width request un-maximizes the column (otherwise
+        // the width change would be invisible while maximized).
+        col.is_maximized = false;
         true
     }
 
@@ -610,6 +657,9 @@ impl Workspace {
         };
         col.width = Some(next);
         col.is_full_width = false;
+        // Like niri (whose preset cycling goes through set_column_width):
+        // un-maximize so the new width actually shows.
+        col.is_maximized = false;
         true
     }
 
@@ -619,7 +669,13 @@ impl Workspace {
         let Some(col) = self.columns.get_mut(self.active_column_idx) else {
             return false;
         };
-        col.is_full_width = !col.is_full_width;
+        // Niri: while maximized, toggle-full-width un-maximizes.
+        if col.is_maximized {
+            col.is_maximized = false;
+            col.is_full_width = false;
+        } else {
+            col.is_full_width = !col.is_full_width;
+        }
         true
     }
 
@@ -684,12 +740,13 @@ impl Workspace {
         }
     }
 
-    /// Focus the column at `idx` (already validated), resetting the
-    /// view offset like any horizontal focus jump.
+    /// Focus the column at `idx` (already validated). The view keeps
+    /// its position; `refresh_view_offset` scrolls it minimally so the
+    /// column is visible (niri's activate_column).
     fn focus_column_at(&mut self, idx: usize) -> bool {
         if idx != self.active_column_idx {
+            self.rebase_view_to_current();
             self.active_column_idx = idx;
-            self.view_offset = 0.0;
             self.activate_prev_column_on_removal = None;
             true
         } else {
@@ -1339,5 +1396,29 @@ mod tests {
         assert!(ws.focus_column_index(8));
         assert_eq!(ws.focused_id(), Some(3));
         assert!(!ws.focus_column_index(8));
+    }
+
+    #[test]
+    fn width_change_leaves_maximized() {
+        // Niri: set-column-width (incl. preset cycling) un-maximizes
+        // the column; otherwise the width change is invisible while
+        // maximized (the reported Mod+R-after-Mod+F bug).
+        let mut ws = Workspace::new();
+        ws.add_window(1);
+        assert!(ws.toggle_maximized());
+        assert!(ws.columns[0].is_maximized);
+        assert!(ws.set_column_width(&SizeChange::Fixed(500.0)));
+        assert!(!ws.columns[0].is_maximized);
+
+        ws.toggle_maximized();
+        let presets = vec![ColumnWidth::Proportion(0.33), ColumnWidth::Proportion(0.66)];
+        assert!(ws.cycle_column_width(&presets));
+        assert!(!ws.columns[0].is_maximized);
+
+        // toggle_full_width also un-maximizes (niri).
+        ws.toggle_maximized();
+        assert!(ws.toggle_full_width());
+        assert!(!ws.columns[0].is_maximized);
+        assert!(!ws.columns[0].is_full_width);
     }
 }

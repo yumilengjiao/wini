@@ -448,6 +448,22 @@ impl Animator {
         self.resize = resize;
     }
 
+    /// The rect this window should be at *right now* while its
+    /// animation is in flight — i.e. what `tick` last sent for it.
+    /// None when the window is at rest (or untracked); callers then
+    /// query the HWND's actual position instead.
+    ///
+    /// The focus ring needs this: window moves go out with
+    /// `SWP_ASYNCWINDOWPOS`, so immediately after a tick the HWND's
+    /// real rect is still the *previous* frame's position — reading it
+    /// would make the ring trail the window it outlines.
+    pub fn in_flight_value(&self, id: isize) -> Option<(i32, i32, i32, i32)> {
+        match self.rects.get(&id) {
+            Some(r) if !r.finished() => Some(r.value()),
+            _ => None,
+        }
+    }
+
     #[allow(dead_code)] // kept as API; tests and future callers use it
     pub fn is_animating(&self) -> bool {
         self.rects.values().any(|r| !r.finished())
