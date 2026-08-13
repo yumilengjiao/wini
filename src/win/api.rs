@@ -20,6 +20,36 @@ pub fn window_rect(hwnd: HWND) -> Option<(f64, f64, f64, f64)> {
     ))
 }
 
+/// Visible window bounds (DWM extended frame) as (x, y, w, h) in
+/// screen coordinates. Unlike `window_rect`, this excludes the
+/// invisible resize borders that modern framed windows reserve inside
+/// their window rect (~7-10px on the sides/bottom), so anything that
+/// must hug the *visible* edge of a window — the focus ring — should
+/// use this. Falls back to the raw window rect if DWM is unavailable.
+pub fn frame_rect(hwnd: HWND) -> Option<(f64, f64, f64, f64)> {
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+    let mut rc = RECT::default();
+    let ok = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rc as *mut RECT as *mut core::ffi::c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .is_ok()
+    };
+    if ok {
+        Some((
+            rc.left as f64,
+            rc.top as f64,
+            (rc.right - rc.left) as f64,
+            (rc.bottom - rc.top) as f64,
+        ))
+    } else {
+        window_rect(hwnd)
+    }
+}
+
 /// Current cursor position in screen coordinates.
 pub fn cursor_pos() -> Option<(f64, f64)> {
     let mut pt = POINT::default();

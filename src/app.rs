@@ -283,8 +283,10 @@ impl AppState {
                     }
                 }
                 // The newly-foreground window raises itself while
-                // processing WM_ACTIVATE: nothing to do for the bar
-                // (topmost layer) here yet.
+                // processing WM_ACTIVATE (after our sync raise_bars):
+                // re-raise the bars (yasb/zebar) on every foreground
+                // change so they stay on top (niri: layer-shell top).
+                placement::raise_bars(&self.monitors);
             }
         }
     }
@@ -621,6 +623,7 @@ impl AppState {
             // Real focus follows too (Windows couples focus and
             // foreground; failing is harmless, e.g. foreground lock).
             crate::win::api::force_set_foreground(hwnd);
+            placement::raise_bars(&self.monitors);
         }
     }
 
@@ -1017,16 +1020,35 @@ impl AppState {
             fb.hide();
             return;
         }
-        // Hug the window edge. While the window animates, the HWND's
-        // rect is stale: moves go out with SWP_ASYNCWINDOWPOS, so
-        // right after a tick the window is still at the previous
-        // frame's position — reading it makes the ring trail the
-        // window. Use the animator's in-flight rect (what we just
-        // sent).
-        let rect = if let Some((ax, ay, aw, ah)) = self.animator.in_flight_value(id) {
-            Some((ax as f64, ay as f64, aw as f64, ah as f64))
+        // Hug the *visible* window edge: `frame_rect` (DWM extended
+        // frame bounds) skips the invisible resize borders that
+        // `window_rect` includes — the ring would otherwise float
+        // ~10px off the window on three sides.
+        //
+        // While the window animates, the HWND's rects are stale: moves
+        // go out with SWP_ASYNCWINDOWPOS, so right after a tick the
+        // window is still at the previous frame's position — reading
+        // it makes the ring trail the window. Use the animator's
+        // in-flight rect (what we just sent) plus the visible-edge
+        // insets measured from the live rects (insets don't change
+        // mid-motion; both rects are stale by the same amount).
+        let rect = if let Some((ax, ay, aw, ah)) = self.animator.in_flight_value(id)
+            && let (Some(win), Some(frame)) = (
+                crate::win::api::window_rect(hwnd),
+                crate::win::api::frame_rect(hwnd),
+            ) {
+            let in_l = frame.0 - win.0;
+            let in_t = frame.1 - win.1;
+            let in_r = (win.0 + win.2) - (frame.0 + frame.2);
+            let in_b = (win.1 + win.3) - (frame.1 + frame.3);
+            Some((
+                ax as f64 + in_l,
+                ay as f64 + in_t,
+                aw as f64 - in_l - in_r,
+                ah as f64 - in_t - in_b,
+            ))
         } else {
-            crate::win::api::window_rect(hwnd)
+            crate::win::api::frame_rect(hwnd)
         };
         if let Some((x, y, w, h)) = rect {
             // Config stores 0xRRGGBB; COLORREF wants 0x00BBGGRR.
@@ -1038,6 +1060,7 @@ impl AppState {
                 w as i32,
                 h as i32,
                 ring.width,
+                ring.radius,
                 windows::Win32::Foundation::COLORREF(bgr),
             );
         } else {
@@ -1387,9 +1410,11 @@ impl AppState {
         let ok = crate::win::api::force_set_foreground(hwnd);
         log::debug!("sync_focus_to_os: force_set_foreground({focused_id}) -> {ok}");
         // SetForegroundWindow/BringWindowToTop put the window above
-        // the desktop bar (yasb/zebar); bringing bars back up is
-        // handled by the bar-raise pass (niri: layer-shell top).
-        let _ = ok;
+        // the desktop bar (yasb/zebar); bring bars back up (niri:
+        // the layer-shell bar renders above tiled windows).
+        if ok {
+            placement::raise_bars(&self.monitors);
+        }
     }
 
     /// Animate a workspace switch as niri does, with a CAMERA model:
@@ -1556,6 +1581,9 @@ impl AppState {
                 self.animator.remove(id);
             }
         }
+        // The sliding windows crossed the bar zone: put bars
+        // (yasb/zebar/...) back on top of them.
+        placement::raise_bars(&self.monitors);
 
         self.slides.insert(device.to_string(), slide);
         true
@@ -1696,9 +1724,11 @@ impl AppState {
                 placement::raise(hwnd);
             }
         }
-        // A windowed-fullscreen window covers the bar zone too (niri:
-        // layer-shell top).
-        let _ = &raise_ids;
+        // A windowed-fullscreen window covers the bar zone too; keep
+        // bars (yasb/zebar/...) on top of it (niri: layer-shell top).
+        if !raise_ids.is_empty() {
+            placement::raise_bars(&self.monitors);
+        }
         // Kick an immediate frame so first paint is not delayed.
         self.tick_animations();
         self.update_focus_border();
@@ -1739,6 +1769,9 @@ impl AppState {
             let done = slide.finished();
             log::debug!("slide[{device}]: camera={cam:.3} done={done}");
             placement::apply_geometry(&rects);
+            // The sliding windows cross the bar zone every frame;
+            // keep bars (yasb/zebar/...) above them.
+            placement::raise_bars(&self.monitors);
             if done {
                 let slide = self.slides.remove(&device).expect("checked above");
                 log::debug!("slide[{device}]: settled, hiding non-active windows");

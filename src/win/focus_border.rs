@@ -10,15 +10,15 @@
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CombineRgn, CreateRectRgn, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
-    InvalidateRect, PAINTSTRUCT, RGN_DIFF, SetWindowRgn,
+    BeginPaint, CombineRgn, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
+    EndPaint, FillRect, InvalidateRect, PAINTSTRUCT, RGN_DIFF, SetWindowRgn,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, RegisterClassW, SetWindowPos, ShowWindow, HWND_TOPMOST,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, RegisterClassW, SetLayeredWindowAttributes, SetWindowPos,
+    ShowWindow, HWND_TOPMOST, LWA_ALPHA, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE,
+    SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 /// Current ring color, reached from wnd_proc (main thread only).
@@ -79,21 +79,49 @@ impl FocusBorder {
                 None,
             )
             .ok()?;
+            // A WS_EX_LAYERED window is not displayed until its
+            // alpha/color key is set — without this the ring exists
+            // but never shows.
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
             Some(FocusBorder { hwnd })
         }
     }
 
     /// Outline the rect (x, y, w, h) — in screen coordinates — with a
     /// ring of `thickness` pixels drawn just outside it, in `color`.
-    pub fn update(&self, x: i32, y: i32, w: i32, h: i32, thickness: i32, color: COLORREF) {
+    /// `radius` rounds the ring's corners: the inner edge gets radius
+    /// `radius`, the outer edge `radius + thickness`, keeping the band
+    /// a constant width around the bend. 0 = square corners.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(
+        &self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        thickness: i32,
+        radius: i32,
+        color: COLORREF,
+    ) {
         let t = thickness.max(1);
+        let r = radius.max(0);
         let (ow, oh) = (w + 2 * t, h + 2 * t);
         unsafe {
             COLOR.set(color);
             // Shape the window into the ring: full client minus the
             // inner rect. SetWindowRgn takes ownership of `ring`.
-            let full = CreateRectRgn(0, 0, ow, oh);
-            let inner = CreateRectRgn(t, t, t + w, t + h);
+            // CreateRoundRectRgn's ellipse params are the diameter, so
+            // pass 2*radius for a corner of that radius.
+            let full = if r > 0 {
+                CreateRoundRectRgn(0, 0, ow, oh, 2 * (r + t), 2 * (r + t))
+            } else {
+                CreateRectRgn(0, 0, ow, oh)
+            };
+            let inner = if r > 0 {
+                CreateRoundRectRgn(t, t, t + w, t + h, 2 * r, 2 * r)
+            } else {
+                CreateRectRgn(t, t, t + w, t + h)
+            };
             let ring = CreateRectRgn(0, 0, 0, 0);
             CombineRgn(Some(ring), Some(full), Some(inner), RGN_DIFF);
             let _ = DeleteObject(full.into());
