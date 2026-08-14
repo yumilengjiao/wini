@@ -173,6 +173,9 @@ struct AppState {
     overlay: Option<crate::win::overlay::OverlayWindow>,
     /// Focus ring: outlines the focused window (niri's focus-ring).
     focus_border: Option<crate::win::focus_border::FocusBorder>,
+    /// System tray icon with the quick-actions menu (config,
+    /// autostart, quit). None if the tray could not be created.
+    tray: Option<crate::win::tray::Tray>,
     /// Window geometry animations.
     animator: Animator,
 }
@@ -1739,6 +1742,7 @@ impl AppState {
     /// returns: at-rest rects whose target changed still owe their
     /// final frame (see `Animator::tick`).
     fn tick_animations(&mut self) {
+        self.handle_tray_events();
         for (id, x, y, w, h) in self.animator.tick() {
             let rect = crate::layout::geometry::TileRect { id, x, y, w, h };
             placement::apply_geometry(&[rect]);
@@ -1747,6 +1751,68 @@ impl AppState {
         // The ring follows the focused window's live rect, so it must
         // move with every animation frame.
         self.update_focus_border();
+    }
+
+    /// Drain tray-menu events and perform the requested actions.
+    /// Called from the animation timer (menu events arrive on a
+    /// global channel; polling it every frame is cheap and keeps
+    /// everything on the main thread).
+    fn handle_tray_events(&mut self) {
+        let Some(tray) = self.tray.as_mut() else {
+            return;
+        };
+        let actions = tray.poll_events();
+        for action in actions {
+            log::info!("tray action: {action:?}");
+            match action {
+                crate::win::tray::TrayAction::OpenConfig => {
+                    self.open_config_file();
+                }
+                crate::win::tray::TrayAction::ReloadConfig => {
+                    // Force a reload even if the mtime poll already
+                    // saw today's change (or the file was touched back
+                    // to an old mtime).
+                    self.config_mtime = None;
+                    self.maybe_reload_config();
+                }
+                crate::win::tray::TrayAction::ToggleAutostart => {
+                    let now = !crate::win::tray::autostart_enabled();
+                    if crate::win::tray::set_autostart(now) {
+                        if let Some(tray) = self.tray.as_ref() {
+                            tray.set_autostart_checked(now);
+                        }
+                        log::info!("autostart {}", if now { "on" } else { "off" });
+                    } else {
+                        log::warn!("failed to toggle autostart");
+                    }
+                }
+                crate::win::tray::TrayAction::Quit => unsafe { PostQuitMessage(0) },
+            }
+        }
+    }
+
+    /// Open the config file with the system default editor.
+    fn open_config_file(&self) {
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let path = config::config_path();
+        if !path.exists() {
+            // Give the editor something to open and the user something
+            // to edit: seed the file with the example config.
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(
+                &path,
+                include_str!("../config.example.kdl"),
+            );
+        }
+        let path = windows::core::HSTRING::from(path.as_os_str());
+        let r = unsafe { ShellExecuteW(None, None, &path, None, None, SW_SHOWNORMAL) };
+        // ShellExecuteW returns a small value (<= 32) on failure.
+        if r.0 as usize <= 32 {
+            log::warn!("failed to open config file (code {})", r.0 as usize);
+        }
     }
 
     /// Advance every in-flight workspace slide one frame: place all
@@ -1879,6 +1945,13 @@ impl App {
             original_rects: std::collections::HashMap::new(),
             overlay,
             focus_border,
+            tray: {
+                let t = crate::win::tray::Tray::new();
+                if t.is_none() {
+                    log::warn!("failed to create the tray icon");
+                }
+                t
+            },
             animator,
         }));
 
