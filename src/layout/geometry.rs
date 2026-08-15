@@ -75,11 +75,7 @@ pub struct TileRect {
 }
 
 /// Resolve a column's pixel width.
-pub fn resolve_width(
-    width: Option<ColumnWidth>,
-    params: &LayoutParams,
-    view_width: f64,
-) -> f64 {
+pub fn resolve_width(width: Option<ColumnWidth>, params: &LayoutParams, view_width: f64) -> f64 {
     match width.unwrap_or(params.default_column_width) {
         ColumnWidth::Proportion(p) => (p * view_width).max(1.0),
         ColumnWidth::Fixed(f) => f.max(1.0),
@@ -248,13 +244,7 @@ pub fn view_offset_for_column(
 /// ended at `last_right + gaps - view_width`, which is exactly where
 /// the LAST column right-aligns — a centered middle column got
 /// pulled back and the view appeared to never scroll.
-pub fn clamp_view_pos(
-    vp: f64,
-    xs: &[f64],
-    widths: &[f64],
-    view_width: f64,
-    gaps: f64,
-) -> f64 {
+pub fn clamp_view_pos(vp: f64, xs: &[f64], widths: &[f64], view_width: f64, gaps: f64) -> f64 {
     let Some((&first_x, _)) = xs.first().zip(widths.first()) else {
         return vp;
     };
@@ -270,7 +260,12 @@ pub fn clamp_view_pos(
 
 /// Distribute the column's height among its tiles by weight, honoring
 /// `gaps` between tiles. Returns `(y, height)` pairs in column-space.
-pub fn tile_heights(ws: &Workspace, ci: usize, params: &LayoutParams, area_h: f64) -> Vec<(f64, f64)> {
+pub fn tile_heights(
+    ws: &Workspace,
+    ci: usize,
+    params: &LayoutParams,
+    area_h: f64,
+) -> Vec<(f64, f64)> {
     let col = &ws.columns[ci];
     let n = col.tiles.len();
     if n == 0 {
@@ -331,14 +326,7 @@ pub fn refresh_view_offset(
         None => (view_pos(ws, &xs), prev_idx_hint),
     };
     let new_offset = view_offset_for_column(
-        cur_vp,
-        params,
-        area_width,
-        view_width,
-        &xs,
-        &widths,
-        idx,
-        prev_idx,
+        cur_vp, params, area_width, view_width, &xs, &widths, idx, prev_idx,
     );
     log::debug!(
         "refresh_view_offset: idx={idx} prev={prev_idx:?} cur_vp={cur_vp:.1} \
@@ -358,11 +346,6 @@ pub fn compute_workspace_geometry(
     params: &LayoutParams,
     area: (f64, f64, f64, f64),
 ) -> Vec<TileRect> {
-    // Overview mode: scale everything down to fit (niri's
-    // toggle-overview filmstrip).
-    if ws.is_overview && !ws.columns.is_empty() {
-        return overview_geometry(ws, params, area);
-    }
     let (ax, ay, aw, ah) = area;
     // Niri model: the view IS the full work area. There is no separate
     // content inset — the `gaps` breathing room at the screen edges
@@ -404,45 +387,6 @@ pub fn compute_workspace_geometry(
                 h: h.round().max(1.0) as i32,
             });
         }
-    }
-    out
-}
-
-/// Overview geometry: all columns scaled by the same factor so the
-/// whole workspace fits the view, centered horizontally and
-/// vertically. Focus/navigation keep working on the scaled-down tiles.
-fn overview_geometry(
-    ws: &Workspace,
-    params: &LayoutParams,
-    area: (f64, f64, f64, f64),
-) -> Vec<TileRect> {
-    let (ax, ay, aw, ah) = area;
-    let view_width = aw.max(1.0);
-    let view_height = ah.max(1.0);
-    let widths = column_widths(ws, params, view_width);
-    let n = ws.columns.len();
-    let total: f64 = widths.iter().sum::<f64>() + params.gaps * (n - 1) as f64;
-    // Uniform scale (with a small margin), never scaled *up*.
-    let scale = ((view_width / total.max(1.0)) * 0.96).min(1.0);
-    let scaled_total = total * scale;
-    let content_left = ax + (aw - scaled_total) / 2.0;
-    let base_y = ay + (ah - view_height * scale) / 2.0;
-
-    let mut out = Vec::new();
-    let mut x = content_left;
-    for (ci, col) in ws.columns.iter().enumerate() {
-        let w = widths[ci] * scale;
-        let heights = tile_heights(ws, ci, params, view_height);
-        for (tile, &(y, h)) in col.tiles.iter().zip(heights.iter()) {
-            out.push(TileRect {
-                id: tile.id,
-                x: x.round() as i32,
-                y: (base_y + y * scale).round() as i32,
-                w: w.round().max(1.0) as i32,
-                h: (h * scale).round().max(1.0) as i32,
-            });
-        }
-        x += w + params.gaps * scale;
     }
     out
 }
@@ -660,34 +604,6 @@ mod tests {
     }
 
     #[test]
-    fn overview_scales_and_fits() {
-        let mut ws = Workspace::new();
-        for i in 1..=8 {
-            ws.add_window(i);
-        }
-        ws.toggle_overview();
-        let p = params();
-        let rects = compute_workspace_geometry(&ws, &p, area());
-        assert_eq!(rects.len(), 8);
-        // Everything must fit inside the area.
-        for r in &rects {
-            assert!(r.x >= 0 && r.x + r.w <= W as i32, "column fits: {r:?}");
-            assert!(r.y >= 0 && r.y + r.h <= H as i32);
-            assert!(r.h < H as i32, "scaled down vertically");
-        }
-        // Column order preserved, one row.
-        let mut last_x = i32::MIN;
-        for r in &rects {
-            assert!(r.x >= last_x);
-            last_x = r.x;
-        }
-        // Toggling off returns to normal full-height geometry.
-        ws.toggle_overview();
-        let rects = compute_workspace_geometry(&ws, &p, area());
-        assert!(rects.iter().all(|r| r.h == H as i32));
-    }
-
-    #[test]
     fn maximize_covers_whole_area() {
         let mut ws = Workspace::new();
         ws.add_window(1);
@@ -696,7 +612,10 @@ mod tests {
         let rects = compute_workspace_geometry(&ws, &p, area());
         assert_eq!(rects.len(), 1);
         // Full monitor rect, no padding.
-        assert_eq!((rects[0].x, rects[0].y, rects[0].w, rects[0].h), (0, 0, W as i32, H as i32));
+        assert_eq!(
+            (rects[0].x, rects[0].y, rects[0].w, rects[0].h),
+            (0, 0, W as i32, H as i32)
+        );
     }
 
     #[test]
@@ -731,7 +650,10 @@ mod tests {
         refresh_view_offset(&mut ws, &p, view_w, None);
         let rects = compute_workspace_geometry(&ws, &p, area());
         let max_rect = rects.iter().find(|r| r.id == 3).unwrap();
-        assert_eq!((max_rect.x, max_rect.y, max_rect.w, max_rect.h), (0, 0, W as i32, H as i32));
+        assert_eq!(
+            (max_rect.x, max_rect.y, max_rect.w, max_rect.h),
+            (0, 0, W as i32, H as i32)
+        );
 
         // Focus the first column: the view scrolls left and the
         // maximized column must move with it (not stay pinned on top
@@ -743,7 +665,10 @@ mod tests {
         let max_rect = rects.iter().find(|r| r.id == 3).unwrap();
         assert!(max_rect.x > 0, "maximized column scrolled: {max_rect:?}");
         let first = rects.iter().find(|r| r.id == 1).unwrap();
-        assert!(first.x >= 0 && first.x + first.w <= W as i32, "first column visible: {first:?}");
+        assert!(
+            first.x >= 0 && first.x + first.w <= W as i32,
+            "first column visible: {first:?}"
+        );
     }
 
     #[test]

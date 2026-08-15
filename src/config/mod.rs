@@ -141,6 +141,8 @@ pub struct AnimationsConfig {
     pub window_close: AnimKind,
     /// Workspace-switch slide (the vertical canvas slide).
     pub workspace_switch: AnimKind,
+    /// Overview open/close zoom (niri's toggle-overview).
+    pub overview_open_close: AnimKind,
 }
 
 impl Default for AnimationsConfig {
@@ -164,6 +166,12 @@ impl Default for AnimationsConfig {
             workspace_switch: AnimKind::Spring(SpringParams {
                 damping_ratio: 1.0,
                 stiffness: 1000.0,
+                epsilon: 0.0001,
+            }),
+            // Niri's default overview-open-close spring.
+            overview_open_close: AnimKind::Spring(SpringParams {
+                damping_ratio: 1.0,
+                stiffness: 800.0,
                 epsilon: 0.0001,
             }),
         }
@@ -204,6 +212,11 @@ impl AnimationsConfig {
     /// Driving parameters for the workspace-switch slide.
     pub fn workspace_switch_params(&self) -> AnimParams {
         self.params(self.workspace_switch)
+    }
+
+    /// Driving parameters for the overview open/close zoom.
+    pub fn overview_open_close_params(&self) -> AnimParams {
+        self.params(self.overview_open_close)
     }
 }
 
@@ -356,6 +369,9 @@ impl Default for Config {
                 bind("Mod+V", Action::ToggleWindowFloating),
                 bind("Mod+Q", Action::CloseWindow),
                 bind("Mod+Shift+Slash", Action::ToggleOverview),
+                // Ctrl+O mirrors niri's overview toggle key (niri's
+                // default bind is Mod+Shift+Slash above).
+                bind("Ctrl+O", Action::ToggleOverview),
                 bind("Mod+Shift+E", Action::Quit),
             ],
         }
@@ -705,6 +721,7 @@ fn parse_animations(node: &KdlNode, config: &mut Config) {
             "window-open" => parse_anim_kind(n, &mut config.animations.window_open),
             "window-close" => parse_anim_kind(n, &mut config.animations.window_close),
             "workspace-switch" => parse_anim_kind(n, &mut config.animations.workspace_switch),
+            "overview-open-close" => parse_anim_kind(n, &mut config.animations.overview_open_close),
             // Kinds we have no rendering for; parsed-and-ignored so
             // niri configs port over without warnings.
             "config-error-open" | "config-error-close" | "screenshot-open" | "screenshot-close" => {
@@ -1165,9 +1182,26 @@ mod tests {
             AnimKind::instant()
         );
         // ...and everything else keeps its defaults.
-        assert_ne!(
-            cfg.animations.movement_params().kind,
+        assert_ne!(cfg.animations.movement_params().kind, AnimKind::instant());
+
+        // The overview open/close zoom has its own kind (niri's
+        // overview-open-close) and can be turned off too.
+        let cfg = parse("animations { overview-open-close { off; } }").unwrap();
+        assert_eq!(
+            cfg.animations.overview_open_close_params().kind,
             AnimKind::instant()
+        );
+        let cfg = parse(
+            "animations { overview-open-close { spring { damping-ratio 1.0; stiffness 400; } } }",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.animations.overview_open_close,
+            AnimKind::Spring(SpringParams {
+                damping_ratio: 1.0,
+                stiffness: 400.0,
+                epsilon: 0.0001,
+            })
         );
 
         // Custom cubic-bezier curve.

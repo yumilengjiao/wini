@@ -68,6 +68,11 @@ animations {
 
     // Per-animation off: just this one lands instantly.
     // window-close { off }
+
+    // Workspace-switch slide (vertical canvas camera) and the
+    // overview open/close zoom (niri's overview-open-close).
+    // workspace-switch { spring damping-ratio=1.0 stiffness=1000 epsilon=0.0001 }
+    // overview-open-close { spring damping-ratio=1.0 stiffness=800 epsilon=0.0001 }
 }
 
 // Rules for newly opened windows; first match wins. `match` values
@@ -120,6 +125,8 @@ binds {
     Mod+V       { toggle-window-floating; }
     Mod+Q       { close-window; }
     Mod+Shift+Slash { toggle-overview; }
+    // Ctrl+O also toggles the overview (added to the defaults).
+    // Ctrl+O     { toggle-overview; }
     Mod+P       { do-screen-transition; }
 
     Mod+Shift+E { quit; }

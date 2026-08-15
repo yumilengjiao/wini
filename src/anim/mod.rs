@@ -338,7 +338,6 @@ impl Val {
         self.duration.is_zero() || self.start.elapsed() >= self.duration
     }
 
-    #[allow(dead_code)] // consumed by exit-restore / overview
     pub fn target(&self) -> f64 {
         self.to
     }
@@ -371,7 +370,15 @@ impl AnimatedRect {
         }
     }
 
-    pub fn retarget(&mut self, x: f64, y: f64, w: f64, h: f64, movement: AnimParams, resize: AnimParams) {
+    pub fn retarget(
+        &mut self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        movement: AnimParams,
+        resize: AnimParams,
+    ) {
         self.x.retarget(x, movement);
         self.y.retarget(y, movement);
         self.w.retarget(w, resize);
@@ -703,9 +710,6 @@ mod tests {
         // At the same wall-clock instant the slowed spring must have
         // covered much less distance.
         let (va, vb) = (a.value(), b.value());
-        assert!(
-            vb < va * 0.75,
-            "slowed spring lags: slow={vb} fast={va}"
-        );
+        assert!(vb < va * 0.75, "slowed spring lags: slow={vb} fast={va}");
     }
 }

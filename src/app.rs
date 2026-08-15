@@ -124,6 +124,91 @@ impl Slide {
     }
 }
 
+/// An open (or opening/closing) overview on one monitor — niri's
+/// `toggle-overview`. Like the slide, everything derives from TWO
+/// animated values instead of per-window springs:
+/// - `progress`: 0 = closed, 1 = fully open. The zoom is niri's
+///   `compute_overview_zoom`: `zoom = 1 - progress * (1 - 0.35)` —
+///   at progress 0 the derived rects are EXACTLY the settled tiles,
+///   so opening starts pixel-continuous from the current view.
+/// - `camera`: the workspace render index on the vertical strip,
+///   identical to the slide camera. In the overview it scrolls
+///   freely (wheel / focus-workspace) while `active_workspace_idx`
+///   stays put; closing retargets it to the workspace we close into.
+///
+/// The canvas is the FULL monitor scaled by `zoom` and centered
+/// (niri's `workspaces_render_geo`: workspace k sits at
+/// `dy = (k - camera) * stride`, stride = scaled full height + a 10%
+/// gap — `workspace_size_with_gap`). Real windows are resized to the
+/// scaled rects (apps reflow their content at small sizes — accepted
+/// compromise; DWM thumbnails are a future optimization).
+#[derive(Debug, Clone)]
+struct Overview {
+    /// Open/close progress (0 = closed, 1 = fully open).
+    progress: crate::anim::Val,
+    /// Camera position (workspace index on the strip).
+    camera: crate::anim::Val,
+    /// Settled (zoom-1) tile rects per participating (non-empty)
+    /// workspace, exactly like the slide's finals. Refreshed by
+    /// `refresh_overview` whenever the layout changes while open.
+    finals: Vec<(usize, Vec<crate::layout::geometry::TileRect>)>,
+    /// The monitor's FULL rect (left, top, w, h) — the overview
+    /// canvas, like niri's view_size (bars float above it).
+    full: (f64, f64, f64, f64),
+    /// Zoom at progress = 1 (niri's overview.zoom, default 0.35).
+    zoom_target: f64,
+}
+
+impl Overview {
+    /// Current zoom (niri clamps the configured zoom to a sane range
+    /// and never lets the divisor reach 0).
+    fn zoom(&self) -> f64 {
+        (1.0 - self.progress.value() * (1.0 - self.zoom_target)).max(0.0001)
+    }
+
+    /// Whether the overview is (animating) open or closing.
+    fn opening(&self) -> bool {
+        self.progress.target() > 0.5
+    }
+
+    /// All participant rects at an explicit zoom/camera (zoom 1 with
+    /// the camera at the active workspace yields the settled tiles,
+    /// which is what the close handover applies).
+    fn rects_at(&self, zoom: f64, cam: f64) -> Vec<crate::layout::geometry::TileRect> {
+        let (fx, fy, fw, fh) = self.full;
+        let ws_h = fh * zoom;
+        let stride = ws_h + fh * 0.1 * zoom;
+        // Center the scaled canvas in the monitor (niri's
+        // static_offset); at zoom 1 the offsets are 0.
+        let off_x = fx + (fw - fw * zoom) / 2.0;
+        let off_y = fy + (fh - ws_h) / 2.0;
+        let mut out = Vec::new();
+        for (k, rects) in &self.finals {
+            let dy = (*k as f64 - cam) * stride;
+            for r in rects {
+                out.push(crate::layout::geometry::TileRect {
+                    id: r.id,
+                    x: (off_x + (r.x as f64 - fx) * zoom).round() as i32,
+                    y: (off_y + dy + (r.y as f64 - fy) * zoom).round() as i32,
+                    w: ((r.w as f64) * zoom).round().max(1.0) as i32,
+                    h: ((r.h as f64) * zoom).round().max(1.0) as i32,
+                });
+            }
+        }
+        out
+    }
+
+    /// Participant rects at the current animated zoom/camera.
+    fn current_rects(&self) -> Vec<crate::layout::geometry::TileRect> {
+        self.rects_at(self.zoom(), self.camera.value())
+    }
+
+    /// Both springs at rest?
+    fn settled(&self) -> bool {
+        self.progress.finished() && self.camera.finished()
+    }
+}
+
 /// Mutable state shared between the message loop and event handlers.
 /// (The config field is consumed by the input module in the next
 /// commits.)
@@ -166,6 +251,9 @@ struct AppState {
     /// In-flight workspace-switch slides (niri's vertical canvas),
     /// keyed by monitor device. See [`Slide`] for the camera model.
     slides: std::collections::HashMap<String, Slide>,
+    /// Open (or animating) overviews, keyed by monitor device. See
+    /// [`Overview`] for the zoom + camera model.
+    overviews: std::collections::HashMap<String, Overview>,
     /// Each window's geometry as it was when we started managing it;
     /// restored on exit so the desktop is left as we found it.
     original_rects: std::collections::HashMap<isize, windows::Win32::Foundation::RECT>,
@@ -273,6 +361,14 @@ impl AppState {
             }
             WinEvent::Foreground(hwnd) => {
                 log::debug!("foreground event -> {hwnd:?}");
+                // A click on a window inside an open overview selects
+                // it: activate its workspace and close into it (runs
+                // even when focus didn't change — clicking the
+                // already-focused window must still close).
+                if self.click_in_overview(hwnd) {
+                    placement::raise_bars(&self.monitors);
+                    return;
+                }
                 if self.focused != Some(hwnd) {
                     self.focused = Some(hwnd);
                     let id = hwnd.0 as isize;
@@ -432,41 +528,294 @@ impl AppState {
         }
     }
 
-    /// Exit overview mode on every monitor. Returns true if any was
-    /// active (the caller consumes the key press in that case).
+    /// Close the overview on every monitor, back to the currently
+    /// active workspace (niri's Esc / Return in overview). Returns
+    /// true if any overview was open (the caller consumes the key).
     fn exit_overviews(&mut self) -> bool {
-        let mut any = false;
-        for m in &mut self.layout.monitors {
-            if m.active_workspace_mut().is_overview {
-                m.active_workspace_mut().is_overview = false;
-                any = true;
-            }
-        }
-        if any {
-            self.reflow();
-        }
-        any
-    }
-
-    /// A click (not a drag) on a window while overview is active:
-    /// exit overview focused on the clicked window. Returns true if
-    /// handled.
-    fn click_in_overview(&mut self, hwnd: HWND) -> bool {
-        let id = hwnd.0 as isize;
-        let in_overview = self.layout.monitors.iter().any(|m| {
-            m.active_workspace().is_overview && m.workspace_of(id) == Some(m.active_workspace_idx)
-        });
-        if !in_overview {
+        let devices: Vec<String> = self.overviews.keys().cloned().collect();
+        if devices.is_empty() {
             return false;
         }
-        self.exit_overviews();
-        if self.layout.focus_window(id) {
-            self.focused = Some(hwnd);
-            self.update_focus_view(id);
+        for device in devices {
+            self.close_overview_to(&device, None);
         }
-        self.reflow();
-        self.sync_focus_to_os();
         true
+    }
+
+    /// Open the overview on one monitor (niri's toggle-overview,
+    /// per-monitor): every non-empty workspace participates, all its
+    /// windows become visible at once and the zoom animates 1 -> 0.35
+    /// around the active workspace. The camera starts parked on the
+    /// active workspace, so the first frame equals the current view.
+    fn open_overview(&mut self, device: &str) {
+        if self.interacting_window.is_some() || self.suspended {
+            return;
+        }
+        let Some(mon) = self.monitors.iter().find(|m| m.device == device) else {
+            return;
+        };
+        let Some(ml) = self.layout.monitor(device) else {
+            return;
+        };
+
+        // An in-flight slide on this monitor would fight the overview
+        // transport: snap it to its endpoint first (park the active
+        // workspace's tiles, hide the rest), then open from settled
+        // state.
+        if let Some(slide) = self.slides.remove(device) {
+            let cam = slide.camera.target();
+            placement::apply_geometry(&slide.rects_at(cam));
+            let active_idx = ml.active_workspace_idx;
+            for (k, rs) in &slide.finals {
+                if *k == active_idx {
+                    continue;
+                }
+                for r in rs {
+                    let hwnd = HWND(r.id as *mut _);
+                    // Register BEFORE hiding (hook race).
+                    self.hidden_by_us.insert(r.id);
+                    if crate::win::api::is_alive(hwnd) {
+                        placement::set_shown(hwnd, false);
+                    }
+                }
+            }
+        }
+
+        let params = self.params.clone();
+        let full = (
+            mon.full.left as f64,
+            mon.full.top as f64,
+            (mon.full.right - mon.full.left) as f64,
+            (mon.full.bottom - mon.full.top) as f64,
+        );
+        let area = (
+            mon.work.left as f64,
+            mon.work.top as f64,
+            (mon.work.right - mon.work.left) as f64,
+            (mon.work.bottom - mon.work.top) as f64,
+        );
+        let mut finals = Vec::new();
+        for (k, ws) in ml.workspaces.iter().enumerate() {
+            if ws.is_empty() {
+                continue;
+            }
+            finals.push((k, geometry::compute_workspace_geometry(ws, &params, area)));
+        }
+
+        let anim = self.config.animations.overview_open_close_params();
+        let mut progress = crate::anim::Val::to(0.0, anim);
+        progress.retarget(1.0, anim);
+        let camera = crate::anim::Val::to(ml.active_workspace_idx as f64, anim);
+
+        let ov = Overview {
+            progress,
+            camera,
+            finals,
+            full,
+            zoom_target: 0.35,
+        };
+        // Every participant becomes visible (windows of inactive
+        // workspaces are normally hidden); their z order stays as-is,
+        // like the slide. This frame's rects are exactly the settled
+        // tiles (zoom starts at 1), so nothing jumps.
+        for r in ov.finals.iter().flat_map(|(_, rs)| rs.iter()) {
+            let hwnd = HWND(r.id as *mut _);
+            self.hidden_by_us.remove(&r.id);
+            if crate::win::api::is_alive(hwnd) {
+                placement::set_shown(hwnd, true);
+            }
+        }
+        placement::apply_geometry(&ov.current_rects());
+        // Floats would sit full-size over the scaled workspaces;
+        // hide them for the duration (reflow brings them back once
+        // the overview state is gone).
+        let float_ids: Vec<isize> = self
+            .floating
+            .iter()
+            .filter(|(_, fs)| fs.device == device)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in float_ids {
+            let hwnd = HWND(id as *mut _);
+            // Register BEFORE hiding (hook race).
+            self.hidden_by_us.insert(id);
+            if crate::win::api::is_alive(hwnd) {
+                placement::set_shown(hwnd, false);
+            }
+            self.animator.remove(id);
+        }
+        placement::raise_bars(&self.monitors);
+        log::debug!(
+            "overview[{device}]: opening ({} workspaces)",
+            ov.finals.len()
+        );
+        self.overviews.insert(device.to_string(), ov);
+        self.update_focus_border();
+    }
+
+    /// Toggle the overview on one monitor: open when closed, close
+    /// when open (Ctrl+O twice mid-animation reverses smoothly — the
+    /// progress spring carries its velocity).
+    fn toggle_overview(&mut self, device: &str) {
+        let Some(ov) = self.overviews.get_mut(device) else {
+            self.open_overview(device);
+            return;
+        };
+        let anim = self.config.animations.overview_open_close_params();
+        let switch = self.config.animations.workspace_switch_params();
+        if ov.opening() {
+            ov.progress.retarget(0.0, anim);
+            // Close back into the active workspace.
+            if let Some(active) = self
+                .layout
+                .monitor(device)
+                .map(|ml| ml.active_workspace_idx)
+            {
+                ov.camera.retarget(active as f64, switch);
+            }
+        } else {
+            // Reopening mid-close: keep the camera wherever it is.
+            ov.progress.retarget(1.0, anim);
+        }
+    }
+
+    /// Close the overview, sliding the camera to `ws_idx` (None = the
+    /// active workspace). The zoom-in and the camera slide run as two
+    /// parallel springs (niri synchronizes them into one monotonic
+    /// motion via a correction term; the parallel version is close
+    /// enough and far simpler).
+    fn close_overview_to(&mut self, device: &str, ws_idx: Option<usize>) {
+        let Some(ov) = self.overviews.get_mut(device) else {
+            return;
+        };
+        let anim = self.config.animations.overview_open_close_params();
+        let switch = self.config.animations.workspace_switch_params();
+        let target = ws_idx
+            .or_else(|| {
+                self.layout
+                    .monitor(device)
+                    .map(|ml| ml.active_workspace_idx)
+            })
+            .map(|i| i as f64)
+            .unwrap_or_else(|| ov.camera.target());
+        ov.progress.retarget(0.0, anim);
+        ov.camera.retarget(target, switch);
+    }
+
+    /// Scroll the overview camera one workspace up/down (niri's bare
+    /// wheel and focus-workspace-up/down in overview). Clamped to the
+    /// workspaces that exist.
+    fn overview_scroll(&mut self, device: &str, down: bool) {
+        let Some(ov) = self.overviews.get_mut(device) else {
+            return;
+        };
+        let Some(ml) = self.layout.monitor(device) else {
+            return;
+        };
+        let max = ml.workspaces.len().saturating_sub(1) as f64;
+        let cur = ov.camera.target();
+        let to = if down {
+            (cur + 1.0).min(max)
+        } else {
+            (cur - 1.0).max(0.0)
+        };
+        if (to - cur).abs() > f64::EPSILON {
+            let switch = self.config.animations.workspace_switch_params();
+            ov.camera.retarget(to, switch);
+        }
+    }
+
+    /// Scroll the overview camera to a specific workspace index
+    /// (focus-workspace while the overview is open: the camera moves,
+    /// the active workspace does not — niri's
+    /// `allow_to_activate_workspace = false` in overview).
+    fn overview_goto(&mut self, device: &str, idx: usize) {
+        let Some(ov) = self.overviews.get_mut(device) else {
+            return;
+        };
+        let max = self
+            .layout
+            .monitor(device)
+            .map(|ml| ml.workspaces.len().saturating_sub(1))
+            .unwrap_or(0);
+        let switch = self.config.animations.workspace_switch_params();
+        ov.camera.retarget(idx.min(max) as f64, switch);
+    }
+
+    /// A click (not a drag) — or any foreground change — onto a window
+    /// inside an open overview: activate its workspace, focus it and
+    /// close the overview into it (niri's toggle-overview-to-
+    /// workspace). Returns true if handled.
+    fn click_in_overview(&mut self, hwnd: HWND) -> bool {
+        let id = hwnd.0 as isize;
+        let Some(device) = self.overviews.iter().find_map(|(d, ov)| {
+            ov.finals
+                .iter()
+                .any(|(_, rs)| rs.iter().any(|r| r.id == id))
+                .then(|| d.clone())
+        }) else {
+            return false;
+        };
+        let Some(ws_idx) = self
+            .layout
+            .monitor(&device)
+            .and_then(|ml| ml.workspace_of(id))
+        else {
+            return false;
+        };
+        log::debug!(
+            "overview[{device}]: selecting window {id} (ws {})",
+            ws_idx + 1
+        );
+        if let Some(ml) = self.layout.monitor_mut(&device) {
+            ml.active_workspace_idx = ws_idx;
+            ml.active_workspace_mut().focus_window(id);
+        }
+        self.focused = Some(hwnd);
+        self.update_focus_view(id);
+        self.close_overview_to(&device, Some(ws_idx));
+        true
+    }
+
+    /// Rebuild an overview's participant set from the current layout
+    /// (windows opened/closed while it is open) and apply one frame.
+    /// Called from reflow(), which skips overview monitors' tiled
+    /// windows entirely.
+    fn refresh_overview(&mut self, device: &str) {
+        let Some(mon) = self.monitors.iter().find(|m| m.device == device) else {
+            return;
+        };
+        let Some(ml) = self.layout.monitor(device) else {
+            return;
+        };
+        let params = self.params.clone();
+        let area = (
+            mon.work.left as f64,
+            mon.work.top as f64,
+            (mon.work.right - mon.work.left) as f64,
+            (mon.work.bottom - mon.work.top) as f64,
+        );
+        let mut finals = Vec::new();
+        for (k, ws) in ml.workspaces.iter().enumerate() {
+            if ws.is_empty() {
+                continue;
+            }
+            finals.push((k, geometry::compute_workspace_geometry(ws, &params, area)));
+        }
+        let Some(ov) = self.overviews.get_mut(device) else {
+            return;
+        };
+        ov.finals = finals;
+        // Windows opened mid-overview join as visible participants.
+        for r in ov.finals.iter().flat_map(|(_, rs)| rs.iter()) {
+            let hwnd = HWND(r.id as *mut _);
+            self.hidden_by_us.remove(&r.id);
+            if crate::win::api::is_alive(hwnd) {
+                placement::set_shown(hwnd, true);
+            }
+        }
+        placement::apply_geometry(&ov.current_rects());
+        placement::raise_bars(&self.monitors);
     }
 
     /// Niri's do-screen-transition: suspend management and cover the
@@ -535,9 +884,36 @@ impl AppState {
                     }
                 }
             }
-            log::debug!(
-                "slide[{device}]: snapped to endpoint on suspend (camera={cam:.3})"
-            );
+            log::debug!("slide[{device}]: snapped to endpoint on suspend (camera={cam:.3})");
+        }
+        // Open overviews snap closed the same way: park the active
+        // workspace's windows at their settled tiles, hide the rest,
+        // drop the state. The screen is covered for the transition
+        // anyway; `resume_management`'s reflow re-applies everything.
+        let overviews = std::mem::take(&mut self.overviews);
+        for (device, ov) in overviews {
+            let active_idx = self
+                .layout
+                .monitor(&device)
+                .map(|ml| ml.active_workspace_idx);
+            let cam = active_idx
+                .map(|i| i as f64)
+                .unwrap_or_else(|| ov.camera.target());
+            placement::apply_geometry(&ov.rects_at(1.0, cam));
+            for (k, rs) in &ov.finals {
+                if Some(*k) == active_idx {
+                    continue;
+                }
+                for r in rs {
+                    let hwnd = HWND(r.id as *mut _);
+                    // Register BEFORE hiding (hook race).
+                    self.hidden_by_us.insert(r.id);
+                    if crate::win::api::is_alive(hwnd) {
+                        placement::set_shown(hwnd, false);
+                    }
+                }
+            }
+            log::debug!("overview[{device}]: snapped closed on suspend");
         }
         if let Some(fb) = self.focus_border.as_ref() {
             fb.hide();
@@ -567,6 +943,21 @@ impl AppState {
         }
         match ev.kind {
             MouseKind::WheelV | MouseKind::WheelH => {
+                // In an open overview, a bare vertical wheel scrolls the
+                // workspace strip (niri maps it to focus-workspace-up/
+                // down under the mouse); wheel combos and horizontal
+                // wheels fall through to the configured binds.
+                if ev.kind == MouseKind::WheelV
+                    && !ev.mod_held
+                    && !ev.ctrl
+                    && !ev.shift
+                    && let Some(device) =
+                        monitor::monitor_at_cursor(&self.monitors).map(|m| m.device.clone())
+                    && self.overviews.contains_key(&device)
+                {
+                    self.overview_scroll(&device, ev.notches < 0);
+                    return;
+                }
                 let Some(vk) = ev.wheel_vk() else { return };
                 let key_ev = KeyEvent {
                     vk,
@@ -603,6 +994,15 @@ impl AppState {
             return;
         }
         let id = hwnd.0 as isize;
+        // Hovering a scaled-down overview window must not focus it:
+        // focusing activates its workspace and fights the overview.
+        if self.overviews.values().any(|ov| {
+            ov.finals
+                .iter()
+                .any(|(_, rs)| rs.iter().any(|r| r.id == id))
+        }) {
+            return;
+        }
         let visible_tiled = self.layout.monitors.iter().any(|m| {
             m.workspace_of(id)
                 .is_some_and(|ws| ws == m.active_workspace_idx)
@@ -669,10 +1069,33 @@ impl AppState {
                     .iter()
                     .find_map(|m| m.workspace_of(id).map(|_| m.device.clone()))
             })
-            .or_else(|| {
-                monitor::monitor_at_cursor(&self.monitors).map(|m| m.device.clone())
-            });
+            .or_else(|| monitor::monitor_at_cursor(&self.monitors).map(|m| m.device.clone()));
         let Some(device) = device else { return };
+
+        // The overview owns several actions while open: they act on the
+        // per-monitor overview state (camera scroll) instead of the
+        // layout, and the layout borrow below must not run.
+        match action {
+            Action::ToggleOverview => {
+                self.toggle_overview(&device);
+                return;
+            }
+            Action::FocusWindowDown if self.overviews.contains_key(&device) => {
+                self.overview_scroll(&device, true);
+                return;
+            }
+            Action::FocusWindowUp if self.overviews.contains_key(&device) => {
+                self.overview_scroll(&device, false);
+                return;
+            }
+            Action::FocusWorkspace(n) | Action::WorkspaceSwitch(n)
+                if self.overviews.contains_key(&device) =>
+            {
+                self.overview_goto(&device, n.saturating_sub(1) as usize);
+                return;
+            }
+            _ => {}
+        }
 
         // Floating windows are not in the tiling: handle the small
         // action subset that applies to them directly.
@@ -685,23 +1108,9 @@ impl AppState {
                 return;
             }
             // These apply to the workspace, not the float itself.
-            match action {
-                Action::ToggleOverview => {
-                    if let Some(fs) = self.floating.get(&id) {
-                        let device = fs.device.clone();
-                        if let Some(ml) = self.layout.monitor_mut(&device)
-                            && ml.active_workspace_mut().toggle_overview()
-                        {
-                            self.reflow();
-                        }
-                    }
-                    return;
-                }
-                Action::CloseWindow => {
-                    self.close_window(id);
-                    return;
-                }
-                _ => {}
+            if matches!(action, Action::CloseWindow) {
+                self.close_window(id);
+                return;
             }
             // Map a few tiling actions to float move/resize.
             let mut touched = false;
@@ -920,9 +1329,8 @@ impl AppState {
                 // back to the plain (instant) reflow when the
                 // animation is `off` in the config, or while the user
                 // is dragging a window.
-                let slidden = ws_prev.is_some_and(|prev_idx| {
-                    self.workspace_slide_reflow(&device, prev_idx, idx)
-                });
+                let slidden = ws_prev
+                    .is_some_and(|prev_idx| self.workspace_slide_reflow(&device, prev_idx, idx));
                 if !slidden {
                     self.reflow();
                 }
@@ -1006,6 +1414,28 @@ impl AppState {
             return;
         };
         let id = hwnd.0 as isize;
+        // In an overview the focused window is scaled down; the ring
+        // must outline the scaled rect (the real HWND rect also lags
+        // the zoom animation by a frame).
+        if let Some(r) = self
+            .overviews
+            .values()
+            .find_map(|ov| ov.current_rects().into_iter().find(|r| r.id == id))
+        {
+            // Config stores 0xRRGGBB; COLORREF wants 0x00BBGGRR.
+            let rgb = ring.active_color;
+            let bgr = ((rgb & 0xFF) << 16) | (rgb & 0x00_FF_00) | ((rgb >> 16) & 0xFF);
+            fb.update(
+                r.x,
+                r.y,
+                r.w,
+                r.h,
+                ring.width,
+                ring.radius,
+                windows::Win32::Foundation::COLORREF(bgr),
+            );
+            return;
+        }
         let visible_float = self
             .floating
             .get(&id)
@@ -1118,6 +1548,9 @@ impl AppState {
         for m in &new_monitors {
             self.layout.add_monitor(&m.device);
         }
+        // Overviews reference monitor geometry that just changed;
+        // drop them (the reflow below re-applies normal tiling).
+        self.overviews.clear();
         self.monitors = new_monitors;
         self.reflow();
     }
@@ -1154,6 +1587,14 @@ impl AppState {
     /// on another monitor moves the window to that output.
     fn handle_tiled_drag_end(&mut self, hwnd: HWND) {
         let id = hwnd.0 as isize;
+
+        // A click or drag on a window inside an open overview selects
+        // it: activate its workspace, focus it, close into it. (Niri
+        // turns overview drags into spatial moves between workspaces;
+        // not supported yet — any overview drag acts as a select.)
+        if self.click_in_overview(hwnd) {
+            return;
+        }
 
         // Tell real drags apart from clicks / tiny nudges: only a
         // meaningful position change triggers a reorder.
@@ -1443,6 +1884,12 @@ impl AppState {
         if self.interacting_window.is_some() || self.suspended {
             return false;
         }
+        // An open overview owns this monitor's transport; a slide
+        // would fight it. The caller's reflow refreshes the overview
+        // instead (the layout change lands scaled).
+        if self.overviews.contains_key(device) {
+            return false;
+        }
         let ws_params = self.config.animations.workspace_switch_params();
         if ws_params.kind == crate::anim::AnimKind::instant() {
             return false;
@@ -1478,7 +1925,9 @@ impl AppState {
         let mut participants: Vec<usize> = Vec::new();
         let mut finals: Vec<(usize, Vec<geometry::TileRect>)> = Vec::new();
         for k in lo..=hi {
-            let Some(ws) = ml.workspaces.get(k) else { continue };
+            let Some(ws) = ml.workspaces.get(k) else {
+                continue;
+            };
             participants.push(k);
             finals.push((k, geometry::compute_workspace_geometry(ws, &params, area)));
         }
@@ -1507,18 +1956,18 @@ impl AppState {
             }
             // Park the still-relevant old participants exactly where
             // they are right now, so the camera handover is seamless.
-            let keep: std::collections::HashSet<isize> =
-                old_rects.iter().map(|r| r.id).collect();
+            let keep: std::collections::HashSet<isize> = old_rects.iter().map(|r| r.id).collect();
             for (k, rects) in finals.iter_mut() {
                 if !participants.contains(k) || (lo..=hi).contains(k) {
                     continue;
                 }
                 rects.retain(|r| !keep.contains(&r.id));
                 for r in old_rects.iter().filter(|r| keep.contains(&r.id)) {
-                    if rects.iter().all(|x| x.id != r.id) && ml
-                        .workspaces
-                        .get(*k)
-                        .is_some_and(|ws| ws.window_ids().any(|id| id == r.id))
+                    if rects.iter().all(|x| x.id != r.id)
+                        && ml
+                            .workspaces
+                            .get(*k)
+                            .is_some_and(|ws| ws.window_ids().any(|id| id == r.id))
                     {
                         rects.push(*r);
                     }
@@ -1619,21 +2068,30 @@ impl AppState {
             // targets for THIS monitor are skipped until the slide
             // settles (which runs the skipped reflow via
             // finish_slide).
+            //
+            // An open overview owns the monitor's tiled geometry the
+            // same way (all workspaces, not just the active one); its
+            // participants are refreshed via `refresh_overview`
+            // below instead.
             let mut sliding_ids: std::collections::HashSet<isize> =
                 std::collections::HashSet::new();
             if let Some(slide) = self.slides.get(&mon.device) {
                 sliding_ids.extend(
-                    slide.finals.iter().flat_map(|(_, rs)| rs.iter().map(|r| r.id)),
+                    slide
+                        .finals
+                        .iter()
+                        .flat_map(|(_, rs)| rs.iter().map(|r| r.id)),
                 );
+            }
+            if let Some(ov) = self.overviews.get(&mon.device) {
+                sliding_ids.extend(ov.finals.iter().flat_map(|(_, rs)| rs.iter().map(|r| r.id)));
             }
             for (i, ws) in ml.workspaces.iter().enumerate() {
                 if i != ml.active_workspace_idx {
                     // Windows still taking part in a slide on this
                     // monitor are hidden by finish_slide once the
                     // camera settles; don't hide them mid-slide.
-                    hide_ids.extend(
-                        ws.window_ids().filter(|id| !sliding_ids.contains(id)),
-                    );
+                    hide_ids.extend(ws.window_ids().filter(|id| !sliding_ids.contains(id)));
                 }
             }
             let area = (
@@ -1675,7 +2133,11 @@ impl AppState {
                     .layout
                     .monitor(&fs.device)
                     .map(|ml| ml.active_workspace_idx == fs.workspace_idx)
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    // Floats are hidden while an overview is open on
+                    // their monitor (they would sit full-size over
+                    // the scaled workspaces).
+                    && !self.overviews.contains_key(&fs.device);
                 (*id, fs.x, fs.y, fs.w, fs.h, visible)
             })
             .collect();
@@ -1732,6 +2194,13 @@ impl AppState {
         if !raise_ids.is_empty() {
             placement::raise_bars(&self.monitors);
         }
+        // Monitors with an open overview own their tiled geometry:
+        // rebuild their participant set (windows may have opened or
+        // closed since) and park one frame at the current camera/zoom.
+        let overview_devices: Vec<String> = self.overviews.keys().cloned().collect();
+        for device in overview_devices {
+            self.refresh_overview(&device);
+        }
         // Kick an immediate frame so first paint is not delayed.
         self.tick_animations();
         self.update_focus_border();
@@ -1748,6 +2217,7 @@ impl AppState {
             placement::apply_geometry(&[rect]);
         }
         self.tick_slides();
+        self.tick_overviews();
         // The ring follows the focused window's live rect, so it must
         // move with every animation frame.
         self.update_focus_border();
@@ -1802,10 +2272,7 @@ impl AppState {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(
-                &path,
-                include_str!("../config.example.kdl"),
-            );
+            let _ = std::fs::write(&path, include_str!("../config.example.kdl"));
         }
         let path = windows::core::HSTRING::from(path.as_os_str());
         let r = unsafe { ShellExecuteW(None, None, &path, None, None, SW_SHOWNORMAL) };
@@ -1866,6 +2333,73 @@ impl AppState {
                 // (e.g. floats shown/hidden mid-slide).
                 self.reflow();
             }
+        }
+    }
+
+    /// Advance every overview one frame: while zoom or camera are in
+    /// flight, place all participant windows at their zoom/camera-
+    /// derived rects (bars re-raised above them). A fully closed and
+    /// settled overview hands over: park the final frame at zoom 1
+    /// (== the settled tiles of the target workspace), hide the
+    /// non-active participants, drop the state and reflow (which
+    /// brings floats back and applies whatever changed meanwhile). A
+    /// fully open and settled overview needs no per-frame work — the
+    /// state stays for scrolling and selection.
+    fn tick_overviews(&mut self) {
+        if self.overviews.is_empty() {
+            return;
+        }
+        let devices: Vec<String> = self.overviews.keys().cloned().collect();
+        for device in devices {
+            let Some(ov) = self.overviews.get(&device) else {
+                continue;
+            };
+            // While the user drags one of the scaled windows, stop
+            // applying overview rects for a moment — fighting the
+            // drag would make the window rubber-band back every
+            // frame. The animation freezes and resumes on drop.
+            if self.interacting_window.is_some() {
+                continue;
+            }
+            if !ov.settled() {
+                let zoom = ov.zoom();
+                let cam = ov.camera.value();
+                log::debug!("overview[{device}]: zoom={zoom:.3} cam={cam:.2}");
+                placement::apply_geometry(&ov.rects_at(zoom, cam));
+                // The scaled windows cross the bar zone; keep bars
+                // (yasb/zebar/...) above them.
+                placement::raise_bars(&self.monitors);
+                continue;
+            }
+            if ov.opening() {
+                // Open and settled: nothing to animate until the user
+                // scrolls or selects.
+                continue;
+            }
+            let ov = self.overviews.remove(&device).expect("checked above");
+            log::debug!("overview[{device}]: closed");
+            // Park the final frame at zoom 1 with the camera on the
+            // target workspace — exactly the settled tiles.
+            placement::apply_geometry(&ov.rects_at(1.0, ov.camera.target()));
+            let active_idx = self
+                .layout
+                .monitor(&device)
+                .map(|ml| ml.active_workspace_idx);
+            for (k, rs) in &ov.finals {
+                if Some(*k) == active_idx {
+                    continue;
+                }
+                for r in rs {
+                    let hwnd = HWND(r.id as *mut _);
+                    // Register BEFORE hiding (hook race).
+                    self.hidden_by_us.insert(r.id);
+                    if crate::win::api::is_alive(hwnd) {
+                        placement::set_shown(hwnd, false);
+                    }
+                }
+            }
+            // The overview no longer owns this monitor's geometry.
+            self.reflow();
         }
     }
 }
@@ -1942,6 +2476,7 @@ impl App {
             floating: std::collections::HashMap::new(),
             hidden_by_us: std::collections::HashSet::new(),
             slides: std::collections::HashMap::new(),
+            overviews: std::collections::HashMap::new(),
             original_rects: std::collections::HashMap::new(),
             overlay,
             focus_border,
@@ -2141,5 +2676,97 @@ fn install_ctrl_c_quit() {
         if SetConsoleCtrlHandler(Some(handler), true).is_err() {
             log::warn!("failed to install Ctrl+C handler");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instant() -> crate::anim::AnimParams {
+        crate::anim::AnimParams {
+            kind: crate::anim::AnimKind::instant(),
+            slowdown: 1.0,
+        }
+    }
+
+    fn tile(id: isize, x: i32, y: i32, w: i32, h: i32) -> geometry::TileRect {
+        geometry::TileRect { id, x, y, w, h }
+    }
+
+    /// Monitor: full 1000x800 at (0,0). Workspace 0's settled tile is
+    /// (100, 60, 400, 700), workspace 1's is (150, 60, 400, 700).
+    fn overview() -> Overview {
+        Overview {
+            progress: crate::anim::Val::to(1.0, instant()),
+            camera: crate::anim::Val::to(0.0, instant()),
+            finals: vec![
+                (0, vec![tile(1, 100, 60, 400, 700)]),
+                (1, vec![tile(2, 150, 60, 400, 700)]),
+            ],
+            full: (0.0, 0.0, 1000.0, 800.0),
+            zoom_target: 0.35,
+        }
+    }
+
+    #[test]
+    fn overview_zoom_follows_progress() {
+        let mut ov = overview();
+        // progress 1 -> the target zoom.
+        assert!((ov.zoom() - 0.35).abs() < 1e-9);
+        // progress 0 -> zoom 1 (closed == settled view).
+        ov.progress = crate::anim::Val::to(0.0, instant());
+        assert!((ov.zoom() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn overview_rects_continuous_at_zoom_one() {
+        // At zoom 1 with the camera on workspace k, workspace k's
+        // rects are EXACTLY the settled tiles — the close handover to
+        // reflow() is pixel-exact, and opening starts from the
+        // current view.
+        let mut ov = overview();
+        ov.camera = crate::anim::Val::to(1.0, instant());
+        let rects = ov.rects_at(1.0, 1.0);
+        assert_eq!(rects.len(), 2);
+        let r2 = rects.iter().find(|r| r.id == 2).unwrap();
+        assert_eq!((r2.x, r2.y, r2.w, r2.h), (150, 60, 400, 700));
+        // Workspace 0 sits one stride above: stride = 800 + 80 = 880.
+        let r1 = rects.iter().find(|r| r.id == 1).unwrap();
+        assert_eq!((r1.x, r1.y, r1.w, r1.h), (100, 60 - 880, 400, 700));
+    }
+
+    #[test]
+    fn overview_scales_and_centers() {
+        // niri's workspaces_render_geo: the canvas (full monitor) is
+        // scaled by zoom and centered; workspace k sits at
+        // (k - camera) * stride with stride = scaled height + 10% gap.
+        let ov = overview();
+        let rects = ov.rects_at(0.35, 0.0);
+        let r1 = rects.iter().find(|r| r.id == 1).unwrap();
+        // off_x = (1000 - 350) / 2 = 325; x = 325 + 100 * 0.35 = 360.
+        assert_eq!(r1.x, 360);
+        // off_y = (800 - 280) / 2 = 260; y = 260 + 60 * 0.35 = 281.
+        assert_eq!(r1.y, 281);
+        assert_eq!(r1.w, 140);
+        assert_eq!(r1.h, 245);
+        // Camera on workspace 0: workspace 1 is one stride below
+        // (stride = 280 + 800 * 0.1 * 0.35 = 308).
+        let r2 = rects.iter().find(|r| r.id == 2).unwrap();
+        assert_eq!(r2.y, 281 + 308);
+    }
+
+    #[test]
+    fn overview_camera_offsets_all_workspaces() {
+        // Camera between workspaces interpolates the strip offset;
+        // every participant moves in lockstep (one animated value).
+        let ov = overview();
+        let rects = ov.rects_at(0.35, 0.5);
+        let r1 = rects.iter().find(|r| r.id == 1).unwrap();
+        let r2 = rects.iter().find(|r| r.id == 2).unwrap();
+        assert_eq!(r1.y, 281 - 154); // (0 - 0.5) * 308
+        assert_eq!(r2.y, 281 + 154); // (1 - 0.5) * 308
+        // x does not depend on the camera.
+        assert_eq!(r1.x, 360);
     }
 }

@@ -119,9 +119,6 @@ pub struct Workspace {
     /// monitor (niri's `toggle-windowed-fullscreen`). The layout
     /// structure underneath stays intact.
     pub fullscreen_id: Option<WindowId>,
-    /// Overview mode (niri's `toggle-overview`): all columns are scaled
-    /// down so the whole workspace is visible at once. Esc exits.
-    pub is_overview: bool,
     /// Niri semantics: if the active column is removed without any
     /// intermediate focus change, restore focus (and view offset) to the
     /// previously active column instead of the neighbor.
@@ -143,7 +140,6 @@ impl Workspace {
             active_column_idx: 0,
             view_offset: 0.0,
             fullscreen_id: None,
-            is_overview: false,
             activate_prev_column_on_removal: None,
             pending_view_rebase: None,
         }
@@ -234,7 +230,9 @@ impl Workspace {
 
     /// All window ids in layout order.
     pub fn window_ids(&self) -> impl Iterator<Item = WindowId> + '_ {
-        self.columns.iter().flat_map(|c| c.tiles.iter().map(|t| t.id))
+        self.columns
+            .iter()
+            .flat_map(|c| c.tiles.iter().map(|t| t.id))
     }
 
     /// Insert a window as a new column at `idx` (drag-and-drop between
@@ -279,14 +277,6 @@ impl Workspace {
         true
     }
 
-    /// Toggle overview mode (niri's toggle-overview): the whole
-    /// workspace scales down into a filmstrip; Esc (or the same bind)
-    /// exits back into the focused column.
-    pub fn toggle_overview(&mut self) -> bool {
-        self.is_overview = !self.is_overview;
-        true
-    }
-
     /// Remove a window. Fixes up focus indices following niri's rules:
     /// - removing the focused column moves focus to the left neighbor
     ///   (or the prev-active column for a freshly created column),
@@ -304,22 +294,17 @@ impl Workspace {
         if col.tiles.is_empty() {
             self.columns.remove(ci);
             // Pick the new active column.
-            let (new_idx, new_offset) = if let Some((prev_idx, prev_offset)) =
-                self.activate_prev_column_on_removal
-            {
-                // Only valid if the removed column was the active one and
-                // no focus change happened since creation.
-                let candidate = prev_idx.min(self.columns.len().saturating_sub(1));
-                (candidate, prev_offset)
-            } else {
-                (ci.saturating_sub(1), 0.0)
-            };
+            let (new_idx, new_offset) =
+                if let Some((prev_idx, prev_offset)) = self.activate_prev_column_on_removal {
+                    // Only valid if the removed column was the active one and
+                    // no focus change happened since creation.
+                    let candidate = prev_idx.min(self.columns.len().saturating_sub(1));
+                    (candidate, prev_offset)
+                } else {
+                    (ci.saturating_sub(1), 0.0)
+                };
             self.activate_prev_column_on_removal = None;
-            self.active_column_idx = if self.columns.is_empty() {
-                0
-            } else {
-                new_idx
-            };
+            self.active_column_idx = if self.columns.is_empty() { 0 } else { new_idx };
             self.view_offset = new_offset;
             // The (idx, offset) pair set above is self-consistent;
             // drop any stale rebase record.
@@ -461,8 +446,9 @@ impl Workspace {
         if self.columns[ci].tiles.is_empty() {
             self.columns.remove(ci);
         } else {
-            self.columns[ci].active_tile_idx =
-                self.columns[ci].active_tile_idx.min(self.columns[ci].tiles.len() - 1);
+            self.columns[ci].active_tile_idx = self.columns[ci]
+                .active_tile_idx
+                .min(self.columns[ci].tiles.len() - 1);
         }
 
         if !self.columns[ni].tiles.is_empty() {
@@ -527,8 +513,9 @@ impl Workspace {
         } else {
             // Expel: standalone column next to the current position.
             let tile = self.columns[ci].tiles.remove(ti);
-            self.columns[ci].active_tile_idx =
-                self.columns[ci].active_tile_idx.min(self.columns[ci].tiles.len() - 1);
+            self.columns[ci].active_tile_idx = self.columns[ci]
+                .active_tile_idx
+                .min(self.columns[ci].tiles.len() - 1);
             let col = Column {
                 tiles: vec![tile],
                 active_tile_idx: 0,
@@ -597,8 +584,9 @@ impl Workspace {
         self.columns.insert(ci + 1, col);
         // Focus stays on the (still focused) source column, but its
         // active tile must be valid after the removal.
-        self.columns[ci].active_tile_idx =
-            self.columns[ci].active_tile_idx.min(self.columns[ci].tiles.len() - 1);
+        self.columns[ci].active_tile_idx = self.columns[ci]
+            .active_tile_idx
+            .min(self.columns[ci].tiles.len() - 1);
         self.active_column_idx = ci;
         self.activate_prev_column_on_removal = None;
         true
@@ -607,7 +595,12 @@ impl Workspace {
     /// Niri's set-column-width: delta ("+100"/"-100"), fixed
     /// ("1000") or proportion ("50%"). Applied to the focused column.
     pub fn set_column_width(&mut self, spec: &SizeChange) -> bool {
-        let Some(ci) = self.columns.len().checked_sub(0).map(|_| self.active_column_idx) else {
+        let Some(ci) = self
+            .columns
+            .len()
+            .checked_sub(0)
+            .map(|_| self.active_column_idx)
+        else {
             return false;
         };
         let col = &mut self.columns[ci];
@@ -1097,7 +1090,10 @@ mod tests {
         assert!(ws.focus_tile(DirV::Up));
         assert_eq!(ws.focused_id(), Some(B));
         assert!(ws.move_tile(DirV::Up));
-        assert_eq!(ws.columns[0].tiles.iter().map(|t| t.id).collect::<Vec<_>>(), vec![B, A, C]);
+        assert_eq!(
+            ws.columns[0].tiles.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![B, A, C]
+        );
         assert_eq!(ws.focused_id(), Some(B));
         // At top edge: no move.
         assert!(!ws.move_tile(DirV::Up));
@@ -1112,7 +1108,10 @@ mod tests {
         // C focused (rightmost); swap with neighbor only.
         assert!(ws.move_column(DirH::Left));
         assert_eq!(
-            ws.columns.iter().map(|c| c.focused_id()).collect::<Vec<_>>(),
+            ws.columns
+                .iter()
+                .map(|c| c.focused_id())
+                .collect::<Vec<_>>(),
             vec![Some(A), Some(C), Some(B)]
         );
         assert_eq!(ws.focused_id(), Some(C));
@@ -1246,10 +1245,7 @@ mod tests {
             "empty workspace has nothing focused"
         );
         assert!(ml.switch_workspace(0));
-        assert_eq!(
-            ml.move_focused_window_to_workspace(1, true),
-            Some(B)
-        );
+        assert_eq!(ml.move_focused_window_to_workspace(1, true), Some(B));
         assert_eq!(ml.active_workspace_idx, 1);
         assert_eq!(ml.active_workspace().focused_id(), Some(B));
         // A stayed behind on workspace 0.
@@ -1344,7 +1340,10 @@ mod tests {
         ws.remove_window(A);
         ws.insert_column_at(2, A);
         assert_eq!(
-            ws.columns.iter().map(|c| c.focused_id()).collect::<Vec<_>>(),
+            ws.columns
+                .iter()
+                .map(|c| c.focused_id())
+                .collect::<Vec<_>>(),
             vec![Some(B), Some(C), Some(A)]
         );
         assert_eq!(ws.focused_id(), Some(A));
