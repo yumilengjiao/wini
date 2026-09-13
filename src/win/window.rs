@@ -1,6 +1,6 @@
 //! Tracking of top-level application windows.
 //!
-//! yumi-wini does not own application windows; it observes them. This
+//! wini does not own application windows; it observes them. This
 //! module decides *which* HWNDs are worth managing and keeps a snapshot
 //! of their basic properties.
 

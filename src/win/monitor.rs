@@ -1,6 +1,6 @@
 //! Monitor enumeration and geometry.
 //!
-//! yumi-wini lays windows out per-monitor (each output gets its own set of
+//! wini lays windows out per-monitor (each output gets its own set of
 //! scrollable workspaces later). This module snapshots the current monitor
 //! topology using `EnumDisplayMonitors` / `GetMonitorInfoW`.
 

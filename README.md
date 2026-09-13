@@ -1,4 +1,4 @@
-# yumi-wini
+# wini
 
 A scrollable-tiling window manager for Windows, inspired by
 [Niri](https://github.com/YaLTeR/niri).
@@ -6,7 +6,7 @@ A scrollable-tiling window manager for Windows, inspired by
 > Reproduce the Niri experience, not the Niri architecture.
 
 Windows already has a window manager and a compositor (DWM), so
-yumi-wini does **not** replace them. It runs as a normal process on
+wini does **not** replace them. It runs as a normal process on
 top, tracking application windows (HWNDs) and arranging them into
 Niri's scrollable, column-based layout — with keyboard-driven focus,
 workspaces, floating windows, animations and an overview mode.
@@ -35,7 +35,7 @@ workspaces, floating windows, animations and an overview mode.
 - **Hot reload** — edit the config file, it applies within a second
   (a broken config keeps the last good one)
 - **Graceful exit** — every window gets its original geometry,
-  decorations and visibility back when yumi-wini quits
+  decorations and visibility back when wini quits
 
 ## Build & run
 
@@ -57,8 +57,8 @@ Logs go to stderr; raise verbosity with `RUST_LOG=debug`.
 
 ## Configuration
 
-The config lives at `%APPDATA%\yumi-wini\config.kdl` (override with
-the `YUMI_WINI_CONFIG` environment variable). Missing file = sane
+The config lives at `%APPDATA%\wini\config.kdl` (override with
+the `WINI_CONFIG` environment variable). Missing file = sane
 defaults. See [docs/CONFIG.md](docs/CONFIG.md) for the full reference
 and [config.example.kdl](config.example.kdl) for a commented starting
 point.

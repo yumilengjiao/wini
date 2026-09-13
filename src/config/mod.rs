@@ -41,8 +41,8 @@
 //! }
 //! ```
 //!
-//! Config lives at `%APPDATA%\yumi-wini\config.kdl` (overridable with
-//! `YUMI_WINI_CONFIG`). Missing file = defaults.
+//! Config lives at `%APPDATA%\wini\config.kdl` (overridable with
+//! `WINI_CONFIG`). Missing file = defaults.
 
 // The input module consumes this in the next commits; silence interim
 // dead-code warnings.
@@ -407,13 +407,13 @@ impl Config {
 
 /// Locate the config file without reading it.
 pub fn config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("YUMI_WINI_CONFIG") {
+    if let Ok(p) = std::env::var("WINI_CONFIG") {
         return PathBuf::from(p);
     }
     let base = std::env::var("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
-    base.join("yumi-wini").join("config.kdl")
+    base.join("wini").join("config.kdl")
 }
 
 /// Load and parse the config; falls back to defaults on any problem

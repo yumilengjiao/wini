@@ -1,4 +1,4 @@
-//! yumi-wini: a scrollable-tiling window manager for Windows, inspired by Niri.
+//! wini: a scrollable-tiling window manager for Windows, inspired by Niri.
 //!
 //! This program acts as a window *management layer* on top of the existing
 //! Windows window manager / DWM. It tracks application windows (HWNDs),
@@ -35,7 +35,7 @@ fn main() -> ExitCode {
     }
 
     log::info!(
-        "yumi-wini v{} starting (pid {})",
+        "wini v{} starting (pid {})",
         env!("CARGO_PKG_VERSION"),
         std::process::id()
     );
@@ -46,7 +46,7 @@ fn main() -> ExitCode {
                 log::error!("fatal error: {err}");
                 ExitCode::FAILURE
             } else {
-                log::info!("yumi-wini exited cleanly");
+                log::info!("wini exited cleanly");
                 ExitCode::SUCCESS
             }
         }

@@ -1,6 +1,6 @@
-// yumi-wini example configuration.
+// wini example configuration.
 //
-// Copy to %APPDATA%\yumi-wini\config.kdl and edit. Everything here is
+// Copy to %APPDATA%\wini\config.kdl and edit. Everything here is
 // optional — a missing file means the defaults, and hot reload picks
 // up changes within a second (parse errors keep the last good config).
 //

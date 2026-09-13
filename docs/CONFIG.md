@@ -1,7 +1,7 @@
 # Configuration reference
 
-yumi-wini is configured with a [KDL](https://kdl.dev) file, kept at
-`%APPDATA%\yumi-wini\config.kdl` (override with the `YUMI_WINI_CONFIG`
+wini is configured with a [KDL](https://kdl.dev) file, kept at
+`%APPDATA%\wini\config.kdl` (override with the `WINI_CONFIG`
 environment variable). The file is hot-reloaded: changes apply within
 about a second; if the new file fails to parse, the previous config
 stays in effect and a warning is logged.
@@ -143,7 +143,7 @@ A config-provided `binds` section **replaces** the default binds.
 
 | Action | Meaning |
 | --- | --- |
-| `quit` | exit yumi-wini (restores all windows) |
+| `quit` | exit wini (restores all windows) |
 | `close-window` | close the focused window (WM_CLOSE) |
 | `spawn "cmd args"` | run a command (first token = exe) |
 | `focus-column-left` / `focus-column-right` | move column focus |

@@ -1553,6 +1553,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wini"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "kdl",
+ "log",
+ "tray-icon",
+ "windows",
+]
+
+[[package]]
 name = "winnow"
 version = "0.5.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1578,17 +1589,6 @@ checksum = "502da5464ccd04011667b11c435cb992822c2c0dbde1770c988480d312a0db2e"
 dependencies = [
  "libc",
  "pkg-config",
-]
-
-[[package]]
-name = "yumi-wini"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "kdl",
- "log",
- "tray-icon",
- "windows",
 ]
 
 [[package]]
