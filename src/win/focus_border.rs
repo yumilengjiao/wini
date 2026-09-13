@@ -45,7 +45,7 @@ pub struct FocusBorder {
 
 impl FocusBorder {
     pub fn new() -> Option<Self> {
-        let class_name = w!("yumi_wini_focus");
+        let class_name = w!("wini_focus");
         unsafe {
             let hinstance = GetModuleHandleW(None).ok()?;
             let wc = WNDCLASSW {

@@ -130,7 +130,7 @@ impl MessageWindow {
     /// Create a message-only window owned by the calling thread. The
     /// thread must pump messages for deliveries to arrive.
     pub fn new() -> Option<Self> {
-        let class_name = w!("yumi_wini_msg");
+        let class_name = w!("wini_msg");
 
         unsafe {
             let hinstance = GetModuleHandleW(None).ok()?;

@@ -110,7 +110,7 @@ pub struct OverlayWindow {
 
 impl OverlayWindow {
     pub fn new() -> Option<Self> {
-        let class_name = w!("yumi_wini_overlay");
+        let class_name = w!("wini_overlay");
         unsafe {
             let hinstance = GetModuleHandleW(None).ok()?;
             let wc = WNDCLASSW {

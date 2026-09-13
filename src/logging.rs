@@ -1,12 +1,12 @@
 //! Logging bootstrap.
 //!
 //! Verbosity is controlled with the `RUST_LOG` environment variable,
-//! e.g. `RUST_LOG=yumi_wini=debug`. Defaults to `info`.
+//! e.g. `RUST_LOG=wini=debug`. Defaults to `info`.
 
 use std::io::Write;
 
 /// Verbosity is controlled with the `RUST_LOG` environment variable,
-/// e.g. `RUST_LOG=yumi_wini=debug`. Defaults to `info`.
+/// e.g. `RUST_LOG=wini=debug`. Defaults to `info`.
 pub fn init() {
     let level = std::env::var("RUST_LOG")
         .ok()
