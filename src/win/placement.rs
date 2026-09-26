@@ -226,6 +226,24 @@ unsafe extern "system" fn enum_bar(hwnd: HWND, lparam: LPARAM) -> BOOL {
 /// the target window's own message loop services the move — one busy
 /// app (e.g. a terminal under load) stalls the whole animation frame.
 pub fn apply_geometry(rects: &[TileRect]) {
+    apply_geometry_with(rects, SWP_ASYNCWINDOWPOS);
+}
+
+/// Synchronous variant for the FINAL frame of a slide settle: the
+/// hide of the non-active participants and the reflow that follow
+/// must not race a still-queued async move (a window could be hidden
+/// before its last move lands, then get repositioned while hidden
+/// and briefly re-shown at a stale rect by the reflow — the "flash
+/// of the previous workspace" bug). One blocking frame per slide is
+/// an acceptable price for the ordering guarantee.
+pub fn apply_geometry_sync(rects: &[TileRect]) {
+    apply_geometry_with(rects, windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS(0));
+}
+
+fn apply_geometry_with(
+    rects: &[TileRect],
+    extra: windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
+) {
     for r in rects {
         let hwnd = HWND(r.id as *mut core::ffi::c_void);
         if !super::api::is_alive(hwnd) {
@@ -239,7 +257,7 @@ pub fn apply_geometry(rects: &[TileRect]) {
                 r.y,
                 r.w,
                 r.h,
-                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | extra,
             )
         };
         if ok.is_err() {

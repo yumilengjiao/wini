@@ -2344,13 +2344,19 @@ impl AppState {
         // Build the slide record, then materialize one frame at the
         // camera's current value so windows jump to their
         // canvas-relative positions immediately (no one-frame flash
-        // of the new workspace's final tiles).
+        // of the new workspace's final tiles). This frame goes out
+        // SYNCHRONOUSLY: the participants are shown right after, and
+        // an async move would still be queued at that point — the
+        // entering windows would flash for one frame at their stale
+        // tiles (every workspace tiles into the same work area, so
+        // they would land exactly on top of the current windows)
+        // before the queued move pulled them off-screen.
         let slide = Slide {
             camera,
             finals,
             stride,
         };
-        placement::apply_geometry(&slide.rects_at(cam_from));
+        placement::apply_geometry_sync(&slide.rects_at(cam_from));
 
         // Show every participant; hide everything else on this
         // monitor's inactive workspaces. No `raise` anywhere: all
@@ -2655,7 +2661,14 @@ impl AppState {
             let rects = slide.rects_at(cam);
             let done = slide.finished();
             log::debug!("slide[{device}]: camera={cam:.3} done={done}");
-            placement::apply_geometry(&rects);
+            if done {
+                // The settle frame goes out SYNCHRONOUSLY: the hide
+                // of the non-active participants below must not race
+                // a still-queued async move (see apply_geometry_sync).
+                placement::apply_geometry_sync(&rects);
+            } else {
+                placement::apply_geometry(&rects);
+            }
             // The sliding windows cross the bar zone every frame;
             // keep bars (yasb/zebar/...) above them.
             placement::raise_bars(&self.monitors);
