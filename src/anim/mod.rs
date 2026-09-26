@@ -341,6 +341,12 @@ impl Val {
     pub fn target(&self) -> f64 {
         self.to
     }
+
+    /// The value the current flight started from (the value at the
+    /// last retarget).
+    pub fn from(&self) -> f64 {
+        self.from
+    }
 }
 
 /// A (x, y, w, h) rectangle whose components animate independently:

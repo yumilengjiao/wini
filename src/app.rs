@@ -184,6 +184,12 @@ struct Overview {
     zoom_target: f64,
     /// In-flight view scroll of one workspace (see [`ViewShift`]).
     view_shift: Option<ViewShift>,
+    /// `Some(from_progress)` when the camera and progress springs
+    /// were retargeted together with identical params (overview
+    /// close/toggle-close, niri's `activate_workspace_with_anim_config`).
+    /// Rendering then applies niri's `workspace_render_idx` correction
+    /// so the zoom+slide composite is monotonic.
+    sync_from_progress: Option<f64>,
 }
 
 impl Overview {
@@ -232,9 +238,36 @@ impl Overview {
         out
     }
 
+    /// Camera position for rendering. While a synchronized close is
+    /// in flight, apply niri's `workspace_render_idx` correction:
+    ///
+    /// ```text
+    /// render_idx = to + (cam - to) * (from_zoom / cur_zoom)
+    /// ```
+    ///
+    /// (substituted from niri's first_ws_y derivation; stride scales
+    /// linearly with zoom, so the height ratio is the zoom ratio).
+    /// Continuous at both ends — cam == to collapses it to `to`, and
+    /// cur_zoom glides through the progress spring's exact endpoint —
+    /// so it stays valid even when the distance-dependent spring
+    /// durations let the camera outlive the zoom.
+    fn render_cam(&self) -> f64 {
+        let cam = self.camera.value();
+        match self.sync_from_progress {
+            Some(from_progress) => {
+                let from_zoom =
+                    (1.0 - from_progress * (1.0 - self.zoom_target)).max(0.0001);
+                let cur_zoom = self.zoom();
+                let to = self.camera.target();
+                to + (cam - to) * (from_zoom / cur_zoom)
+            }
+            None => cam,
+        }
+    }
+
     /// Participant rects at the current animated zoom/camera.
     fn current_rects(&self) -> Vec<crate::layout::geometry::TileRect> {
-        self.rects_at(self.zoom(), self.camera.value())
+        self.rects_at(self.zoom(), self.render_cam())
     }
 
     /// Both springs at rest?
@@ -682,6 +715,7 @@ impl AppState {
             full,
             zoom_target,
             view_shift: None,
+            sync_from_progress: None,
         };
         // Backdrop host covering the full monitor. Every participant
         // becomes visible (windows of inactive workspaces are
@@ -750,34 +784,42 @@ impl AppState {
             return;
         };
         let anim = self.config.animations.overview_open_close_params();
-        let switch = self.config.animations.workspace_switch_params();
         if ov.opening() {
             ov.progress.retarget(0.0, anim);
-            // Close back into the active workspace.
+            // Close back into the active workspace. The camera must
+            // run with the SAME params as the zoom (niri passes the
+            // overview open/close config to activate_workspace) so
+            // both springs start and end together — otherwise the
+            // opaque backdrop lingers waiting for a longer camera
+            // slide after the zoom already finished.
             if let Some(active) = self
                 .layout
                 .monitor(device)
                 .map(|ml| ml.active_workspace_idx)
             {
-                ov.camera.retarget(active as f64, switch);
+                ov.camera.retarget(active as f64, anim);
+                ov.sync_from_progress = Some(ov.progress.from());
             }
         } else {
-            // Reopening mid-close: keep the camera wherever it is.
+            // Reopening mid-close: keep the camera wherever it is; the
+            // zoom/camera pair is no longer synchronized.
             ov.progress.retarget(1.0, anim);
+            ov.sync_from_progress = None;
         }
     }
 
     /// Close the overview, sliding the camera to `ws_idx` (None = the
-    /// active workspace). The zoom-in and the camera slide run as two
-    /// parallel springs (niri synchronizes them into one monotonic
-    /// motion via a correction term; the parallel version is close
-    /// enough and far simpler).
+    /// active workspace). The zoom-in and the camera slide run with
+    /// identical animation params (niri passes the overview open/close
+    /// config to activate_workspace_with_anim_config) so both springs
+    /// start and end together; the backdrop's `settled()` then fires
+    /// exactly when the motion stops instead of dead-waiting on a
+    /// longer camera slide.
     fn close_overview_to(&mut self, device: &str, ws_idx: Option<usize>) {
         let Some(ov) = self.overviews.get_mut(device) else {
             return;
         };
         let anim = self.config.animations.overview_open_close_params();
-        let switch = self.config.animations.workspace_switch_params();
         let target = ws_idx
             .or_else(|| {
                 self.layout
@@ -787,7 +829,8 @@ impl AppState {
             .map(|i| i as f64)
             .unwrap_or_else(|| ov.camera.target());
         ov.progress.retarget(0.0, anim);
-        ov.camera.retarget(target, switch);
+        ov.camera.retarget(target, anim);
+        ov.sync_from_progress = Some(ov.progress.from());
     }
 
     /// Scroll the overview camera one workspace up/down (niri's bare
@@ -810,6 +853,7 @@ impl AppState {
         if (to - cur).abs() > f64::EPSILON {
             let switch = self.config.animations.workspace_switch_params();
             ov.camera.retarget(to, switch);
+            ov.sync_from_progress = None;
         }
     }
 
@@ -828,6 +872,7 @@ impl AppState {
             .unwrap_or(0);
         let switch = self.config.animations.workspace_switch_params();
         ov.camera.retarget(idx.min(max) as f64, switch);
+        ov.sync_from_progress = None;
     }
 
     /// Move the overview's internal selection (the keyboard nav niri
@@ -2675,7 +2720,7 @@ impl AppState {
             }
             if !ov.settled() {
                 let zoom = ov.zoom();
-                let cam = ov.camera.value();
+                let cam = ov.render_cam();
                 log::debug!("overview[{device}]: zoom={zoom:.3} cam={cam:.2}");
                 let rects = ov.rects_at(zoom, cam);
                 if let Some(host) = self.overview_hosts.get_mut(&device) {
@@ -3064,6 +3109,7 @@ mod tests {
             full: (0.0, 0.0, 1000.0, 800.0),
             zoom_target: 0.35,
             view_shift: None,
+            sync_from_progress: None,
         }
     }
 
@@ -3126,5 +3172,52 @@ mod tests {
         assert_eq!(r2.y, 281 + 154); // (1 - 0.5) * 308
         // x does not depend on the camera.
         assert_eq!(r1.x, 360);
+    }
+
+    #[test]
+    fn overview_sync_correction_continuous_at_ends() {
+        // niri's workspace_render_idx correction:
+        //   render = to + (cam - to) * (from_zoom / cur_zoom).
+        // At the start (cam == from, zoom == from_zoom) it must equal
+        // `from`; at the end (cam == to) it must equal `to` —
+        // regardless of the zoom ratio.
+        // A 10s linear easing keeps values mid-flight for sampling.
+        let slow = || crate::anim::AnimParams {
+            kind: crate::anim::AnimKind::Easing {
+                duration: std::time::Duration::from_secs(10),
+                curve: crate::anim::Curve::Linear,
+            },
+            slowdown: 1.0,
+        };
+        let mut ov = overview();
+        // Close from progress 1: camera 0 -> 1 (ws 2 selected).
+        ov.camera = crate::anim::Val::to(0.0, slow());
+        ov.camera.retarget(1.0, slow());
+        ov.sync_from_progress = Some(1.0);
+
+        // Start: progress 1 -> zoom 0.35 == from_zoom, cam ~0.
+        let start = ov.render_cam();
+        assert!(start.abs() < 1e-3, "start == from: {start}");
+
+        // End: camera finished at 1.0 -> correction collapses to `to`.
+        ov.progress = crate::anim::Val::to(0.0, instant());
+        ov.camera = crate::anim::Val::to(1.0, instant());
+        let end = ov.render_cam();
+        assert!((end - 1.0).abs() < 1e-9, "end == to: {end}");
+
+        // Mid-flight with the zoom finished (progress 0 -> zoom 1):
+        // render = to + (cam - to) * from_zoom — the tail of the
+        // camera slide is compressed, never reversed or jumped.
+        ov.camera = crate::anim::Val::to(0.4, slow());
+        ov.camera.retarget(1.0, slow());
+        let cam_now = ov.camera.value();
+        let mid = ov.render_cam();
+        let expect = 1.0 + (cam_now - 1.0) * 0.35;
+        assert!((mid - expect).abs() < 1e-3, "mid: {mid} vs {expect}");
+        assert!(mid > cam_now && mid < 1.0, "monotonic-ish: {mid}");
+
+        // No sync: the raw camera value passes through.
+        ov.sync_from_progress = None;
+        assert!((ov.render_cam() - ov.camera.value()).abs() < 1e-3);
     }
 }
