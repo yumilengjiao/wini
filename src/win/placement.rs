@@ -10,7 +10,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, HWND_TOP, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE,
+    SW_SHOWNOACTIVATE,
     GWL_EXSTYLE, GWL_STYLE, WINDOW_LONG_PTR_INDEX, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
     WS_SYSMENU, WS_THICKFRAME, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
@@ -75,7 +76,12 @@ pub fn raise(hwnd: HWND) {
 /// rendered, exactly like niri).
 pub fn set_shown(hwnd: HWND, shown: bool) {
     unsafe {
-        let _ = ShowWindow(hwnd, if shown { SW_SHOW } else { SW_HIDE });
+        // SW_SHOWNOACTIVATE, not SW_SHOW: SW_SHOW ACTIVATES the
+        // window, and the newly-activated window raises itself above
+        // everything asynchronously (WM_ACTIVATE) — above an open
+        // overview's backdrop too, which we cannot reliably outrun.
+        // Activation is our job (sync_focus_to_os), not ShowWindow's.
+        let _ = ShowWindow(hwnd, if shown { SW_SHOWNOACTIVATE } else { SW_HIDE });
     }
 }
 
@@ -96,24 +102,42 @@ pub fn set_shown(hwnd: HWND, shown: bool) {
 // pointer, so results go through a module-level thread-local).
 thread_local! {
     static BARS_FOUND: std::cell::RefCell<Vec<HWND>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Cached bar list (see [`raise_bars`]): (when enumerated, bars).
+    /// Enumerating is cross-process (EnumWindows + GetWindowRect on
+    /// every window) and raise_bars runs EVERY ANIMATION FRAME while a
+    /// slide or overview animates — the per-call cost is a visible
+    /// frame hitch. Refresh at most once a second; invalidate on
+    /// display-topology changes.
+    static BARS_CACHE:
+        std::cell::RefCell<(Option<std::time::Instant>, Vec<HWND>)> =
+        const { std::cell::RefCell::new((None, Vec::new())) };
+}
+
+/// Drop the cached bar list (monitor topology changed / bars
+/// themselves restarted) so the next raise_bars re-enumerates.
+pub fn invalidate_bar_cache() {
+    BARS_CACHE.with(|c| *c.borrow_mut() = (None, Vec::new()));
 }
 
 pub fn raise_bars(monitors: &[crate::win::monitor::Monitor]) {
-    BARS_FOUND.with(|f| f.borrow_mut().clear());
-    // Pass a pointer to the (thin) reference to the slice: a plain
-    // `slice as *const _` would be a fat pointer and truncate under
-    // `as isize`.
-    let mons_ptr: *const &[crate::win::monitor::Monitor] = &monitors;
-    unsafe {
-        let _ = EnumWindows(Some(enum_bar), LPARAM(mons_ptr as isize));
-        let bars: Vec<HWND> = BARS_FOUND.with(|f| std::mem::take(&mut *f.borrow_mut()));
-        log::debug!("raise_bars: re-raising {} bar(s)", bars.len());
-        for bar in bars {
-            log::debug!(
-                "raise_bars: hwnd={:?} class={}",
-                bar,
-                crate::win::api::window_class(bar)
-            );
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(1000);
+    let bars: Vec<HWND> = BARS_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.0.is_some_and(|t| t.elapsed() < CACHE_TTL) && !cache.1.is_empty() {
+            return cache.1.clone();
+        }
+        let found = enumerate_bars(monitors);
+        *cache = (Some(std::time::Instant::now()), found.clone());
+        found
+    });
+    log::debug!("raise_bars: re-raising {} bar(s)", bars.len());
+    for bar in bars {
+        log::debug!(
+            "raise_bars: hwnd={:?} class={}",
+            bar,
+            crate::win::api::window_class(bar)
+        );
+        unsafe {
             match SetWindowPos(
                 bar,
                 Some(HWND_TOP),
@@ -128,6 +152,18 @@ pub fn raise_bars(monitors: &[crate::win::monitor::Monitor]) {
             }
         }
     }
+}
+
+fn enumerate_bars(monitors: &[crate::win::monitor::Monitor]) -> Vec<HWND> {
+    BARS_FOUND.with(|f| f.borrow_mut().clear());
+    // Pass a pointer to the (thin) reference to the slice: a plain
+    // `slice as *const _` would be a fat pointer and truncate under
+    // `as isize`.
+    let mons_ptr: *const &[crate::win::monitor::Monitor] = &monitors;
+    unsafe {
+        let _ = EnumWindows(Some(enum_bar), LPARAM(mons_ptr as isize));
+    }
+    BARS_FOUND.with(|f| std::mem::take(&mut *f.borrow_mut()))
 }
 
 /// `EnumWindows` callback for [`raise_bars`]: collects bar-like

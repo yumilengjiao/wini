@@ -291,6 +291,9 @@ pub struct Config {
     pub focus_follows_mouse: bool,
     pub layout: LayoutParams,
     pub focus_ring: FocusRingConfig,
+    /// `overview { zoom 0.5; }` — niri's overview section (we
+    /// implement `zoom`; the backdrop uses niri's default color).
+    pub overview: OverviewConfig,
     pub animations: AnimationsConfig,
     pub binds: Vec<Bind>,
     pub window_rules: Vec<WindowRule>,
@@ -305,6 +308,7 @@ impl Default for Config {
             focus_follows_mouse: false,
             layout: LayoutParams::default(),
             focus_ring: FocusRingConfig::default(),
+            overview: OverviewConfig::default(),
             animations: AnimationsConfig::default(),
             window_rules: Vec::new(),
             spawn_at_startup: Vec::new(),
@@ -369,8 +373,9 @@ impl Default for Config {
                 bind("Mod+V", Action::ToggleWindowFloating),
                 bind("Mod+Q", Action::CloseWindow),
                 bind("Mod+Shift+Slash", Action::ToggleOverview),
-                // Ctrl+O mirrors niri's overview toggle key (niri's
-                // default bind is Mod+Shift+Slash above).
+                // Mod+O is the primary overview toggle (Ctrl+O kept as an
+                // extra alias; niri's own default is Mod+Shift+Slash above).
+                bind("Mod+O", Action::ToggleOverview),
                 bind("Ctrl+O", Action::ToggleOverview),
                 bind("Mod+Shift+E", Action::Quit),
             ],
@@ -473,6 +478,7 @@ pub fn parse(source: &str) -> Result<Config, String> {
                 parse_binds(node, &mut config);
             }
             "window-rule" => parse_window_rule(node, &mut config),
+            "overview" => parse_overview(node, &mut config),
             "spawn-at-startup" => {
                 if let Some(cmd) = first_string_arg(node) {
                     config.spawn_at_startup.push(cmd);
@@ -578,6 +584,35 @@ fn parse_width_node(n: &KdlNode) -> ColumnWidth {
         }
     }
     ColumnWidth::Proportion(0.25)
+}
+
+/// `overview { zoom 0.5; }` — niri's overview section (zoom only;
+/// the backdrop uses niri's default color for now).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverviewConfig {
+    /// Scale of a workspace at fully-open overview (niri default
+    /// 0.5, clamped to 0.75 like niri).
+    pub zoom: f64,
+}
+
+impl Default for OverviewConfig {
+    fn default() -> Self {
+        OverviewConfig { zoom: 0.5 }
+    }
+}
+
+/// `overview { zoom 0.4; }`
+fn parse_overview(node: &KdlNode, config: &mut Config) {
+    if let Some(doc) = node.children() {
+        for c in doc.nodes() {
+            if c.name().value() == "zoom"
+                && let Some(v) = first_float_arg(c)
+            {
+                // Niri clamps the configured zoom to (0.0001, 0.75).
+                config.overview.zoom = v.clamp(0.0001, 0.75);
+            }
+        }
+    }
 }
 
 /// `window-rule { match app-id="firefox" title="download"; open-floating true; }`
@@ -1404,9 +1439,8 @@ mod tests {
     fn example_config_parses() {
         // The shipped example must stay valid against the real parser.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.kdl");
-        let Ok(src) = std::fs::read_to_string(&path) else {
-            panic!("missing config.example.kdl next to Cargo.toml");
-        };
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {} failed: {e}", path.display()));
         let cfg = parse(&src).expect("config.example.kdl must parse");
         assert!(!cfg.binds.is_empty());
         assert_eq!(cfg.window_rules.len(), 2);

@@ -87,6 +87,12 @@ window-rule {
     open-maximized
 }
 
+// Overview (Mod+O): workspace scale when fully zoomed out. Niri
+// default 0.5, clamped to 0.75.
+overview {
+    zoom 0.5
+}
+
 // Startup commands, in order.
 spawn-at-startup "alacritty"
 
@@ -125,8 +131,9 @@ binds {
     Mod+V       { toggle-window-floating; }
     Mod+Q       { close-window; }
     Mod+Shift+Slash { toggle-overview; }
-    // Ctrl+O also toggles the overview (added to the defaults).
-    // Ctrl+O     { toggle-overview; }
+    // Mod+O (and its alias Ctrl+O) also toggle the overview.
+    // Mod+O     { toggle-overview; }
+    // Ctrl+O    { toggle-overview; }
     Mod+P       { do-screen-transition; }
 
     Mod+Shift+E { quit; }

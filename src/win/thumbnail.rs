@@ -1,0 +1,341 @@
+//! Overview host window: an opaque backdrop covering one monitor,
+//! carrying DWM live thumbnails of the (unmoved) real windows.
+//!
+//! The real windows keep their settled tile rects the whole time and
+//! sit *behind* the backdrop — the overview only renders scaled DWM
+//! thumbnails of them. This avoids the three fatal problems of
+//! resizing real windows: apps have minimum sizes (overlap), apps
+//! reflow their content at every intermediate size (flicker), and
+//! real-window geometry churn races the layout.
+//!
+//! - Backdrop: a plain `WS_POPUP` window painted with the configured
+//!   backdrop color (niri: `overview.backdrop-color`),
+//!   `WS_EX_NOACTIVATE` + `WS_EX_TOOLWINDOW` so clicking it never
+//!   steals keyboard focus from the focused window behind it.
+//! - Thumbnails: `DwmRegisterThumbnail` per participant, destination
+//!   rects updated every animation frame (DWM composites them; no
+//!   per-frame app work).
+//! - Input: clicks land on the host (thumbnails are DWM-drawn, not
+//!   hit-testable); `WM_LBUTTONDOWN`/`WM_RBUTTONDOWN` are forwarded to
+//!   a handler set by the app, which hit-tests the click against the
+//!   current thumbnail rects.
+//! - Z order: the host lives in the normal band, re-raised above the
+//!   real windows (which raise themselves on focus changes) but below
+//!   the desktop bars (`raise_bars` runs after every host raise) and
+//!   below our topmost focus ring.
+
+use windows::core::w;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
+    DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+    DWM_THUMBNAIL_PROPERTIES,
+};
+use windows::Win32::Graphics::Gdi::{CreateSolidBrush, HBRUSH};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, GetWindow, GetWindowLongPtrW,
+    GetWindowThreadProcessId, GWL_EXSTYLE, GW_HWNDPREV, RegisterClassW, SetWindowPos, ShowWindow,
+    HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOOWNERZORDER, SW_SHOWNOACTIVATE,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WM_LBUTTONDOWN, WM_RBUTTONDOWN, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+};
+
+use crate::layout::geometry::TileRect;
+
+/// Niri's default overview backdrop color (0.15, 0.15, 0.15).
+const DEFAULT_BACKDROP: u32 = 0x0026_2626; // 0x00BBGGRR
+
+/// Current backdrop color, reached from wnd_proc (main thread only).
+struct BackdropCell(std::cell::UnsafeCell<u32>);
+unsafe impl Sync for BackdropCell {}
+static BACKDROP: BackdropCell = BackdropCell(std::cell::UnsafeCell::new(DEFAULT_BACKDROP));
+
+/// Click handler: (host hwnd address, client x, client y) — set once
+/// by the app at startup, invoked on the main thread.
+type ClickHandler = Box<dyn Fn(isize, i32, i32)>;
+struct ClickCell(std::cell::UnsafeCell<Option<ClickHandler>>);
+unsafe impl Sync for ClickCell {}
+static CLICK_HANDLER: ClickCell = ClickCell(std::cell::UnsafeCell::new(None));
+
+/// Register the click handler invoked when the user clicks anywhere
+/// on an overview backdrop (thumbnails included — they are DWM-drawn
+/// and not separately hit-testable).
+pub fn set_click_handler(handler: impl Fn(isize, i32, i32) + 'static) {
+    // Safety: main thread only; wnd_proc runs during message
+    // dispatch on the same thread.
+    unsafe {
+        *CLICK_HANDLER.0.get() = Some(Box::new(handler));
+    }
+}
+
+/// Set the backdrop color (0x00BBGGRR COLORREF).
+pub fn set_backdrop_color(color: u32) {
+    // Safety: main thread only.
+    unsafe {
+        *BACKDROP.0.get() = color;
+    }
+}
+
+/// One monitor's overview: backdrop window + thumbnail set.
+pub struct OverviewHost {
+    hwnd: HWND,
+    /// Thumbnails by source window id (the DWM thumbnail handle
+    /// is an `isize` in windows-rs). Dead/deregistered entries are
+    /// pruned by `sync_sources`.
+    thumbs: Vec<(isize, isize)>,
+    /// Host window origin in screen coords (thumbnail destination
+    /// rects are client-relative).
+    origin: (i32, i32),
+}
+
+impl OverviewHost {
+    /// Create the backdrop window covering `full` (left, top, right,
+    /// bottom in screen px), shown immediately.
+    pub fn new(full: (i32, i32, i32, i32)) -> Option<Self> {
+        let class_name = w!("yumi_wini_ov_host");
+        let (l, t, r, b) = full;
+        unsafe {
+            let hinstance = GetModuleHandleW(None).ok()?;
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(wnd_proc),
+                hInstance: hinstance.into(),
+                lpszClassName: class_name,
+                // Solid backdrop: the class brush paints it without
+                // WM_PAINT flicker.
+                hbrBackground: backdrop_brush(),
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+
+            // No WS_EX_TOPMOST (the focus ring must stay above) and
+            // no WS_EX_TRANSPARENT (we need the clicks).
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0),
+                class_name,
+                w!(""),
+                WINDOW_STYLE(WS_POPUP.0),
+                l,
+                t,
+                r - l,
+                b - t,
+                None,
+                None,
+                Some(hinstance.into()),
+                None,
+            )
+            .ok()?;
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            Some(OverviewHost {
+                hwnd,
+                thumbs: Vec::new(),
+                origin: (l, t),
+            })
+        }
+    }
+
+    pub fn hwnd_addr(&self) -> isize {
+        self.hwnd.0 as isize
+    }
+
+    /// The window directly ABOVE the backdrop in z order (None when
+    /// the backdrop tops its band). Diagnostic: with the backdrop
+    /// freshly raised, a MANAGED window here is exactly the
+    /// "real window covers the overview" bug — the app logs it.
+    pub fn window_above(&self) -> Option<isize> {
+        unsafe {
+            let above = GetWindow(self.hwnd, GW_HWNDPREV).ok()?;
+            (above.0 as isize != 0).then_some(above.0 as isize)
+        }
+    }
+
+    // (window_above used by the app's raise diagnostic)
+
+    /// Bring the backdrop above the real windows (they raise
+    /// themselves on focus changes; the bars are re-raised after this
+    /// by the caller, and the ring is topmost).
+    ///
+    /// Windows' FOREGROUND Z-ORDER PROTECTION silently denies this
+    /// raise whenever the foreground window is one of the non-topmost
+    /// windows below us — the usual case, since the focused
+    /// participant IS the OS foreground: SetWindowPos returns success
+    /// but the z order doesn't change (verified live). So the fast
+    /// path first checks whether the order is already correct (zero
+    /// cost when it is), then verifies the plain raise actually took
+    /// effect (only TOPMOST windows may sit above a raised host),
+    /// and as a last resort retries attached to the foreground
+    /// thread (AttachThreadInput lifts the restriction — the same
+    /// technique as `force_set_foreground`).
+    pub fn raise(&self) {
+        unsafe {
+            if z_order_ok(self.hwnd) {
+                return;
+            }
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            );
+            if z_order_ok(self.hwnd) {
+                return;
+            }
+            let fg = GetForegroundWindow();
+            let fg_thread = if fg.0.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(fg, None)
+            };
+            let me = GetCurrentThreadId();
+            if fg_thread != 0 && fg_thread != me {
+                let _ = AttachThreadInput(me, fg_thread, true);
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                );
+                let _ = AttachThreadInput(me, fg_thread, false);
+            }
+        }
+    }
+
+    /// Reconcile the thumbnail set with `sources`: register missing
+    /// (alive) windows, drop dead/deregistered ones. Call whenever
+    /// the participant set may have changed (every reflow).
+    pub fn sync_sources(&mut self, sources: &[isize]) {
+        self.thumbs
+            .retain(|(id, thumb)| {
+                if sources.contains(id) {
+                    true
+                } else {
+                    // Safety: thumbnail handle is valid (we own it).
+                    unsafe { let _ = DwmUnregisterThumbnail(*thumb); }
+                    false
+                }
+            });
+        for &id in sources {
+            if self.thumbs.iter().any(|(i, _)| *i == id) {
+                continue;
+            }
+            let hwnd = HWND(id as *mut core::ffi::c_void);
+            if !crate::win::api::is_alive(hwnd) {
+                continue;
+            }
+            // Safety: both HWNDs are valid; the host belongs to this
+            // thread.
+            match unsafe { DwmRegisterThumbnail(self.hwnd, hwnd) } {
+                Ok(thumb) => self.thumbs.push((id, thumb)),
+                Err(e) => log::warn!("overview: thumbnail for window {id} failed: {e}"),
+            }
+        }
+    }
+
+    /// Push one frame of destination rects (screen coords; converted
+    /// to the host's client space here). Each rect is inset by a
+    /// couple of pixels so neighboring thumbnails don't visually
+    /// touch — with typical `layout { gaps 1..4 }` the scaled gap is
+    /// sub-pixel and the overview would look like one solid mosaic.
+    pub fn update_rects(&mut self, rects: &[TileRect]) {
+        const INSET: i32 = 2;
+        for r in rects {
+            let Some((_, thumb)) = self.thumbs.iter().find(|(id, _)| *id == r.id) else {
+                continue;
+            };
+            let (dx, dy, dw, dh) = if r.w > 2 * INSET && r.h > 2 * INSET {
+                (r.x + INSET, r.y + INSET, r.w - 2 * INSET, r.h - 2 * INSET)
+            } else {
+                (r.x, r.y, r.w, r.h)
+            };
+            let props = DWM_THUMBNAIL_PROPERTIES {
+                dwFlags: DWM_TNP_RECTDESTINATION
+                    | DWM_TNP_OPACITY
+                    | DWM_TNP_VISIBLE
+                    | DWM_TNP_SOURCECLIENTAREAONLY,
+                rcDestination: RECT {
+                    left: dx - self.origin.0,
+                    top: dy - self.origin.1,
+                    right: dx - self.origin.0 + dw,
+                    bottom: dy - self.origin.1 + dh,
+                },
+                opacity: 255,
+                fVisible: windows::core::BOOL(1),
+                fSourceClientAreaOnly: windows::core::BOOL(0),
+                ..Default::default()
+            };
+            // Safety: thumbnail handle is valid (we own it).
+            unsafe {
+                let _ = DwmUpdateThumbnailProperties(*thumb, &props);
+            }
+        }
+    }
+}
+
+/// Is `hwnd` correctly placed — i.e. nothing sits above it that
+/// shouldn't? Allowed above: TOPMOST windows (focus ring, tray)
+/// and bar-like windows (`WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` —
+/// yasb/zebar's recipe; raise_bars legitimately puts them above the
+/// backdrop). Anything else above — a managed real window — means
+/// the raise was (or would be) denied by the foreground z-order
+/// protection, or something raised itself above us since.
+unsafe fn z_order_ok(hwnd: HWND) -> bool {
+    unsafe {
+        let above = match GetWindow(hwnd, GW_HWNDPREV) {
+            Ok(h) => h,
+            Err(_) => return true, // nothing above
+        };
+        if above.0.is_null() {
+            return true;
+        }
+        let ex = GetWindowLongPtrW(above, GWL_EXSTYLE) as u32;
+        ex & WS_EX_TOPMOST.0 != 0
+            || ex & (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0)
+                == (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0)
+    }
+}
+
+impl Drop for OverviewHost {
+    fn drop(&mut self) {
+        for (_, thumb) in self.thumbs.drain(..) {
+            // Safety: handle owned by us, main thread.
+            unsafe { let _ = DwmUnregisterThumbnail(thumb); }
+        }
+        // Safety: window created by this thread.
+        unsafe { let _ = DestroyWindow(self.hwnd); }
+    }
+}
+
+/// Backdrop brush for the window class (leaked: one per process).
+fn backdrop_brush() -> HBRUSH {
+    unsafe {
+        // Safety: reads the color set at startup (before any window
+        // exists); no mutation afterwards.
+        let color = *BACKDROP.0.get();
+        CreateSolidBrush(windows::Win32::Foundation::COLORREF(color))
+    }
+}
+
+extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN {
+        // Safety: reads the handler on the same (main) thread that
+        // set it, during message dispatch.
+        unsafe {
+            if let Some(handler) = &*CLICK_HANDLER.0.get() {
+                let x = (lparam.0 & 0xFFFF) as u16 as i32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i32;
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler(hwnd.0 as isize, x, y)
+                }));
+            }
+        }
+        return LRESULT(0);
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
