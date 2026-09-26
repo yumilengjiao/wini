@@ -776,7 +776,7 @@ impl AppState {
     }
 
     /// Toggle the overview on one monitor: open when closed, close
-    /// when open (Ctrl+O twice mid-animation reverses smoothly — the
+    /// when open (toggling twice mid-animation reverses smoothly — the
     /// progress spring carries its velocity).
     fn toggle_overview(&mut self, device: &str) {
         let Some(ov) = self.overviews.get_mut(device) else {

@@ -131,9 +131,8 @@ binds {
     Mod+V       { toggle-window-floating; }
     Mod+Q       { close-window; }
     Mod+Shift+Slash { toggle-overview; }
-    // Mod+O (and its alias Ctrl+O) also toggle the overview.
+    // Mod+O also toggles the overview.
     // Mod+O     { toggle-overview; }
-    // Ctrl+O    { toggle-overview; }
     Mod+P       { do-screen-transition; }
 
     Mod+Shift+E { quit; }

@@ -373,10 +373,10 @@ impl Default for Config {
                 bind("Mod+V", Action::ToggleWindowFloating),
                 bind("Mod+Q", Action::CloseWindow),
                 bind("Mod+Shift+Slash", Action::ToggleOverview),
-                // Mod+O is the primary overview toggle (Ctrl+O kept as an
-                // extra alias; niri's own default is Mod+Shift+Slash above).
+                // Mod+O is an extra overview alias (niri's own default
+                // is Mod+Shift+Slash above). No Ctrl+O: it clashes
+                // with apps' "open file" shortcut.
                 bind("Mod+O", Action::ToggleOverview),
-                bind("Ctrl+O", Action::ToggleOverview),
                 bind("Mod+Shift+E", Action::Quit),
             ],
         }
