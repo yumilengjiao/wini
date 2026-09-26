@@ -1,15 +1,22 @@
-//! Overview host window: an opaque backdrop covering one monitor,
+//! Overview host window: a transparent backdrop covering one monitor,
 //! carrying DWM live thumbnails of the (unmoved) real windows.
 //!
-//! The real windows keep their settled tile rects the whole time and
-//! sit *behind* the backdrop — the overview only renders scaled DWM
-//! thumbnails of them. This avoids the three fatal problems of
-//! resizing real windows: apps have minimum sizes (overlap), apps
-//! reflow their content at every intermediate size (flicker), and
-//! real-window geometry churn races the layout.
+//! The real windows keep their settled tile sizes and park one
+//! virtual-screen width to the right (off every monitor) while the
+//! overview is open — the transparent backdrop shows the bare
+//! desktop between the scaled DWM thumbnails of them. (Cross-process
+//! DWMWA_CLOAK is access-denied and SW_HIDE blanks the thumbnails;
+//! parking off-screen is the only approach that keeps live
+//! thumbnails AND clears the real windows from the desktop.) This
+//! avoids the three fatal problems of resizing real windows: apps
+//! have minimum sizes (overlap), apps reflow their content at every
+//! intermediate size (flicker), and real-window geometry churn races
+//! the layout.
 //!
-//! - Backdrop: a plain `WS_POPUP` window painted with the configured
-//!   backdrop color (niri: `overview.backdrop-color`),
+//! - Backdrop: a `WS_POPUP` + `WS_EX_LAYERED` window painted with a
+//!   transparency color key (`SetLayeredWindowAttributes`,
+//!   `LWA_COLORKEY`) so the desktop wallpaper shows through; only the
+//!   DWM thumbnails (opaque window content) are visible.
 //!   `WS_EX_NOACTIVATE` + `WS_EX_TOOLWINDOW` so clicking it never
 //!   steals keyboard focus from the focused window behind it.
 //! - Thumbnails: `DwmRegisterThumbnail` per participant, destination
@@ -18,7 +25,9 @@
 //! - Input: clicks land on the host (thumbnails are DWM-drawn, not
 //!   hit-testable); `WM_LBUTTONDOWN`/`WM_RBUTTONDOWN` are forwarded to
 //!   a handler set by the app, which hit-tests the click against the
-//!   current thumbnail rects.
+//!   current thumbnail rects. (Colorkey-transparent pixels pass
+//!   clicks through to the desktop — harmless: the real windows
+//!   below are cloaked and not hit-testable.)
 //! - Z order: the host lives in the normal band, re-raised above the
 //!   real windows (which raise themselves on focus changes) but below
 //!   the desktop bars (`raise_bars` runs after every host raise) and
@@ -36,21 +45,20 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, GetWindow, GetWindowLongPtrW,
-    GetWindowThreadProcessId, GWL_EXSTYLE, GW_HWNDPREV, RegisterClassW, SetWindowPos, ShowWindow,
-    HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOOWNERZORDER, SW_SHOWNOACTIVATE,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WM_LBUTTONDOWN, WM_RBUTTONDOWN, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GetWindowThreadProcessId, GWL_EXSTYLE, GW_HWNDPREV, LWA_COLORKEY, RegisterClassW,
+    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOOWNERZORDER, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+    WM_LBUTTONDOWN, WM_RBUTTONDOWN, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::layout::geometry::TileRect;
 
-/// Niri's default overview backdrop color (0.15, 0.15, 0.15).
-const DEFAULT_BACKDROP: u32 = 0x0026_2626; // 0x00BBGGRR
-
-/// Current backdrop color, reached from wnd_proc (main thread only).
-struct BackdropCell(std::cell::UnsafeCell<u32>);
-unsafe impl Sync for BackdropCell {}
-static BACKDROP: BackdropCell = BackdropCell(std::cell::UnsafeCell::new(DEFAULT_BACKDROP));
+/// Transparency color key of the backdrop (COLORREF 0x00BBGGRR).
+/// Magenta: symmetric in RGB/BGR and essentially never present in
+/// real window content — every pixel painted in it composites fully
+/// transparent, so the desktop shows through around the thumbnails.
+const COLORKEY: u32 = 0x00FF_00FF;
 
 /// Click handler: (host hwnd address, client x, client y) — set once
 /// by the app at startup, invoked on the main thread.
@@ -67,14 +75,6 @@ pub fn set_click_handler(handler: impl Fn(isize, i32, i32) + 'static) {
     // dispatch on the same thread.
     unsafe {
         *CLICK_HANDLER.0.get() = Some(Box::new(handler));
-    }
-}
-
-/// Set the backdrop color (0x00BBGGRR COLORREF).
-pub fn set_backdrop_color(color: u32) {
-    // Safety: main thread only.
-    unsafe {
-        *BACKDROP.0.get() = color;
     }
 }
 
@@ -109,10 +109,15 @@ impl OverviewHost {
             };
             let _ = RegisterClassW(&wc);
 
-            // No WS_EX_TOPMOST (the focus ring must stay above) and
-            // no WS_EX_TRANSPARENT (we need the clicks).
+            // WS_EX_LAYERED + LWA_COLORKEY: the colorkey-painted
+            // client area composites fully transparent (desktop
+            // visible), the DWM thumbnails stay opaque. No
+            // WS_EX_TOPMOST (the focus ring must stay above) and no
+            // WS_EX_TRANSPARENT (we need the clicks).
             let hwnd = CreateWindowExW(
-                WINDOW_EX_STYLE(WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0),
+                WINDOW_EX_STYLE(
+                    WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0 | WS_EX_LAYERED.0,
+                ),
                 class_name,
                 w!(""),
                 WINDOW_STYLE(WS_POPUP.0),
@@ -126,6 +131,12 @@ impl OverviewHost {
                 None,
             )
             .ok()?;
+            let _ = SetLayeredWindowAttributes(
+                hwnd,
+                windows::Win32::Foundation::COLORREF(COLORKEY),
+                0,
+                LWA_COLORKEY,
+            );
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             Some(OverviewHost {
                 hwnd,
@@ -239,18 +250,19 @@ impl OverviewHost {
     }
 
     /// Push one frame of destination rects (screen coords; converted
-    /// to the host's client space here). Each rect is inset by a
-    /// couple of pixels so neighboring thumbnails don't visually
-    /// touch — with typical `layout { gaps 1..4 }` the scaled gap is
+    /// to the host's client space here). Each rect is inset by
+    /// `inset` pixels so neighboring thumbnails don't visually touch
+    /// — with typical `layout { gaps 1..4 }` the scaled gap is
     /// sub-pixel and the overview would look like one solid mosaic.
-    pub fn update_rects(&mut self, rects: &[TileRect]) {
-        const INSET: i32 = 2;
+    /// The caller converges the inset to 0 as the zoom approaches 1
+    /// so the close handover to the real windows is pixel-exact.
+    pub fn update_rects(&mut self, rects: &[TileRect], inset: i32) {
         for r in rects {
             let Some((_, thumb)) = self.thumbs.iter().find(|(id, _)| *id == r.id) else {
                 continue;
             };
-            let (dx, dy, dw, dh) = if r.w > 2 * INSET && r.h > 2 * INSET {
-                (r.x + INSET, r.y + INSET, r.w - 2 * INSET, r.h - 2 * INSET)
+            let (dx, dy, dw, dh) = if r.w > 2 * inset && r.h > 2 * inset {
+                (r.x + inset, r.y + inset, r.w - 2 * inset, r.h - 2 * inset)
             } else {
                 (r.x, r.y, r.w, r.h)
             };
@@ -313,13 +325,10 @@ impl Drop for OverviewHost {
 }
 
 /// Backdrop brush for the window class (leaked: one per process).
+/// Paints the transparency color key: with `LWA_COLORKEY` every such
+/// pixel composites fully transparent.
 fn backdrop_brush() -> HBRUSH {
-    unsafe {
-        // Safety: reads the color set at startup (before any window
-        // exists); no mutation afterwards.
-        let color = *BACKDROP.0.get();
-        CreateSolidBrush(windows::Win32::Foundation::COLORREF(color))
-    }
+    unsafe { CreateSolidBrush(windows::Win32::Foundation::COLORREF(COLORKEY)) }
 }
 
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {

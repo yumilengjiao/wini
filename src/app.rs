@@ -159,14 +159,15 @@ struct ViewShift {
 /// `dy = (k - camera) * stride`, stride = scaled full height + a 10%
 /// gap — `workspace_size_with_gap`).
 ///
-/// These rects are THUMBNAIL rects, not real-window rects: the real
-/// windows never move while the overview is open — they keep their
-/// settled tiles behind an opaque backdrop window (see
-/// `win::thumbnail`), and DWM live thumbnails of them are drawn at
-/// the scaled rects. This sidesteps app minimum sizes (real windows
-/// refused to shrink → overlaps), per-frame app reflow (flicker) and
-/// the close handover (the backdrop drops away revealing windows
-/// already exactly in place).
+/// These rects are THUMBNAIL rects, not real-window rects: while the
+/// overview is open the real windows keep their settled tile sizes
+/// but park one virtual-screen width to the right (off every monitor),
+/// so the transparent backdrop (see `win::thumbnail`) shows the bare
+/// desktop between the DWM live thumbnails drawn at the scaled rects.
+/// This sidesteps app minimum sizes (real windows refused to shrink
+/// → overlaps), per-frame app reflow (flicker), and the close
+/// handover (windows return to their tiles — exactly where the zoom-1
+/// thumbnails ended — before the backdrop drops).
 #[derive(Debug, Clone)]
 struct Overview {
     /// Open/close progress (0 = closed, 1 = fully open).
@@ -190,6 +191,13 @@ struct Overview {
     /// Rendering then applies niri's `workspace_render_idx` correction
     /// so the zoom+slide composite is monotonic.
     sync_from_progress: Option<f64>,
+    /// Horizontal shift applied to the real participant windows while
+    /// the overview is open: they park right of the whole virtual
+    /// screen (covers the leftmost settled tile, whose x can be very
+    /// negative) so the transparent backdrop shows the bare desktop
+    /// between the thumbnails. DWM thumbnails keep rendering
+    /// off-screen windows. 0 in tests (no shifting).
+    offscreen_shift: i32,
 }
 
 impl Overview {
@@ -265,6 +273,15 @@ impl Overview {
         }
     }
 
+    /// Thumbnail gap inset for this frame: 2px fully zoomed out,
+    /// converging to 0 as the zoom reaches 1 so the close handover
+    /// to the real windows is pixel-exact (no seam around the last
+    /// frames).
+    fn thumb_inset(&self) -> i32 {
+        let t = ((1.0 - self.zoom()) / (1.0 - self.zoom_target)).clamp(0.0, 1.0);
+        (t * 2.0).round() as i32
+    }
+
     /// Participant rects at the current animated zoom/camera.
     fn current_rects(&self) -> Vec<crate::layout::geometry::TileRect> {
         self.rects_at(self.zoom(), self.render_cam())
@@ -276,6 +293,31 @@ impl Overview {
             && self.camera.finished()
             && self.view_shift.as_ref().is_none_or(|s| s.offset.finished())
     }
+
+    /// The participant rects shifted off-screen (where the real
+    /// windows park while the overview is open).
+    fn shifted(&self, rects: &[crate::layout::geometry::TileRect]) -> Vec<crate::layout::geometry::TileRect> {
+        rects
+            .iter()
+            .map(|r| crate::layout::geometry::TileRect {
+                id: r.id,
+                x: r.x + self.offscreen_shift,
+                y: r.y,
+                w: r.w,
+                h: r.h,
+            })
+            .collect()
+    }
+}
+
+/// Leftmost settled x across all participant rects (tiles sit at
+/// very negative x when the view is scrolled right).
+fn ov_min_x(finals: &[(usize, Vec<geometry::TileRect>)]) -> i32 {
+    finals
+        .iter()
+        .flat_map(|(_, rs)| rs.iter().map(|r| r.x))
+        .min()
+        .unwrap_or(0)
 }
 
 /// Current view position (column-space x at the content-area's left
@@ -708,6 +750,18 @@ impl AppState {
 
         // Niri clamps the configured zoom to a sane range.
         let zoom_target = self.config.overview.zoom.clamp(0.0001, 0.75);
+        // Participants park right of the whole virtual screen for the
+        // duration of the overview. The settled tiles can sit at very
+        // negative x (columns scrolled off the left edge), so the
+        // shift must cover the leftmost tile as well:
+        //   parked_x = settled_x + shift >= virtual_right + 256.
+        let min_x = ov_min_x(&finals);
+        let offscreen_shift = unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            };
+            GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        } + 256 - min_x;
         let ov = Overview {
             progress,
             camera,
@@ -716,6 +770,7 @@ impl AppState {
             zoom_target,
             view_shift: None,
             sync_from_progress: None,
+            offscreen_shift,
         };
         // Backdrop host covering the full monitor. Every participant
         // becomes visible (windows of inactive workspaces are
@@ -745,8 +800,18 @@ impl AppState {
             .flat_map(|(_, rs)| rs.iter().map(|r| r.id))
             .collect();
         host.sync_sources(&sources);
-        host.update_rects(&ov.current_rects());
+        host.update_rects(&ov.current_rects(), ov.thumb_inset());
         host.raise();
+        // Only NOW move the real windows off-screen: the first
+        // thumbnail frame (zoom ~1) covers their tiles exactly, so
+        // the swap from real window to thumbnail is seamless.
+        // Synchronous, so nothing is drawn half-shifted.
+        let parked: Vec<crate::layout::geometry::TileRect> = ov
+            .finals
+            .iter()
+            .flat_map(|(_, rs)| rs.iter().cloned())
+            .collect();
+        placement::apply_geometry_sync(&ov.shifted(&parked));
         // Floats would sit full-size over the backdrop; hide them for
         // the duration (reflow brings them back once the overview
         // state is gone).
@@ -1114,8 +1179,8 @@ impl AppState {
             return;
         };
         ov.finals = finals;
-        // Real windows: settled tiles, instantly, behind the
-        // backdrop. Cancel any in-flight springs for them first so a
+        // Real windows: parked off-screen at their (shifted) settled
+        // tiles. Cancel any in-flight springs for them first so a
         // stale animated rect can't land on top of this placement.
         let settled: Vec<geometry::TileRect> = ov
             .finals
@@ -1130,13 +1195,13 @@ impl AppState {
             }
             self.animator.remove(r.id);
         }
-        placement::apply_geometry(&settled);
+        placement::apply_geometry(&ov.shifted(&settled));
         // Thumbnails: reconcile the source set, then one frame at
         // the current zoom/camera.
         let sources: Vec<isize> = settled.iter().map(|r| r.id).collect();
         if let Some(host) = self.overview_hosts.get_mut(device) {
             host.sync_sources(&sources);
-            host.update_rects(&ov.current_rects());
+            host.update_rects(&ov.current_rects(), ov.thumb_inset());
             host.raise();
         }
         placement::raise_bars(&self.monitors);
@@ -1211,11 +1276,10 @@ impl AppState {
             log::debug!("slide[{device}]: snapped to endpoint on suspend (camera={cam:.3})");
         }
         // Open overviews drop their backdrops/thumbnails (the screen
-        // is covered for the transition anyway) and hide the
-        // participants of non-active workspaces they had shown for
-        // the thumbnails. No geometry is applied: the real windows
-        // have been at their settled tiles the whole time.
-        // `resume_management`'s reflow re-applies everything.
+        // is covered for the transition anyway), park the active
+        // workspace's participants back at their settled tiles
+        // (synchronously) and hide the rest. `resume_management`'s
+        // reflow re-applies everything.
         let overviews = std::mem::take(&mut self.overviews);
         self.overview_hosts.clear();
         for (device, ov) in overviews {
@@ -1223,8 +1287,10 @@ impl AppState {
                 .layout
                 .monitor(&device)
                 .map(|ml| ml.active_workspace_idx);
+            let mut back: Vec<crate::layout::geometry::TileRect> = Vec::new();
             for (k, rs) in &ov.finals {
                 if Some(*k) == active_idx {
+                    back.extend(rs.iter().cloned());
                     continue;
                 }
                 for r in rs {
@@ -1236,6 +1302,7 @@ impl AppState {
                     }
                 }
             }
+            placement::apply_geometry_sync(&back);
             log::debug!("overview[{device}]: snapped closed on suspend");
         }
         if let Some(fb) = self.focus_border.as_ref() {
@@ -1894,10 +1961,19 @@ impl AppState {
             self.layout.add_monitor(&m.device);
         }
         // Overviews reference monitor geometry that just changed;
-        // drop them (their backdrops go with them; the reflow below
-        // re-applies normal tiling).
-        self.overviews.clear();
+        // drop them: park every participant back at its settled tile
+        // (the reflow below re-applies normal tiling, incl. hiding
+        // the non-active workspaces).
+        let dropped = std::mem::take(&mut self.overviews);
         self.overview_hosts.clear();
+        for (_, ov) in dropped {
+            let all: Vec<crate::layout::geometry::TileRect> = ov
+                .finals
+                .iter()
+                .flat_map(|(_, rs)| rs.iter().cloned())
+                .collect();
+            placement::apply_geometry_sync(&all);
+        }
         self.monitors = new_monitors;
         self.reflow();
     }
@@ -2737,7 +2813,7 @@ impl AppState {
                 log::debug!("overview[{device}]: zoom={zoom:.3} cam={cam:.2}");
                 let rects = ov.rects_at(zoom, cam);
                 if let Some(host) = self.overview_hosts.get_mut(&device) {
-                    host.update_rects(&rects);
+                    host.update_rects(&rects, ov.thumb_inset());
                 }
                 // The focused window may have raised itself above the
                 // backdrop (focus changes while the overview is
@@ -2764,15 +2840,20 @@ impl AppState {
             }
             let ov = self.overviews.remove(&device).expect("checked above");
             log::debug!("overview[{device}]: closed");
-            // Hide the non-active participants BEFORE dropping the
-            // backdrop, so the reveal shows only the target
-            // workspace's windows.
+            // Bring the real windows back BEFORE dropping the
+            // backdrop: hide the non-active participants (invisible —
+            // they are off-screen) and park the active ones at their
+            // settled tiles SYNCHRONOUSLY. At zoom 1 the thumbnails
+            // cover those tiles pixel-exactly (the inset converged to
+            // 0), so the host drop below is seamless.
             let active_idx = self
                 .layout
                 .monitor(&device)
                 .map(|ml| ml.active_workspace_idx);
+            let mut back: Vec<crate::layout::geometry::TileRect> = Vec::new();
             for (k, rs) in &ov.finals {
                 if Some(*k) == active_idx {
+                    back.extend(rs.iter().cloned());
                     continue;
                 }
                 for r in rs {
@@ -2784,6 +2865,7 @@ impl AppState {
                     }
                 }
             }
+            placement::apply_geometry_sync(&back);
             // Dropping the host destroys the backdrop + thumbnails;
             // the real windows are revealed exactly where the
             // thumbnails ended (zoom 1 == settled tiles).
@@ -3123,6 +3205,7 @@ mod tests {
             zoom_target: 0.35,
             view_shift: None,
             sync_from_progress: None,
+            offscreen_shift: 0,
         }
     }
 

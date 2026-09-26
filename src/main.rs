@@ -15,8 +15,29 @@ mod win;
 
 use std::process::ExitCode;
 
+/// Hide the console window when wini owns it (launched from Explorer,
+/// a shortcut or autostart): a window manager should start silently,
+/// not pop a black console box. When launched from a terminal the
+/// console is shared with the shell (more than one process attached),
+/// so it stays visible for log reading and Ctrl+C.
+fn hide_owned_console() {
+    unsafe {
+        use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+        let mut procs = [0u32; 8];
+        let attached = GetConsoleProcessList(&mut procs);
+        if attached == 1 {
+            let hwnd = GetConsoleWindow();
+            if !hwnd.0.is_null() {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
     logging::init();
+    hide_owned_console();
 
     // Per-monitor-v2 DPI awareness: without it Windows virtualizes all
     // coordinates we read/write (GetMonitorInfo, GetWindowRect,
