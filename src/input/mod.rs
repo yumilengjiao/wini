@@ -336,10 +336,12 @@ pub fn decode_message(wparam: usize, lparam: isize) -> KeyEvent {
 /// (Encoding lives in `input::mouse`.)
 pub fn decode_mouse_message(wparam: usize, lparam: isize) -> MouseEvent {
     let w = wparam;
-    let kind = match w & 0b11 {
+    let kind = match w & 0b111 {
         0 => MouseKind::Move,
         1 => MouseKind::WheelV,
-        _ => MouseKind::WheelH,
+        2 => MouseKind::WheelH,
+        3 => MouseKind::LButtonDown,
+        _ => MouseKind::RButtonDown,
     };
     let packed = lparam as u64;
     MouseEvent {
@@ -347,9 +349,9 @@ pub fn decode_mouse_message(wparam: usize, lparam: isize) -> MouseEvent {
         x: (packed >> 32) as u32 as i32,
         y: packed as u32 as i32,
         notches: ((w >> 16) as u8) as i8 as i32,
-        shift: w & 0b0100 != 0,
-        ctrl: w & 0b1000 != 0,
-        mod_held: w & 0b1_0000 != 0,
+        shift: w & 0b1000 != 0,
+        ctrl: w & 0b1_0000 != 0,
+        mod_held: w & 0b10_0000 != 0,
     }
 }
 

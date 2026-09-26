@@ -27,6 +27,8 @@ use crate::win::msg_window::WM_APP_MOUSE;
 
 /// WM_MOUSEMOVE / WM_MOUSEWHEEL / WM_MOUSEHWHEEL.
 const WM_MOUSEMOVE: usize = 0x0200;
+const WM_LBUTTONDOWN: usize = 0x0201;
+const WM_RBUTTONDOWN: usize = 0x0204;
 const WM_MOUSEWHEEL: usize = 0x020A;
 const WM_MOUSEHWHEEL: usize = 0x020E;
 
@@ -38,6 +40,10 @@ pub enum MouseKind {
     WheelV,
     /// Horizontal wheel (left/right).
     WheelH,
+    /// Left button pressed.
+    LButtonDown,
+    /// Right button pressed.
+    RButtonDown,
 }
 
 /// A mouse event forwarded from the hook thread.
@@ -80,6 +86,21 @@ static MOUSE_HOOK_PTR: AtomicUsize = AtomicUsize::new(0);
 /// Last forwarded move position, packed as `(x << 32) | y` — used to
 /// throttle the move flood (high-rate mice produce ~1000 events/s).
 static LAST_MOVE_POS: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// Screen rects in which mouse BUTTONS are intercepted (monitors
+/// with an open overview). The overview backdrop is a colorkey
+/// layered window — fully transparent to hit-testing — so button
+/// presses inside it must be captured here at the hook instead of by
+/// the host window. Intercepted presses are forwarded to the main
+/// thread and SWALLOWED (the desktop and the parked real windows
+/// below must not see them).
+static OVERVIEW_RECTS: Mutex<Vec<(i32, i32, i32, i32)>> = Mutex::new(Vec::new());
+
+/// Replace the button-interception regions (called on overview
+/// open/close/drop).
+pub fn set_overview_regions(rects: Vec<(i32, i32, i32, i32)>) {
+    *OVERVIEW_RECTS.lock().unwrap() = rects;
+}
 
 /// Install the low-level mouse hook. `target` receives `WM_APP_MOUSE`
 /// messages; see [`encode`]/[`crate::input::decode_mouse_message`].
@@ -130,8 +151,37 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         WM_MOUSEMOVE => (MouseKind::Move, 0),
         WM_MOUSEWHEEL => (MouseKind::WheelV, ((ms.mouseData >> 16) as i16) as i32 / 120),
         WM_MOUSEHWHEEL => (MouseKind::WheelH, ((ms.mouseData >> 16) as i16) as i32 / 120),
+        WM_LBUTTONDOWN => (MouseKind::LButtonDown, 0),
+        WM_RBUTTONDOWN => (MouseKind::RButtonDown, 0),
         _ => return call_next(lparam, code, wparam),
     };
+
+    // Overview backdrop regions: button presses are overview UI —
+    // forward and swallow them (see OVERVIEW_RECTS).
+    if matches!(kind, MouseKind::LButtonDown | MouseKind::RButtonDown) {
+        let inside = OVERVIEW_RECTS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|&(l, t, r, b)| ms.pt.x >= l && ms.pt.x < r && ms.pt.y >= t && ms.pt.y < b);
+        if !inside {
+            return call_next(lparam, code, wparam);
+        }
+        let Some(target) = MOUSE_HOOK_STATE.lock().unwrap().as_ref().map(|s| s.target) else {
+            return call_next(lparam, code, wparam);
+        };
+        let ev = MouseEvent {
+            kind,
+            x: ms.pt.x,
+            y: ms.pt.y,
+            notches: 0,
+            shift: key_down(VK_SHIFT),
+            ctrl: key_down(VK_CONTROL),
+            mod_held: false,
+        };
+        forward(target, &ev, ms.pt.x, ms.pt.y);
+        return LRESULT(1);
+    }
 
     // Throttle moves: skip if we forwarded (nearly) this position
     // already. Moves are never swallowed.
@@ -217,11 +267,13 @@ fn encode_wparam(ev: &MouseEvent) -> usize {
         MouseKind::Move => 0usize,
         MouseKind::WheelV => 1,
         MouseKind::WheelH => 2,
+        MouseKind::LButtonDown => 3,
+        MouseKind::RButtonDown => 4,
     };
     kind_bits
-        | ((ev.shift as usize) << 2)
-        | ((ev.ctrl as usize) << 3)
-        | ((ev.mod_held as usize) << 4)
+        | ((ev.shift as usize) << 3)
+        | ((ev.ctrl as usize) << 4)
+        | ((ev.mod_held as usize) << 5)
         | (((ev.notches as i8) as u8 as usize) << 16)
 }
 

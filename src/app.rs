@@ -837,6 +837,7 @@ impl AppState {
         );
         self.overviews.insert(device.to_string(), ov);
         self.overview_hosts.insert(device.to_string(), host);
+        self.sync_overview_regions();
         self.update_focus_border();
     }
 
@@ -1049,34 +1050,30 @@ impl AppState {
         }
     }
 
-    /// A click on an open overview's backdrop host (thumbnail areas
-    /// included — they are DWM-drawn and not separately hit-testable).
-    /// `host_addr` is the host HWND address, `(cx, cy)` the click in
-    /// host-client coords. Hit-testing happens against the CURRENT
-    /// thumbnail rects, so a click mid-animation selects where the
-    /// user sees the window. A hit activates its workspace, focuses
-    /// the window and closes the overview into it (niri's
-    /// toggle-overview-to-workspace). Clicks on the empty backdrop
-    /// do nothing.
-    fn overview_click(&mut self, host_addr: isize, cx: i32, cy: i32) {
-        let Some(device) = self
-            .overview_hosts
-            .iter()
-            .find_map(|(d, h)| (h.hwnd_addr() == host_addr).then(|| d.clone()))
-        else {
-            return;
-        };
-        let Some(ov) = self.overviews.get(&device) else {
-            return;
-        };
-        // Host client coords -> screen coords.
-        let sx = cx + ov.full.0 as i32;
-        let sy = cy + ov.full.1 as i32;
-        let Some(r) = ov
-            .current_rects()
-            .into_iter()
-            .find(|r| sx >= r.x && sx < r.x + r.w && sy >= r.y && sy < r.y + r.h)
-        else {
+    /// A click at screen coords while an overview is open (captured
+    /// by the low-level mouse hook — the colorkey backdrop is
+    /// transparent to hit-testing, so the host never sees clicks).
+    /// Hit-testing happens against the CURRENT thumbnail rects, so a
+    /// click mid-animation selects where the user sees the window. A
+    /// hit activates its workspace, focuses the window and closes
+    /// the overview into it (niri's toggle-overview-to-workspace).
+    /// Clicks on the empty backdrop do nothing (the press was
+    /// already swallowed by the hook).
+    fn overview_click_at(&mut self, sx: i32, sy: i32) {
+        let Some((device, r)) = self.overviews.iter().find_map(|(d, ov)| {
+            let (fx, fy, fw, fh) = ov.full;
+            let inside = sx >= fx as i32
+                && sx < (fx + fw) as i32
+                && sy >= fy as i32
+                && sy < (fy + fh) as i32;
+            if !inside {
+                return None;
+            }
+            ov.current_rects()
+                .into_iter()
+                .find(|r| sx >= r.x && sx < r.x + r.w && sy >= r.y && sy < r.y + r.h)
+                .map(|r| (d.clone(), r))
+        }) else {
             return;
         };
         let id = r.id;
@@ -1110,6 +1107,19 @@ impl AppState {
         self.overview_focus_view(&device, id, vp_before);
         self.refresh_overview(&device);
         self.close_overview_to(&device, Some(ws_idx));
+    }
+
+    /// Push the current open-overview monitor rects to the mouse
+    /// hook, which intercepts+swallows button presses inside them
+    /// (the colorkey backdrop is transparent to hit-testing).
+    fn sync_overview_regions(&self) {
+        let rects: Vec<(i32, i32, i32, i32)> = self
+            .overviews
+            .keys()
+            .filter_map(|d| self.monitors.iter().find(|m| &m.device == d))
+            .map(|m| (m.full.left, m.full.top, m.full.right, m.full.bottom))
+            .collect();
+        crate::input::mouse::set_overview_regions(rects);
     }
 
     /// Re-raise every open overview backdrop above the real windows
@@ -1282,6 +1292,7 @@ impl AppState {
         // reflow re-applies everything.
         let overviews = std::mem::take(&mut self.overviews);
         self.overview_hosts.clear();
+        self.sync_overview_regions();
         for (device, ov) in overviews {
             let active_idx = self
                 .layout
@@ -1365,6 +1376,11 @@ impl AppState {
                 if self.config.focus_follows_mouse {
                     self.focus_follows_mouse(ev.x, ev.y);
                 }
+            }
+            MouseKind::LButtonDown | MouseKind::RButtonDown => {
+                // Only fires inside an overview region (the hook
+                // intercepts and swallows those presses).
+                self.overview_click_at(ev.x, ev.y);
             }
         }
     }
@@ -1977,6 +1993,7 @@ impl AppState {
         // the non-active workspaces).
         let dropped = std::mem::take(&mut self.overviews);
         self.overview_hosts.clear();
+        self.sync_overview_regions();
         for (_, ov) in dropped {
             let all: Vec<crate::layout::geometry::TileRect> = ov
                 .finals
@@ -2881,6 +2898,7 @@ impl AppState {
             // the real windows are revealed exactly where the
             // thumbnails ended (zoom 1 == settled tiles).
             self.overview_hosts.remove(&device);
+            self.sync_overview_regions();
             // The overview no longer owns this monitor's geometry.
             self.reflow();
             // Focus only moved internally while the overview was open
@@ -3014,15 +3032,6 @@ impl App {
             let mouse_state = Rc::clone(&state);
             msg_window.set_mouse_handler(move |ev| {
                 mouse_state.borrow_mut().handle_mouse_event(ev);
-            });
-        }
-        // Overview backdrop clicks: the host window forwards them
-        // here; the app hit-tests them against the live thumbnail
-        // rects and selects the workspace/window under the click.
-        {
-            let ov_state = Rc::clone(&state);
-            crate::win::thumbnail::set_click_handler(move |host, x, y| {
-                ov_state.borrow_mut().overview_click(host, x, y);
             });
         }
         let key_state = Rc::clone(&state);

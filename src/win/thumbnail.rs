@@ -22,12 +22,10 @@
 //! - Thumbnails: `DwmRegisterThumbnail` per participant, destination
 //!   rects updated every animation frame (DWM composites them; no
 //!   per-frame app work).
-//! - Input: clicks land on the host (thumbnails are DWM-drawn, not
-//!   hit-testable); `WM_LBUTTONDOWN`/`WM_RBUTTONDOWN` are forwarded to
-//!   a handler set by the app, which hit-tests the click against the
-//!   current thumbnail rects. (Colorkey-transparent pixels pass
-//!   clicks through to the desktop — harmless: the real windows
-//!   below are cloaked and not hit-testable.)
+//! - Input: the colorkey window is fully transparent to hit-testing,
+//!   so button presses are intercepted one level lower, in the
+//!   low-level mouse hook (see `input::mouse::set_overview_regions`),
+//!   which hit-tests them against the current thumbnail rects.
 //! - Z order: the host lives in the normal band, re-raised above the
 //!   real windows (which raise themselves on focus changes) but below
 //!   the desktop bars (`raise_bars` runs after every host raise) and
@@ -48,8 +46,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, GWL_EXSTYLE, GW_HWNDPREV, LWA_COLORKEY, RegisterClassW,
     SetLayeredWindowAttributes, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOOWNERZORDER, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
-    WM_LBUTTONDOWN, WM_RBUTTONDOWN, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::layout::geometry::TileRect;
@@ -59,24 +56,6 @@ use crate::layout::geometry::TileRect;
 /// real window content — every pixel painted in it composites fully
 /// transparent, so the desktop shows through around the thumbnails.
 const COLORKEY: u32 = 0x00FF_00FF;
-
-/// Click handler: (host hwnd address, client x, client y) — set once
-/// by the app at startup, invoked on the main thread.
-type ClickHandler = Box<dyn Fn(isize, i32, i32)>;
-struct ClickCell(std::cell::UnsafeCell<Option<ClickHandler>>);
-unsafe impl Sync for ClickCell {}
-static CLICK_HANDLER: ClickCell = ClickCell(std::cell::UnsafeCell::new(None));
-
-/// Register the click handler invoked when the user clicks anywhere
-/// on an overview backdrop (thumbnails included — they are DWM-drawn
-/// and not separately hit-testable).
-pub fn set_click_handler(handler: impl Fn(isize, i32, i32) + 'static) {
-    // Safety: main thread only; wnd_proc runs during message
-    // dispatch on the same thread.
-    unsafe {
-        *CLICK_HANDLER.0.get() = Some(Box::new(handler));
-    }
-}
 
 /// One monitor's overview: backdrop window + thumbnail set.
 pub struct OverviewHost {
@@ -112,8 +91,7 @@ impl OverviewHost {
             // WS_EX_LAYERED + LWA_COLORKEY: the colorkey-painted
             // client area composites fully transparent (desktop
             // visible), the DWM thumbnails stay opaque. No
-            // WS_EX_TOPMOST (the focus ring must stay above) and no
-            // WS_EX_TRANSPARENT (we need the clicks).
+            // WS_EX_TOPMOST (the focus ring must stay above).
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(
                     WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0 | WS_EX_LAYERED.0,
@@ -332,19 +310,5 @@ fn backdrop_brush() -> HBRUSH {
 }
 
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN {
-        // Safety: reads the handler on the same (main) thread that
-        // set it, during message dispatch.
-        unsafe {
-            if let Some(handler) = &*CLICK_HANDLER.0.get() {
-                let x = (lparam.0 & 0xFFFF) as u16 as i32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i32;
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handler(hwnd.0 as isize, x, y)
-                }));
-            }
-        }
-        return LRESULT(0);
-    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
