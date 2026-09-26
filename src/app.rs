@@ -1606,8 +1606,16 @@ impl AppState {
         // Workspace we switched FROM (drives the slide direction).
         let mut ws_prev: Option<usize> = None;
         // Preset column widths for the bare set-column-width (cloned
-        // out before the layout borrow below).
+        // out before the layout borrow below), plus the geometry
+        // context needed to resolve them like niri's toggle_width.
         let presets = self.params.preset_column_widths.clone();
+        let layout_params = self.params.clone();
+        let view_width = self
+            .monitors
+            .iter()
+            .find(|m| m.device == device)
+            .map(|m| (m.work.right - m.work.left) as f64)
+            .unwrap_or(1920.0);
         {
             let monitor_layout = self.layout.monitor_mut(&device).unwrap();
             let ws = monitor_layout.active_workspace_mut();
@@ -1636,11 +1644,14 @@ impl AppState {
                         Some(change) => changed = ws.set_column_width(&change),
                         // Bare `set-column-width;` cycles the presets
                         // (niri's preset-column-widths).
-                        None => changed = ws.cycle_column_width(&presets),
+                        None => {
+                            changed =
+                                ws.cycle_column_width(&presets, &layout_params, view_width)
+                        }
                     }
                 }
                 SwitchPresetColumnWidth => {
-                    changed = ws.cycle_column_width(&presets);
+                    changed = ws.cycle_column_width(&presets, &layout_params, view_width);
                 }
                 SetWindowHeight(spec) => {
                     if let Some(change) = SizeChange::parse(&spec) {

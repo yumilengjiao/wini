@@ -193,17 +193,19 @@ impl Workspace {
         grew
     }
 
-    /// Add a window as a new column at the end (niri's default placement)
-    /// and focus it.
+    /// Add a window as a new column RIGHT OF THE ACTIVE one (niri's
+    /// default placement: `add_column(None)` inserts at
+    /// `active_column_idx + 1`) and focus it.
     pub fn add_window(&mut self, id: WindowId) {
         let prev_active = if self.columns.is_empty() {
             None
         } else {
             Some((self.active_column_idx, self.view_offset))
         };
-        self.columns.push(Column::new(id));
+        let idx = (self.active_column_idx + 1).min(self.columns.len());
+        self.columns.insert(idx, Column::new(id));
         self.rebase_view_to_current();
-        self.active_column_idx = self.columns.len() - 1;
+        self.active_column_idx = idx;
         self.activate_prev_column_on_removal = prev_active;
     }
 
@@ -627,25 +629,36 @@ impl Workspace {
         true
     }
 
-    /// Niri's preset-column-widths: a bare `set-column-width` cycles the
-    /// focused column through the configured presets. The next preset
-    /// is the first one after the current width's position (default
-    /// width counts as "before the first preset").
-    pub fn cycle_column_width(&mut self, presets: &[ColumnWidth]) -> bool {
+    /// Niri's preset-column-widths (`switch-preset-column-width` /
+    /// bare `set-column-width`): cycle the focused column through the
+    /// configured presets FORWARDS by resolved width — from a
+    /// non-preset width the next preset is the first one strictly
+    /// wider than the current width (+1px fractional-scale
+    /// allowance), wrapping to the first (smallest) when none is
+    /// wider; from a preset it advances to the next one (wrapping).
+    pub fn cycle_column_width(
+        &mut self,
+        presets: &[ColumnWidth],
+        params: &crate::layout::geometry::LayoutParams,
+        view_width: f64,
+    ) -> bool {
         if presets.is_empty() {
             return false;
         }
         let Some(col) = self.columns.get_mut(self.active_column_idx) else {
             return false;
         };
-        let next = match col.width {
-            None => presets[0],
-            Some(w) => {
-                let idx = presets.iter().position(|&p| p == w);
-                match idx {
-                    Some(i) => presets[(i + 1) % presets.len()],
-                    None => presets[0],
-                }
+        let next = match col.width.and_then(|w| presets.iter().position(|&p| p == w)) {
+            Some(i) => presets[(i + 1) % presets.len()],
+            None => {
+                let cur = crate::layout::geometry::resolve_width(col.width, params, view_width);
+                *presets
+                    .iter()
+                    .find(|&&p| {
+                        crate::layout::geometry::resolve_width(Some(p), params, view_width)
+                            > cur + 1.0
+                    })
+                    .unwrap_or(&presets[0])
             }
         };
         col.width = Some(next);
@@ -1411,7 +1424,8 @@ mod tests {
 
         ws.toggle_maximized();
         let presets = vec![ColumnWidth::Proportion(0.33), ColumnWidth::Proportion(0.66)];
-        assert!(ws.cycle_column_width(&presets));
+        let params = crate::layout::geometry::LayoutParams::default();
+        assert!(ws.cycle_column_width(&presets, &params, 1000.0));
         assert!(!ws.columns[0].is_maximized);
 
         // toggle_full_width also un-maximizes (niri).

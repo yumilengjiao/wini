@@ -1326,21 +1326,27 @@ mod tests {
             ]
         );
 
-        // Cycling: default -> first -> ... -> wraps.
+        // Cycling (niri's toggle_width forwards): from a non-preset
+        // width the next preset is the first one WIDER than the
+        // current resolved width (+1px), wrapping to the smallest;
+        // from a preset it advances to the next (wrapping).
+        // view 1000px: default 0.5 -> 500px, so 0.33 (330) and 0.5
+        // (500) are skipped, Fixed(1280) wins first.
         let presets = cfg.layout.preset_column_widths.clone();
+        let params = crate::layout::geometry::LayoutParams::default();
         let mut ws = crate::layout::Workspace::new();
         ws.add_window(1);
-        assert!(ws.cycle_column_width(&presets));
-        assert_eq!(ws.columns[0].width, Some(ColumnWidth::Proportion(0.33)));
-        assert!(ws.cycle_column_width(&presets));
-        assert_eq!(ws.columns[0].width, Some(ColumnWidth::Proportion(0.5)));
-        assert!(ws.cycle_column_width(&presets));
+        assert!(ws.cycle_column_width(&presets, &params, 1000.0));
         assert_eq!(ws.columns[0].width, Some(ColumnWidth::Fixed(1280.0)));
-        assert!(ws.cycle_column_width(&presets));
+        assert!(ws.cycle_column_width(&presets, &params, 1000.0));
         assert_eq!(ws.columns[0].width, Some(ColumnWidth::Proportion(0.33)));
+        assert!(ws.cycle_column_width(&presets, &params, 1000.0));
+        assert_eq!(ws.columns[0].width, Some(ColumnWidth::Proportion(0.5)));
+        assert!(ws.cycle_column_width(&presets, &params, 1000.0));
+        assert_eq!(ws.columns[0].width, Some(ColumnWidth::Fixed(1280.0)));
 
         // Empty presets: no-op.
-        assert!(!ws.cycle_column_width(&[]));
+        assert!(!ws.cycle_column_width(&[], &params, 1000.0));
     }
 
     #[test]
