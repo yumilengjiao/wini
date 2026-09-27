@@ -1,14 +1,22 @@
+#:schema https://json.schemastore.org/cargo.json
+
 [package]
 name = "wini"
+authors = ["yumilengjiao <yumilengjiao@gmail.com>"]
 version = "0.1.0"
 edition = "2024"
 description = "A scrollable-tiling window manager for Windows, inspired by Niri"
+rust-version = "1.98.1"
+repository = "https://github.com/yumilengjiao/wini"
+homepage = "https://github.com/yumilengjiao/wini"
+readme = "README.md"
+license = "MIT"
 
 [dependencies]
 log = "0.4"
 env_logger = "0.11"
 kdl = "6.5"
-tray-icon = "0.24"
+tray-icon = "0.25.1"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
