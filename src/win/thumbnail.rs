@@ -238,26 +238,18 @@ impl OverviewHost {
         }
 
         /// Push one frame of destination rects (screen coords; converted
-        /// to the host's client space here). Each rect is inset by
-        /// `inset` pixels so neighboring thumbnails don't visually touch
-        /// — with typical `layout { gaps 1..4 }` the scaled gap is
-        /// sub-pixel and the overview would look like one solid mosaic.
-        /// The caller converges the inset to 0 as the zoom approaches 1
-        /// so the close handover to the real windows is pixel-exact.
+        /// to the host's client space here). The rects already carry the
+        /// zoom-scaled layout gaps, so the close handover to the real
+        /// windows at zoom 1 is pixel-exact (no separate inset motion,
+        /// which used to fight the zoom and looked janky).
         pub fn update_rects(
                 &mut self,
                 rects: &[TileRect],
-                inset: i32,
         ) {
                 for r in rects {
                         let Some((_, thumb)) = self.thumbs.iter().find(|(id, _)| *id == r.id)
                         else {
                                 continue;
-                        };
-                        let (dx, dy, dw, dh) = if r.w > 2 * inset && r.h > 2 * inset {
-                                (r.x + inset, r.y + inset, r.w - 2 * inset, r.h - 2 * inset)
-                        } else {
-                                (r.x, r.y, r.w, r.h)
                         };
                         let props = DWM_THUMBNAIL_PROPERTIES {
                                 dwFlags: DWM_TNP_RECTDESTINATION
@@ -265,10 +257,10 @@ impl OverviewHost {
                                         | DWM_TNP_VISIBLE
                                         | DWM_TNP_SOURCECLIENTAREAONLY,
                                 rcDestination: RECT {
-                                        left: dx - self.origin.0,
-                                        top: dy - self.origin.1,
-                                        right: dx - self.origin.0 + dw,
-                                        bottom: dy - self.origin.1 + dh,
+                                        left: r.x - self.origin.0,
+                                        top: r.y - self.origin.1,
+                                        right: r.x - self.origin.0 + r.w,
+                                        bottom: r.y - self.origin.1 + r.h,
                                 },
                                 opacity: 255,
                                 fVisible: windows::core::BOOL(1),

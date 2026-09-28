@@ -99,6 +99,14 @@ struct Slide {
         /// their final (settled) positions (dy = 0) — the settle
         /// handover to reflow() is pixel-exact.
         stride: f64,
+        /// In-flight horizontal glide of one workspace's view: when the
+        /// user scrolls columns (Mod+H/L) mid-slide, the workspace's
+        /// finals are rebuilt at the new view offset and this animated
+        /// x offset (starting at the pre-scroll delta, gliding to 0) is
+        /// applied on top — so the column focus animates instead of
+        /// snapping when the slide settles (niri composes the vertical
+        /// switch and the horizontal view offset as independent springs).
+        x_shift: Option<(usize, crate::anim::Val)>,
 }
 
 impl Slide {
@@ -111,10 +119,14 @@ impl Slide {
                 let mut out = Vec::new();
                 for (k, rects) in &self.finals {
                         let dy = ((*k as f64 - cam) * self.stride).round() as i32;
+                        let dx = match &self.x_shift {
+                                Some((idx, off)) if idx == k => off.value().round() as i32,
+                                _ => 0,
+                        };
                         for r in rects {
                                 out.push(crate::layout::geometry::TileRect {
                                         id: r.id,
-                                        x: r.x,
+                                        x: r.x + dx,
                                         y: r.y + dy,
                                         w: r.w,
                                         h: r.h,
@@ -126,7 +138,7 @@ impl Slide {
 
         /// Is the camera settled at its target?
         fn finished(&self) -> bool {
-                self.camera.finished()
+                self.camera.finished() && self.x_shift.as_ref().is_none_or(|(_, o)| o.finished())
         }
 }
 
@@ -279,15 +291,6 @@ impl Overview {
                         },
                         None => cam,
                 }
-        }
-
-        /// Thumbnail gap inset for this frame: 2px fully zoomed out,
-        /// converging to 0 as the zoom reaches 1 so the close handover
-        /// to the real windows is pixel-exact (no seam around the last
-        /// frames).
-        fn thumb_inset(&self) -> i32 {
-                let t = ((1.0 - self.zoom()) / (1.0 - self.zoom_target)).clamp(0.0, 1.0);
-                (t * 2.0).round() as i32
         }
 
         /// Participant rects at the current animated zoom/camera.
@@ -833,7 +836,7 @@ impl AppState {
                         .flat_map(|(_, rs)| rs.iter().map(|r| r.id))
                         .collect();
                 host.sync_sources(&sources);
-                host.update_rects(&ov.current_rects(), ov.thumb_inset());
+                host.update_rects(&ov.current_rects());
                 host.raise();
                 // Source windows remain at their settled geometry. Drop any
                 // stale layout animation; otherwise an old resize could still
@@ -855,7 +858,7 @@ impl AppState {
                 }
                 // A just-shown source may need one property refresh before DWM
                 // paints its first live thumbnail.
-                host.update_rects(&ov.current_rects(), ov.thumb_inset());
+                host.update_rects(&ov.current_rects());
                 placement::raise_bars(&self.monitors);
                 log::debug!(
                         "overview[{device}]: opening ({} workspaces)",
@@ -1275,7 +1278,7 @@ impl AppState {
                 let sources: Vec<isize> = settled.iter().map(|r| r.id).collect();
                 if let Some(host) = self.overview_hosts.get_mut(device) {
                         host.sync_sources(&sources);
-                        host.update_rects(&ov.current_rects(), ov.thumb_inset());
+                        host.update_rects(&ov.current_rects());
                         host.raise();
                 }
                 placement::raise_bars(&self.monitors);
@@ -2081,6 +2084,17 @@ impl AppState {
                                 {
                                         self.update_focus_view(id);
                                 }
+                                // A horizontal action (column focus / move) taken
+                                // WHILE a workspace slide is in flight would
+                                // otherwise only apply when the slide settles
+                                // (reflow skips sliding monitors) — a hard jump.
+                                // Instead glide the slide's affected workspace to
+                                // its new view offset so the two motions compose.
+                                if self.slides.contains_key(&device)
+                                        && let Some(id) = focused_id
+                                {
+                                        self.nudge_slide_horizontal(&device, id);
+                                }
                                 self.reflow();
                         }
                         self.sync_focus_to_os();
@@ -2676,6 +2690,80 @@ impl AppState {
         /// workspaces sweep across the view like niri's. Bars (yasb/...)
         /// are re-raised above the sliding windows every frame.
         ///
+        /// A column focus/move happened on `device` while a workspace
+        /// slide is animating. Rebuild the affected workspace's slide
+        /// finals at its new view offset and start a horizontal glide
+        /// (starting at the pre-scroll delta, easing to 0) so the column
+        /// scroll animates on top of the vertical slide instead of
+        /// snapping when the slide settles.
+        fn nudge_slide_horizontal(
+                &mut self,
+                device: &str,
+                id: crate::layout::WindowId,
+        ) {
+                let Some(mon) = self.monitors.iter().find(|m| m.device == device) else {
+                        return;
+                };
+                let params = self.params.clone();
+                let area = (
+                        mon.work.left as f64,
+                        mon.work.top as f64,
+                        (mon.work.right - mon.work.left) as f64,
+                        (mon.work.bottom - mon.work.top) as f64,
+                );
+                let Some(ws_idx) = self
+                        .layout
+                        .monitor(device)
+                        .and_then(|ml| ml.workspace_of(id))
+                else {
+                        return;
+                };
+                let Some(new_rects) = self
+                        .layout
+                        .monitor(device)
+                        .and_then(|ml| ml.workspaces.get(ws_idx))
+                        .map(|ws| geometry::compute_workspace_geometry(ws, &params, area))
+                else {
+                        return;
+                };
+                let Some(slide) = self.slides.get_mut(device) else {
+                        return;
+                };
+                // Horizontal delta between the old and new view for a window
+                // present in both sets (the whole workspace scrolls by the
+                // same amount, so any shared window gives the delta).
+                let old_x: std::collections::HashMap<isize, i32> = slide
+                        .finals
+                        .iter()
+                        .find(|(k, _)| *k == ws_idx)
+                        .map(|(_, rs)| rs.iter().map(|r| (r.id, r.x)).collect())
+                        .unwrap_or_default();
+                let delta = new_rects
+                        .iter()
+                        .find_map(|r| old_x.get(&r.id).map(|&ox| ox as f64 - r.x as f64))
+                        .unwrap_or(0.0);
+                // Carry over any in-flight shift for this workspace.
+                let carry = match &slide.x_shift {
+                        Some((k, off)) if *k == ws_idx => off.value(),
+                        _ => 0.0,
+                };
+                // Replace the workspace's finals with the new geometry.
+                if let Some(entry) = slide.finals.iter_mut().find(|(k, _)| *k == ws_idx) {
+                        entry.1 = new_rects;
+                } else {
+                        slide.finals.push((ws_idx, new_rects));
+                }
+                let start = carry + delta;
+                if start.abs() >= 0.5 {
+                        let vp = self.config.animations.view_offset_params();
+                        let mut off = crate::anim::Val::to(start, vp);
+                        off.retarget(0.0, vp);
+                        slide.x_shift = Some((ws_idx, off));
+                } else {
+                        slide.x_shift = None;
+                }
+        }
+
         /// Returns false (and does nothing) when the animation is
         /// disabled (`off`), the monitor is unknown, or management is
         /// paused — the caller then does a plain reflow.
@@ -2808,6 +2896,7 @@ impl AppState {
                         camera,
                         finals,
                         stride,
+                        x_shift: None,
                 };
                 // A normal reflow animates the same HWNDs through
                 // `Animator`. Once a workspace slide takes ownership, no
@@ -3212,13 +3301,12 @@ impl AppState {
                                 log::debug!("overview[{device}]: zoom={zoom:.3} cam={cam:.2}");
                                 let rects = ov.rects_at(zoom, cam);
                                 if let Some(host) = self.overview_hosts.get_mut(&device) {
-                                        host.update_rects(&rects, ov.thumb_inset());
+                                        host.update_rects(&rects);
                                 }
-                                // The focused window may have raised itself above the
-                                // backdrop (focus changes while the overview is
-                                // open); the bars must stay above the backdrop.
-                                self.raise_overview_hosts();
-                                placement::raise_bars(&self.monitors);
+                                // No per-frame re-raise: the host is opaque and
+                                // topmost and the real windows don't move during the
+                                // open/close zoom, so nothing can climb above it. DWM
+                                // composites the thumbnails; the frame stays cheap.
                                 continue;
                         }
                         if ov.opening() {
