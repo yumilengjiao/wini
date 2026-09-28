@@ -797,6 +797,11 @@ impl AppState {
                 let anim = self.config.animations.overview_open_close_params();
                 if ov.opening() {
                         ov.progress.retarget(0.0, anim);
+                        // Snap any in-flight thumbnail view-shift so the close
+                        // starts from the settled view (otherwise the shift
+                        // finishes DURING the close, which looks like the
+                        // windows sliding sideways as the overview zooms in).
+                        ov.view_shift = None;
                         // Close back into the active workspace. The camera must
                         // run with the SAME params as the zoom (niri passes the
                         // overview open/close config to activate_workspace) so
@@ -845,6 +850,7 @@ impl AppState {
                         .unwrap_or_else(|| ov.camera.target());
                 ov.progress.retarget(0.0, anim);
                 ov.camera.retarget(target, anim);
+                ov.view_shift = None;
                 ov.sync_from_progress = Some(ov.progress.from());
         }
 
@@ -1186,9 +1192,8 @@ impl AppState {
                         return;
                 };
                 ov.finals = finals;
-                // Real windows stay at their settled geometry. Cancel any
-                // in-flight springs so a stale layout frame cannot resize a
-                // source while the opaque host is showing its thumbnail.
+                // Real windows stay at their settled geometry, shown so DWM
+                // can thumbnail them.
                 let settled: Vec<geometry::TileRect> = ov
                         .finals
                         .iter()
@@ -1200,8 +1205,16 @@ impl AppState {
                         if crate::win::api::is_alive(hwnd) {
                                 placement::set_shown(hwnd, true);
                         }
-                        self.transport.remove_window(r.id);
                 }
+                // Keep the transport tracking the overview's current active
+                // workspace / view, SNAPPED (not animating): the frame is
+                // skipped for overview monitors, but this guarantees that when
+                // the overview closes the transport already holds the exact
+                // settled positions — no "slide back" from a stale pre-overview
+                // spring the instant the zoom-in completes.
+                let params = self.params.clone();
+                self.transport.sync(&self.layout, &self.monitors, &params);
+                self.transport.snap(device);
                 // Thumbnails: reconcile the source set, then one frame at
                 // the current zoom/camera.
                 let sources: Vec<isize> = settled.iter().map(|r| r.id).collect();
