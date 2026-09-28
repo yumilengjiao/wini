@@ -381,6 +381,16 @@ impl Val {
                 self.duration.is_zero() || self.start.elapsed() >= self.duration
         }
 
+        /// Snap to the current target with no animation (value == target,
+        /// finished). Used to hand a value over instantly (e.g. the overview
+        /// close handoff, so the transport doesn't re-animate from a stale
+        /// pre-overview position).
+        pub fn settle(&mut self) {
+                self.from = self.to;
+                self.v0 = 0.0;
+                self.duration = Duration::ZERO;
+        }
+
         pub fn target(&self) -> f64 {
                 self.to
         }
@@ -437,6 +447,14 @@ impl AnimatedRect {
 
         pub fn finished(&self) -> bool {
                 self.x.finished() && self.y.finished() && self.w.finished() && self.h.finished()
+        }
+
+        /// Snap every component to its target (no animation).
+        pub fn settle(&mut self) {
+                self.x.settle();
+                self.y.settle();
+                self.w.settle();
+                self.h.settle();
         }
 
         /// Current animated rect, rounded for SetWindowPos.

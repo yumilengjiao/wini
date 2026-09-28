@@ -42,7 +42,7 @@ use windows::Win32::Graphics::Gdi::{CreateSolidBrush, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, GW_HWNDPREV, GWL_EXSTYLE,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GW_HWNDPREV, GWL_EXSTYLE,
         GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowThreadProcessId, HWND_TOPMOST,
         LWA_ALPHA, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
         SWP_NOOWNERZORDER, SWP_NOSIZE, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
@@ -67,6 +67,15 @@ pub struct OverviewHost {
         /// Host window origin in screen coords (thumbnail destination
         /// rects are client-relative).
         origin: (i32, i32),
+        /// Host client size (w, h) for the desktop backdrop thumbnail.
+        size: (i32, i32),
+        /// DWM thumbnail of the desktop shell (Progman): wallpaper + icons,
+        /// NOT the app windows (they aren't Progman's content). Drawn to
+        /// fill the host BEHIND the window thumbnails so the overview
+        /// background is the real wallpaper — closing then dissolves
+        /// wallpaper into wallpaper with no dark-backdrop pop. `None` if
+        /// Progman can't be thumbnailed (falls back to the dark brush).
+        desktop_thumb: Option<isize>,
 }
 
 impl OverviewHost {
@@ -116,12 +125,51 @@ impl OverviewHost {
                                 255,
                                 LWA_ALPHA,
                         );
+                        // Register the desktop-shell (Progman) thumbnail FIRST so
+                        // it composites BEHIND the window thumbnails registered
+                        // later: the overview background becomes the real
+                        // wallpaper (+ icons), so closing dissolves wallpaper into
+                        // wallpaper without the dark backdrop popping to wallpaper.
+                        let desktop_thumb = FindWindowW(w!("Progman"), None)
+                                .ok()
+                                .filter(|h| !h.0.is_null())
+                                .and_then(|progman| DwmRegisterThumbnail(hwnd, progman).ok());
                         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                        Some(OverviewHost {
+                        let host = OverviewHost {
                                 hwnd,
                                 thumbs: Vec::new(),
                                 origin: (l, t),
-                        })
+                                size: (r - l, b - t),
+                                desktop_thumb,
+                        };
+                        host.update_desktop_rect();
+                        Some(host)
+                }
+        }
+
+        /// Fill the whole host with the desktop backdrop thumbnail
+        /// (wallpaper and icons). Called once at creation; the source is the
+        /// desktop shell, so it never shows the app windows.
+        fn update_desktop_rect(&self) {
+                let Some(thumb) = self.desktop_thumb else {
+                        return;
+                };
+                let props = DWM_THUMBNAIL_PROPERTIES {
+                        dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE,
+                        rcDestination: RECT {
+                                left: 0,
+                                top: 0,
+                                right: self.size.0,
+                                bottom: self.size.1,
+                        },
+                        opacity: 255,
+                        fVisible: windows::core::BOOL(1),
+                        fSourceClientAreaOnly: windows::core::BOOL(0),
+                        ..Default::default()
+                };
+                // Safety: handle owned by us.
+                unsafe {
+                        let _ = DwmUpdateThumbnailProperties(thumb, &props);
                 }
         }
 
@@ -302,6 +350,11 @@ impl Drop for OverviewHost {
         fn drop(&mut self) {
                 for (_, thumb) in self.thumbs.drain(..) {
                         // Safety: handle owned by us, main thread.
+                        unsafe {
+                                let _ = DwmUnregisterThumbnail(thumb);
+                        }
+                }
+                if let Some(thumb) = self.desktop_thumb.take() {
                         unsafe {
                                 let _ = DwmUnregisterThumbnail(thumb);
                         }

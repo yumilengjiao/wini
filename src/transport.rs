@@ -234,6 +234,26 @@ impl Transport {
                 self.monitors.get(device).is_some_and(|m| !m.wsp.finished())
         }
 
+        /// Snap every spring on `device` to its target (no animation). Used
+        /// to hand geometry over instantly — e.g. when an overview closes,
+        /// so the transport shows windows exactly at their settled tiles
+        /// instead of animating from stale pre-overview positions (a
+        /// visible "move back" right after the host drops).
+        pub fn snap(
+                &mut self,
+                device: &str,
+        ) {
+                if let Some(m) = self.monitors.get_mut(device) {
+                        m.wsp.settle();
+                        for v in m.view.values_mut() {
+                                v.settle();
+                        }
+                        for r in m.tiles.values_mut() {
+                                r.settle();
+                        }
+                }
+        }
+
         /// Current on-screen rect of `id`, sampling the springs right now.
         /// Used by the focus ring (which must track the animated window).
         pub fn window_rect(

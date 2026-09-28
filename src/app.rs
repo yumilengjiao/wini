@@ -2929,6 +2929,14 @@ impl AppState {
                         self.overview_hosts.remove(&device);
                         self.sync_overview_regions();
                         // The overview no longer owns this monitor's geometry.
+                        // Snap the transport to the settled targets first so the
+                        // real windows are revealed exactly where the thumbnails
+                        // ended, instead of animating back from their stale
+                        // pre-overview spring positions (the "move back on
+                        // zoom-in complete" glitch).
+                        let params = self.params.clone();
+                        self.transport.sync(&self.layout, &self.monitors, &params);
+                        self.transport.snap(&device);
                         self.reflow();
                         // Focus only moved internally while the overview was open
                         // (overview_focus / sync deferral); now that the backdrop
