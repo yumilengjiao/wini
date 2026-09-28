@@ -2936,6 +2936,19 @@ impl AppState {
                                 }
                         }
                         placement::apply_geometry_sync(&back);
+                        // Final thumbnail frame at EXACTLY zoom 1 / camera on the
+                        // active workspace, so the thumbnails coincide with the
+                        // real windows to the pixel before the host is dropped.
+                        // The last animating frame was at zoom ~0.99; without this
+                        // the vanishing thumbnail and the appearing real window
+                        // differ by a hair, which reads as the gaps "snapping
+                        // bigger" at the very end of the zoom-in.
+                        if let Some(idx) = active_idx
+                                && let Some(host) = self.overview_hosts.get_mut(&device)
+                        {
+                                let exact = ov.rects_at(1.0, idx as f64);
+                                host.update_rects(&exact);
+                        }
                         // Dropping the host destroys the backdrop + thumbnails;
                         // the real windows are revealed exactly where the
                         // thumbnails ended (zoom 1 == settled tiles).
