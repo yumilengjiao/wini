@@ -437,6 +437,11 @@ impl Default for Config {
                                 // Cycle preset column widths (niri: 1/3, 1/2, 2/3).
                                 bind("Mod+R", Action::SwitchPresetColumnWidth),
                                 bind("Mod+Shift+R", Action::SwitchPresetColumnWidthBack),
+                                // Finer width/height adjustments (niri defaults).
+                                bind("Mod+Minus", Action::SetColumnWidth("-10%".into())),
+                                bind("Mod+Equal", Action::SetColumnWidth("+10%".into())),
+                                bind("Mod+Shift+Minus", Action::SetWindowHeight("-10%".into())),
+                                bind("Mod+Shift+Equal", Action::SetWindowHeight("+10%".into())),
                                 bind("Mod+Ctrl+Home", Action::MoveColumnToFirst),
                                 bind("Mod+Ctrl+End", Action::MoveColumnToLast),
                                 bind("Mod+V", Action::ToggleWindowFloating),

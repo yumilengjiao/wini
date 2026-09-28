@@ -668,25 +668,31 @@ impl Workspace {
         }
 
         /// Niri's set-column-width: delta ("+100"/"-100"), fixed
-        /// ("1000") or proportion ("50%"). Applied to the focused column.
+        /// ("1000"), proportion ("50%") or signed proportion delta
+        /// ("+10%"/"-10%"). Applied to the focused column. `view_width` is
+        /// used only to resolve proportion deltas against the current
+        /// on-screen width.
         pub fn set_column_width(
                 &mut self,
                 spec: &SizeChange,
+                params: &crate::layout::geometry::LayoutParams,
+                view_width: f64,
         ) -> bool {
-                let Some(ci) = self
-                        .columns
-                        .len()
-                        .checked_sub(0)
-                        .map(|_| self.active_column_idx)
-                else {
+                if self.columns.is_empty() {
                         return false;
-                };
+                }
+                let ci = self.active_column_idx;
+                let cur_w = crate::layout::geometry::resolve_width(
+                        self.columns[ci].width,
+                        params,
+                        view_width,
+                );
                 let col = &mut self.columns[ci];
                 match spec {
                         SizeChange::Delta(px) => {
                                 let new_w = match col.width {
                                         Some(ColumnWidth::Fixed(f)) => f + px,
-                                        _ => px.to_owned(),
+                                        _ => cur_w + px,
                                 };
                                 col.width = Some(ColumnWidth::Fixed(new_w.max(100.0)));
                         },
@@ -695,6 +701,17 @@ impl Workspace {
                         },
                         SizeChange::Proportion(p) => {
                                 col.width = Some(ColumnWidth::Proportion(p.clamp(0.01, 1.0)));
+                        },
+                        SizeChange::ProportionDelta(dp) => {
+                                // Current proportion of the view, plus the delta.
+                                let cur_p = if view_width > 0.0 {
+                                        cur_w / view_width
+                                } else {
+                                        0.5
+                                };
+                                col.width = Some(ColumnWidth::Proportion(
+                                        (cur_p + dp).clamp(0.01, 1.0),
+                                ));
                         },
                 }
                 col.is_full_width = false;
@@ -856,6 +873,9 @@ impl Workspace {
                         SizeChange::Proportion(p) => {
                                 tile.height_weight = p.max(0.05);
                         },
+                        SizeChange::ProportionDelta(dp) => {
+                                tile.height_weight = (tile.height_weight + dp).max(0.05);
+                        },
                 }
                 true
         }
@@ -960,13 +980,26 @@ pub enum SizeChange {
         Fixed(f64),
         /// "50%"
         Proportion(f64),
+        /// "+10%" / "-10%": adjust by a fraction of the view width.
+        ProportionDelta(f64),
 }
 
 impl SizeChange {
         pub fn parse(s: &str) -> Option<Self> {
                 let s = s.trim();
                 if let Some(pct) = s.strip_suffix('%') {
-                        let p: f64 = pct.trim().parse().ok()?;
+                        let pct = pct.trim();
+                        // Signed percent is a delta relative to the view width;
+                        // unsigned percent is an absolute proportion.
+                        if let Some(rest) = pct.strip_prefix('+') {
+                                let p: f64 = rest.trim().parse().ok()?;
+                                return Some(SizeChange::ProportionDelta(p / 100.0));
+                        }
+                        if let Some(rest) = pct.strip_prefix('-') {
+                                let p: f64 = rest.trim().parse().ok()?;
+                                return Some(SizeChange::ProportionDelta(-p / 100.0));
+                        }
+                        let p: f64 = pct.parse().ok()?;
                         return Some(SizeChange::Proportion(p / 100.0));
                 }
                 if let Some(delta) = s.strip_prefix('+') {
@@ -1475,7 +1508,7 @@ mod tests {
                 let mut ws = Workspace::new();
                 // One 400px column (proportion 0.5 of a 800px view) at x=0.
                 ws.add_window(A);
-                ws.set_column_width(&SizeChange::Fixed(400.0));
+                ws.set_column_width(&SizeChange::Fixed(400.0), &params, 800.0);
                 assert!(ws.center_active_column(&params, 800.0));
                 // Centered offset = -(view - col)/2 = -(800-400)/2 = -200.
                 assert!(
@@ -1691,23 +1724,35 @@ mod tests {
                 assert_eq!(SizeChange::parse("-50"), Some(SizeChange::Delta(-50.0)));
                 assert_eq!(SizeChange::parse("1000"), Some(SizeChange::Fixed(1000.0)));
                 assert_eq!(SizeChange::parse("50%"), Some(SizeChange::Proportion(0.5)));
+                assert_eq!(
+                        SizeChange::parse("+10%"),
+                        Some(SizeChange::ProportionDelta(0.1))
+                );
+                assert_eq!(
+                        SizeChange::parse("-10%"),
+                        Some(SizeChange::ProportionDelta(-0.1))
+                );
                 assert_eq!(SizeChange::parse("junk"), None);
         }
 
         #[test]
         fn set_column_width_specs() {
+                let p = crate::layout::geometry::LayoutParams::default();
                 let mut ws = Workspace::new();
                 ws.add_window(A);
-                assert!(ws.set_column_width(&SizeChange::Fixed(800.0)));
+                assert!(ws.set_column_width(&SizeChange::Fixed(800.0), &p, 1600.0));
                 assert_eq!(ws.columns[0].width, Some(ColumnWidth::Fixed(800.0)));
-                assert!(ws.set_column_width(&SizeChange::Delta(-100.0)));
+                assert!(ws.set_column_width(&SizeChange::Delta(-100.0), &p, 1600.0));
                 assert_eq!(ws.columns[0].width, Some(ColumnWidth::Fixed(700.0)));
-                assert!(ws.set_column_width(&SizeChange::Proportion(0.5)));
+                assert!(ws.set_column_width(&SizeChange::Proportion(0.5), &p, 1600.0));
                 assert_eq!(ws.columns[0].width, Some(ColumnWidth::Proportion(0.5)));
+                // Signed percent adjusts the current proportion.
+                assert!(ws.set_column_width(&SizeChange::ProportionDelta(0.1), &p, 1600.0));
+                assert_eq!(ws.columns[0].width, Some(ColumnWidth::Proportion(0.6)));
                 // Full-width is reset by an explicit width.
                 ws.toggle_full_width();
                 assert!(ws.columns[0].is_full_width);
-                assert!(ws.set_column_width(&SizeChange::Fixed(600.0)));
+                assert!(ws.set_column_width(&SizeChange::Fixed(600.0), &p, 1600.0));
                 assert!(!ws.columns[0].is_full_width);
         }
 
@@ -1814,12 +1859,12 @@ mod tests {
                 ws.add_window(1);
                 assert!(ws.toggle_maximized());
                 assert!(ws.columns[0].is_maximized);
-                assert!(ws.set_column_width(&SizeChange::Fixed(500.0)));
+                let params = crate::layout::geometry::LayoutParams::default();
+                assert!(ws.set_column_width(&SizeChange::Fixed(500.0), &params, 1000.0));
                 assert!(!ws.columns[0].is_maximized);
 
                 ws.toggle_maximized();
                 let presets = vec![ColumnWidth::Proportion(0.33), ColumnWidth::Proportion(0.66)];
-                let params = crate::layout::geometry::LayoutParams::default();
                 assert!(ws.cycle_column_width(&presets, &params, 1000.0));
                 assert!(!ws.columns[0].is_maximized);
 

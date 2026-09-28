@@ -1746,6 +1746,10 @@ impl AppState {
                                                                                 .clamp(0.05, 20.0))
                                                                         .max(100.0)
                                                                 },
+                                                                SizeChange::ProportionDelta(dp) => {
+                                                                        fs.w = (fs.w * (1.0 + dp))
+                                                                                .max(100.0)
+                                                                },
                                                         }
                                                         touched = true;
                                                 }
@@ -1763,6 +1767,10 @@ impl AppState {
                                                                         fs.h = (fs.h * p
                                                                                 .clamp(0.05, 20.0))
                                                                         .max(100.0)
+                                                                },
+                                                                SizeChange::ProportionDelta(dp) => {
+                                                                        fs.h = (fs.h * (1.0 + dp))
+                                                                                .max(100.0)
                                                                 },
                                                         }
                                                         touched = true;
@@ -1858,7 +1866,11 @@ impl AppState {
                                 SetColumnWidth(spec) => {
                                         match SizeChange::parse(&spec) {
                                                 Some(change) => {
-                                                        changed = ws.set_column_width(&change)
+                                                        changed = ws.set_column_width(
+                                                                &change,
+                                                                &layout_params,
+                                                                view_width,
+                                                        )
                                                 },
                                                 // Bare `set-column-width;` cycles the presets
                                                 // (niri's preset-column-widths).

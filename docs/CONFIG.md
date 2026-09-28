@@ -176,9 +176,12 @@ A config-provided `binds` section **replaces** the default binds.
 | `move-column-to-workspace N` | move the focused column |
 | `move-column-to-workspace-down` / `-up` | move the focused column one workspace down / up (Mod+Ctrl+U / I) |
 
-**Width/height `SPEC`:** `"+100"` / `"-100"` adjust by a delta, `"800"`
-sets fixed pixels, `"50%"` scales by a proportion. (Quotes are only
-needed for values with `+`/`-`/`%`.)
+**Width/height `SPEC`:** `"+100"` / `"-100"` adjust by a pixel delta,
+`"800"` sets fixed pixels, `"50%"` sets an absolute proportion of the
+view, and `"+10%"` / `"-10%"` adjust the proportion by a signed delta.
+(Quotes are only needed for values with `+`/`-`/`%`.) Default binds:
+Mod+Minus / Mod+Equal adjust column width by ±10%, Mod+Shift+Minus /
+Mod+Shift+Equal adjust window height.
 
 ## `window-rule`
 
