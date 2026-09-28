@@ -129,6 +129,25 @@ impl OverviewHost {
                 self.hwnd.0 as isize
         }
 
+        /// Set the whole-window opacity (0 = invisible, 255 = opaque). Used
+        /// to fade the overview in/out near the closed end so opening and
+        /// closing don't pop the backdrop on/off; the DWM thumbnails fade
+        /// with it, cross-fading against the real windows behind (which sit
+        /// at the same tiles, so the blend is seamless).
+        pub fn set_alpha(
+                &self,
+                alpha: u8,
+        ) {
+                unsafe {
+                        let _ = SetLayeredWindowAttributes(
+                                self.hwnd,
+                                windows::Win32::Foundation::COLORREF(0),
+                                alpha,
+                                LWA_ALPHA,
+                        );
+                }
+        }
+
         /// The window directly ABOVE the backdrop in z order (None when
         /// the backdrop tops its band). Diagnostic: with the backdrop
         /// freshly raised, a MANAGED window here is exactly the

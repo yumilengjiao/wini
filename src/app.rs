@@ -298,6 +298,16 @@ impl Overview {
                 self.rects_at(self.zoom(), self.render_cam())
         }
 
+        /// Whole-host opacity for this frame (0..255). Opaque for most of
+        /// the range; fades to 0 only in the last quarter toward the closed
+        /// state, where the zoom is ~1 and the thumbnails coincide with the
+        /// real windows behind — so the fade cross-dissolves identical
+        /// content and the backdrop never pops on/off.
+        fn alpha(&self) -> u8 {
+                let p = self.progress.value().clamp(0.0, 1.0);
+                (((p * 4.0).clamp(0.0, 1.0)) * 255.0).round() as u8
+        }
+
         /// Both springs at rest?
         fn settled(&self) -> bool {
                 self.progress.finished()
@@ -837,6 +847,11 @@ impl AppState {
                         .collect();
                 host.sync_sources(&sources);
                 host.update_rects(&ov.current_rects());
+                // Start transparent: progress is ~0 on the first frame, so the
+                // host is invisible and the (unmoved) real windows show
+                // through; the fade rises with progress as the zoom pulls
+                // back, so opening never pops the backdrop on.
+                host.set_alpha(ov.alpha());
                 host.raise();
                 // Source windows remain at their settled geometry. Drop any
                 // stale layout animation; otherwise an old resize could still
@@ -3298,10 +3313,12 @@ impl AppState {
                         if !ov.settled() {
                                 let zoom = ov.zoom();
                                 let cam = ov.render_cam();
+                                let alpha = ov.alpha();
                                 log::debug!("overview[{device}]: zoom={zoom:.3} cam={cam:.2}");
                                 let rects = ov.rects_at(zoom, cam);
                                 if let Some(host) = self.overview_hosts.get_mut(&device) {
                                         host.update_rects(&rects);
+                                        host.set_alpha(alpha);
                                 }
                                 // No per-frame re-raise: the host is opaque and
                                 // topmost and the real windows don't move during the
@@ -3310,17 +3327,16 @@ impl AppState {
                                 continue;
                         }
                         if ov.opening() {
-                                // Open and settled: nothing to animate until the user
-                                // scrolls or selects — but the z order still needs
-                                // maintaining every frame as a DEFENSE in depth:
-                                // windows can raise themselves for reasons we don't
-                                // control (other apps' BringWindowToTop, foreground
-                                // changes on other monitors). The primary fix is that
-                                // we never force_set_foreground while the overview is
-                                // open (see sync_focus_to_os / overview_focus); this
-                                // re-raise only closes whatever race remains, within
-                                // one frame. It is idempotent and cheap when the
-                                // order is already correct.
+                                // Open and settled: ensure full opacity (a prior
+                                // interrupted close may have left it mid-fade), then
+                                // maintain z order as a defense in depth — windows can
+                                // raise themselves for reasons we don't control. We
+                                // never force_set_foreground while the overview is
+                                // open (see sync_focus_to_os / overview_focus), so this
+                                // only closes whatever race remains, within one frame.
+                                if let Some(host) = self.overview_hosts.get(&device) {
+                                        host.set_alpha(255);
+                                }
                                 self.raise_overview_hosts();
                                 placement::raise_bars(&self.monitors);
                                 continue;
