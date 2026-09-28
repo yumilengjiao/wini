@@ -216,16 +216,6 @@ impl Overview {
                 self.rects_at(self.zoom(), self.render_cam())
         }
 
-        /// Whole-host opacity for this frame (0..255). Opaque for most of
-        /// the range; fades to 0 only in the last quarter toward the closed
-        /// state, where the zoom is ~1 and the thumbnails coincide with the
-        /// real windows behind — so the fade cross-dissolves identical
-        /// content and the backdrop never pops on/off.
-        fn alpha(&self) -> u8 {
-                let p = self.progress.value().clamp(0.0, 1.0);
-                (((p * 4.0).clamp(0.0, 1.0)) * 255.0).round() as u8
-        }
-
         /// Both springs at rest?
         fn settled(&self) -> bool {
                 self.progress.finished()
@@ -754,11 +744,12 @@ impl AppState {
                         .collect();
                 host.sync_sources(&sources);
                 host.update_rects(&ov.current_rects());
-                // Start transparent: progress is ~0 on the first frame, so the
-                // host is invisible and the (unmoved) real windows show
-                // through; the fade rises with progress as the zoom pulls
-                // back, so opening never pops the backdrop on.
-                host.set_alpha(ov.alpha());
+                // The host is opaque and topmost from the first frame, which
+                // covers the real windows completely (no see-through
+                // duplicate). At the opening frame the zoom is ~1 so the
+                // thumbnails coincide with the real tiles — the dark backdrop
+                // only appears in the gaps and grows smoothly as the zoom
+                // pulls back, so there is no pop.
                 host.raise();
                 // Source windows remain at their settled geometry. Drop any
                 // stale layout animation; otherwise an old resize could still
@@ -885,26 +876,42 @@ impl AppState {
                 }
         }
 
-        /// Scroll the overview camera to a specific workspace index
-        /// (focus-workspace while the overview is open: the camera moves,
-        /// the active workspace does not — niri's
-        /// `allow_to_activate_workspace = false` in overview).
-        fn overview_goto(
+        /// Focus a workspace while the overview is open: activate it (so
+        /// focus follows and the overview closes into it), scroll the
+        /// camera to center it, and move `self.focused` to that workspace's
+        /// focused window. Clamped to the workspaces that exist.
+        fn overview_activate(
                 &mut self,
                 device: &str,
                 idx: usize,
         ) {
-                let Some(ov) = self.overviews.get_mut(device) else {
-                        return;
-                };
                 let max = self
                         .layout
                         .monitor(device)
                         .map(|ml| ml.workspaces.len().saturating_sub(1))
                         .unwrap_or(0);
-                let switch = self.config.animations.workspace_switch_params();
-                ov.camera.retarget(idx.min(max) as f64, switch);
-                ov.sync_from_progress = None;
+                let idx = idx.min(max);
+                if let Some(ml) = self.layout.monitor_mut(device)
+                        && ml.active_workspace_idx != idx
+                {
+                        ml.previous_workspace_idx = Some(ml.active_workspace_idx);
+                        ml.active_workspace_idx = idx;
+                }
+                // Move focus to the newly active workspace's focused window
+                // (the ring follows; OS foreground stays put until close).
+                let new_focus = self
+                        .layout
+                        .monitor(device)
+                        .and_then(|ml| ml.workspaces.get(idx))
+                        .and_then(|ws| ws.focused_id());
+                self.focused = new_focus.map(|id| HWND(id as *mut _));
+                if let Some(ov) = self.overviews.get_mut(device) {
+                        let switch = self.config.animations.workspace_switch_params();
+                        ov.camera.retarget(idx as f64, switch);
+                        ov.sync_from_progress = None;
+                }
+                self.refresh_overview(device);
+                self.update_focus_border();
         }
 
         /// Move the overview's internal selection (the keyboard nav niri
@@ -1525,11 +1532,21 @@ impl AppState {
                                 return;
                         },
                         Action::FocusWindowDown if self.overviews.contains_key(&device) => {
-                                self.overview_scroll(&device, true);
+                                let cur = self
+                                        .layout
+                                        .monitor(&device)
+                                        .map(|ml| ml.active_workspace_idx)
+                                        .unwrap_or(0);
+                                self.overview_activate(&device, cur + 1);
                                 return;
                         },
                         Action::FocusWindowUp if self.overviews.contains_key(&device) => {
-                                self.overview_scroll(&device, false);
+                                let cur = self
+                                        .layout
+                                        .monitor(&device)
+                                        .map(|ml| ml.active_workspace_idx)
+                                        .unwrap_or(0);
+                                self.overview_activate(&device, cur.saturating_sub(1));
                                 return;
                         },
                         // Column focus in the overview moves the INTERNAL
@@ -1555,7 +1572,35 @@ impl AppState {
                         Action::FocusWorkspace(n) | Action::WorkspaceSwitch(n)
                                 if self.overviews.contains_key(&device) =>
                         {
-                                self.overview_goto(&device, n.saturating_sub(1) as usize);
+                                self.overview_activate(&device, n.saturating_sub(1) as usize);
+                                return;
+                        },
+                        Action::FocusWorkspaceDown if self.overviews.contains_key(&device) => {
+                                let cur = self
+                                        .layout
+                                        .monitor(&device)
+                                        .map(|ml| ml.active_workspace_idx)
+                                        .unwrap_or(0);
+                                self.overview_activate(&device, cur + 1);
+                                return;
+                        },
+                        Action::FocusWorkspaceUp if self.overviews.contains_key(&device) => {
+                                let cur = self
+                                        .layout
+                                        .monitor(&device)
+                                        .map(|ml| ml.active_workspace_idx)
+                                        .unwrap_or(0);
+                                self.overview_activate(&device, cur.saturating_sub(1));
+                                return;
+                        },
+                        Action::FocusWorkspacePrevious if self.overviews.contains_key(&device) => {
+                                if let Some(prev) = self
+                                        .layout
+                                        .monitor(&device)
+                                        .and_then(|ml| ml.previous_workspace_idx)
+                                {
+                                        self.overview_activate(&device, prev);
+                                }
                                 return;
                         },
                         _ => {},
@@ -2828,12 +2873,10 @@ impl AppState {
                         if !ov.settled() {
                                 let zoom = ov.zoom();
                                 let cam = ov.render_cam();
-                                let alpha = ov.alpha();
                                 log::debug!("overview[{device}]: zoom={zoom:.3} cam={cam:.2}");
                                 let rects = ov.rects_at(zoom, cam);
                                 if let Some(host) = self.overview_hosts.get_mut(&device) {
                                         host.update_rects(&rects);
-                                        host.set_alpha(alpha);
                                 }
                                 // No per-frame re-raise: the host is opaque and
                                 // topmost and the real windows don't move during the
@@ -2842,16 +2885,12 @@ impl AppState {
                                 continue;
                         }
                         if ov.opening() {
-                                // Open and settled: ensure full opacity (a prior
-                                // interrupted close may have left it mid-fade), then
-                                // maintain z order as a defense in depth — windows can
-                                // raise themselves for reasons we don't control. We
-                                // never force_set_foreground while the overview is
-                                // open (see sync_focus_to_os / overview_focus), so this
-                                // only closes whatever race remains, within one frame.
-                                if let Some(host) = self.overview_hosts.get(&device) {
-                                        host.set_alpha(255);
-                                }
+                                // Open and settled: maintain z order as a defense in
+                                // depth — windows can raise themselves for reasons we
+                                // don't control. We never force_set_foreground while
+                                // the overview is open (see sync_focus_to_os /
+                                // overview_focus), so this only closes whatever race
+                                // remains, within one frame.
                                 self.raise_overview_hosts();
                                 placement::raise_bars(&self.monitors);
                                 continue;
