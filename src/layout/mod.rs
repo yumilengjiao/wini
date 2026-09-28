@@ -440,6 +440,30 @@ impl Workspace {
                 true
         }
 
+        /// Move the focused column to the first/last position (niri's
+        /// move-column-to-first / move-column-to-last).
+        pub fn move_column_to_edge(
+                &mut self,
+                edge: Edge,
+        ) -> bool {
+                if self.columns.len() < 2 {
+                        return false;
+                }
+                let i = self.active_column_idx;
+                let target = match edge {
+                        Edge::First => 0,
+                        Edge::Last => self.columns.len() - 1,
+                };
+                if i == target {
+                        return false;
+                }
+                self.rebase_view_to_current();
+                let col = self.columns.remove(i);
+                self.columns.insert(target, col);
+                self.active_column_idx = target;
+                true
+        }
+
         /// Move the focused tile up/down inside its column. At the edges,
         /// the tile stays (niri's move-window-down moves it into the next
         /// column — that's `move_tile_across`).
@@ -694,27 +718,57 @@ impl Workspace {
                 params: &crate::layout::geometry::LayoutParams,
                 view_width: f64,
         ) -> bool {
+                self.cycle_column_width_dir(presets, params, view_width, true)
+        }
+
+        /// `switch-preset-column-width` / `-back`: cycle the focused column
+        /// through the presets. `forwards` picks the next strictly-wider
+        /// preset (wrapping to the smallest); `!forwards` picks the next
+        /// strictly-narrower one (wrapping to the widest) — niri's
+        /// `toggle_width(forwards)`.
+        pub fn cycle_column_width_dir(
+                &mut self,
+                presets: &[ColumnWidth],
+                params: &crate::layout::geometry::LayoutParams,
+                view_width: f64,
+                forwards: bool,
+        ) -> bool {
                 if presets.is_empty() {
                         return false;
                 }
                 let Some(col) = self.columns.get_mut(self.active_column_idx) else {
                         return false;
                 };
+                let n = presets.len();
                 let next = match col.width.and_then(|w| presets.iter().position(|&p| p == w)) {
-                        Some(i) => presets[(i + 1) % presets.len()],
+                        Some(i) => {
+                                if forwards {
+                                        presets[(i + 1) % n]
+                                } else {
+                                        presets[(i + n - 1) % n]
+                                }
+                        },
                         None => {
                                 let cur = crate::layout::geometry::resolve_width(
                                         col.width, params, view_width,
                                 );
-                                *presets.iter()
-                                        .find(|&&p| {
-                                                crate::layout::geometry::resolve_width(
-                                                        Some(p),
-                                                        params,
-                                                        view_width,
-                                                ) > cur + 1.0
-                                        })
-                                        .unwrap_or(&presets[0])
+                                let resolve = |p: ColumnWidth| {
+                                        crate::layout::geometry::resolve_width(
+                                                Some(p),
+                                                params,
+                                                view_width,
+                                        )
+                                };
+                                if forwards {
+                                        *presets.iter()
+                                                .find(|&&p| resolve(p) > cur + 1.0)
+                                                .unwrap_or(&presets[0])
+                                } else {
+                                        *presets.iter()
+                                                .rev()
+                                                .find(|&&p| resolve(p) < cur - 1.0)
+                                                .unwrap_or(&presets[n - 1])
+                                }
                         },
                 };
                 col.width = Some(next);
@@ -1258,6 +1312,33 @@ mod tests {
                 assert!(ws.move_column(DirH::Right));
                 assert!(ws.move_column(DirH::Right));
                 assert!(!ws.move_column(DirH::Right));
+        }
+
+        #[test]
+        fn move_column_to_first_and_last() {
+                let mut ws = Workspace::new();
+                ws.add_window(A);
+                ws.add_window(B);
+                ws.add_window(C); // order A, B, C; C focused
+                assert!(ws.move_column_to_edge(Edge::First));
+                assert_eq!(
+                        ws.columns
+                                .iter()
+                                .map(|c| c.focused_id())
+                                .collect::<Vec<_>>(),
+                        vec![Some(C), Some(A), Some(B)]
+                );
+                assert_eq!(ws.active_column_idx, 0);
+                assert!(!ws.move_column_to_edge(Edge::First), "already first");
+                assert!(ws.move_column_to_edge(Edge::Last));
+                assert_eq!(
+                        ws.columns
+                                .iter()
+                                .map(|c| c.focused_id())
+                                .collect::<Vec<_>>(),
+                        vec![Some(A), Some(B), Some(C)]
+                );
+                assert_eq!(ws.active_column_idx, 2);
         }
 
         #[test]

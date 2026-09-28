@@ -151,10 +151,12 @@ A config-provided `binds` section **replaces** the default binds.
 | `focus-column-index N` | focus the Nth column (clamped to the last) |
 | `focus-window-down` / `focus-window-up` | move focus within the column |
 | `move-column-left` / `move-column-right` | reorder the focused column |
+| `move-column-to-first` / `move-column-to-last` | move the focused column to the first/last position (Mod+Ctrl+Home / End) |
 | `move-window-down` / `move-window-up` | reorder within the column |
 | `move-window-to-column-left` / `move-window-to-column-right` | move the window into the neighboring column |
 | `consume-or-expel-window-left` / `-right` | merge into / split out of the neighboring column |
 | `set-column-width SPEC` | set focused column width (see below); bare = cycle `preset-column-widths` |
+| `switch-preset-column-width` / `-back` | cycle preset widths wider-first / narrower-first (Mod+R / Mod+Shift+R) |
 | `set-window-height SPEC` | set focused window height (same SPEC syntax) |
 | `toggle-full-width` | column spans the full workspace width |
 | `maximize-column` | toggle column maximize |

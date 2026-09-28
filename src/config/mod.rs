@@ -93,6 +93,12 @@ pub enum Action {
         /// niri's switch-preset-column-width (Mod+R): cycle the focused
         /// column through layout.preset-column-widths.
         SwitchPresetColumnWidth,
+        /// niri's switch-preset-column-width-back (Mod+Shift+R): cycle the
+        /// focused column through presets in reverse (narrower-first).
+        SwitchPresetColumnWidthBack,
+        /// niri's move-column-to-first / move-column-to-last.
+        MoveColumnToFirst,
+        MoveColumnToLast,
         ToggleFullWidth,
         MaximizeColumn,
         ToggleWindowedFullscreen,
@@ -405,6 +411,9 @@ impl Default for Config {
                                 bind("Mod+M", Action::ToggleWindowedFullscreen),
                                 // Cycle preset column widths (niri: 1/3, 1/2, 2/3).
                                 bind("Mod+R", Action::SwitchPresetColumnWidth),
+                                bind("Mod+Shift+R", Action::SwitchPresetColumnWidthBack),
+                                bind("Mod+Ctrl+Home", Action::MoveColumnToFirst),
+                                bind("Mod+Ctrl+End", Action::MoveColumnToLast),
                                 bind("Mod+V", Action::ToggleWindowFloating),
                                 bind("Mod+Q", Action::CloseWindow),
                                 bind("Mod+Shift+Slash", Action::ToggleOverview),
@@ -1056,6 +1065,9 @@ fn parse_action(node: &KdlNode) -> Option<Action> {
                 "expel-window-from-column" => Action::ExpelWindowFromColumn,
                 "set-column-width" => Action::SetColumnWidth(arg.unwrap_or_default()),
                 "switch-preset-column-width" => Action::SwitchPresetColumnWidth,
+                "switch-preset-column-width-back" => Action::SwitchPresetColumnWidthBack,
+                "move-column-to-first" => Action::MoveColumnToFirst,
+                "move-column-to-last" => Action::MoveColumnToLast,
                 "set-window-height" => Action::SetWindowHeight(arg.unwrap_or_default()),
                 "toggle-full-width" => Action::ToggleFullWidth,
                 "maximize-column" => Action::MaximizeColumn,

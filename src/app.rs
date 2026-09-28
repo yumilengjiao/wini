@@ -1776,6 +1776,16 @@ impl AppState {
                                                 view_width,
                                         );
                                 },
+                                SwitchPresetColumnWidthBack => {
+                                        changed = ws.cycle_column_width_dir(
+                                                &presets,
+                                                &layout_params,
+                                                view_width,
+                                                false,
+                                        );
+                                },
+                                MoveColumnToFirst => changed = ws.move_column_to_edge(Edge::First),
+                                MoveColumnToLast => changed = ws.move_column_to_edge(Edge::Last),
                                 SetWindowHeight(spec) => {
                                         if let Some(change) = SizeChange::parse(&spec) {
                                                 changed = ws.set_window_height(&change);
