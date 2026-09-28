@@ -122,6 +122,21 @@ pub enum Action {
         MoveWindowToWorkspaceUp,
         ToggleWindowFloating,
         ToggleOverview,
+        /// niri focus-monitor-left/right/up/down.
+        FocusMonitorLeft,
+        FocusMonitorRight,
+        FocusMonitorUp,
+        FocusMonitorDown,
+        /// niri move-column-to-monitor-*.
+        MoveColumnToMonitorLeft,
+        MoveColumnToMonitorRight,
+        MoveColumnToMonitorUp,
+        MoveColumnToMonitorDown,
+        /// niri move-window-to-monitor-*.
+        MoveWindowToMonitorLeft,
+        MoveWindowToMonitorRight,
+        MoveWindowToMonitorUp,
+        MoveWindowToMonitorDown,
         /// Niri's do-screen-transition: cover the screen briefly while
         /// management is suspended (screenshot privacy).
         DoScreenTransition,
@@ -358,14 +373,14 @@ impl Default for Config {
                                 bind("Mod+L", Action::FocusColumnRight),
                                 // Move window/column: niri's Mod+Shift = move focus
                                 // direction; Mod+Ctrl = move the column itself.
-                                bind("Mod+Shift+Left", Action::MoveColumnLeft),
-                                bind("Mod+Shift+Down", Action::MoveWindowDown),
-                                bind("Mod+Shift+Up", Action::MoveWindowUp),
-                                bind("Mod+Shift+Right", Action::MoveColumnRight),
-                                bind("Mod+Shift+H", Action::MoveColumnLeft),
-                                bind("Mod+Shift+J", Action::MoveWindowDown),
-                                bind("Mod+Shift+K", Action::MoveWindowUp),
-                                bind("Mod+Shift+L", Action::MoveColumnRight),
+                                bind("Mod+Shift+Left", Action::FocusMonitorLeft),
+                                bind("Mod+Shift+Down", Action::FocusMonitorDown),
+                                bind("Mod+Shift+Up", Action::FocusMonitorUp),
+                                bind("Mod+Shift+Right", Action::FocusMonitorRight),
+                                bind("Mod+Shift+H", Action::FocusMonitorLeft),
+                                bind("Mod+Shift+J", Action::FocusMonitorDown),
+                                bind("Mod+Shift+K", Action::FocusMonitorUp),
+                                bind("Mod+Shift+L", Action::FocusMonitorRight),
                                 bind("Mod+Ctrl+Left", Action::MoveColumnLeft),
                                 bind("Mod+Ctrl+Down", Action::MoveWindowDown),
                                 bind("Mod+Ctrl+Up", Action::MoveWindowUp),
@@ -403,6 +418,13 @@ impl Default for Config {
                                 bind("Mod+I", Action::FocusWorkspaceUp),
                                 bind("Mod+Ctrl+U", Action::MoveColumnToWorkspaceDown),
                                 bind("Mod+Ctrl+I", Action::MoveColumnToWorkspaceUp),
+                                // Monitor navigation: focus-monitor on
+                                // Mod+Shift+arrows/HJKL (above). The
+                                // move-column-to-monitor / move-window-to-monitor
+                                // actions exist but are unbound by default (they
+                                // would collide with Mod+Ctrl+Shift move-to-column
+                                // and only matter with multiple monitors) — bind
+                                // them in your config if you use several outputs.
                                 bind("Mod+F", Action::MaximizeColumn),
                                 bind("Mod+Shift+F", Action::ToggleWindowedFullscreen),
                                 // Real fullscreen: borderless, covering the whole
@@ -1091,6 +1113,18 @@ fn parse_action(node: &KdlNode) -> Option<Action> {
                 "move-column-to-workspace-up" => Action::MoveColumnToWorkspaceUp,
                 "move-window-to-workspace-down" => Action::MoveWindowToWorkspaceDown,
                 "move-window-to-workspace-up" => Action::MoveWindowToWorkspaceUp,
+                "focus-monitor-left" => Action::FocusMonitorLeft,
+                "focus-monitor-right" => Action::FocusMonitorRight,
+                "focus-monitor-up" => Action::FocusMonitorUp,
+                "focus-monitor-down" => Action::FocusMonitorDown,
+                "move-column-to-monitor-left" => Action::MoveColumnToMonitorLeft,
+                "move-column-to-monitor-right" => Action::MoveColumnToMonitorRight,
+                "move-column-to-monitor-up" => Action::MoveColumnToMonitorUp,
+                "move-column-to-monitor-down" => Action::MoveColumnToMonitorDown,
+                "move-window-to-monitor-left" => Action::MoveWindowToMonitorLeft,
+                "move-window-to-monitor-right" => Action::MoveWindowToMonitorRight,
+                "move-window-to-monitor-up" => Action::MoveWindowToMonitorUp,
+                "move-window-to-monitor-down" => Action::MoveWindowToMonitorDown,
                 other => {
                         log::debug!("ignoring unknown action {other:?}");
                         Action::Unknown(other.to_string())

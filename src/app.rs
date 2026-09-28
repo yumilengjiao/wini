@@ -1505,6 +1505,54 @@ impl AppState {
                 }
         }
 
+        /// Handle a monitor-directional action. `kind`: 0 = focus-monitor,
+        /// 1 = move-column-to-monitor, 2 = move-window-to-monitor.
+        fn dispatch_monitor(
+                &mut self,
+                device: &str,
+                dir: crate::win::monitor::Dir,
+                kind: u8,
+        ) {
+                let Some(current) = self.monitors.iter().find(|m| m.device == device) else {
+                        return;
+                };
+                let Some(target) =
+                        crate::win::monitor::monitor_in_direction(&self.monitors, current, dir)
+                else {
+                        return;
+                };
+                let target_device = target.device.clone();
+
+                let moved_focus = match kind {
+                        1 => self
+                                .layout
+                                .move_focused_column_to_monitor(device, &target_device)
+                                .and_then(|ids| ids.first().copied()),
+                        2 => self
+                                .layout
+                                .move_focused_window_to_monitor(device, &target_device),
+                        _ => None,
+                };
+
+                // After a move, focus follows the moved window to the target
+                // monitor; for a plain focus-monitor, adopt whatever the target
+                // monitor currently focuses.
+                let new_focus = match kind {
+                        0 => self.layout.focused_id(&target_device),
+                        _ => moved_focus,
+                };
+                if kind != 0 && moved_focus.is_none() {
+                        // Nothing to move (empty column / no focus): no-op.
+                        return;
+                }
+                self.focused = new_focus.map(|id| HWND(id as *mut _));
+                if let Some(id) = new_focus {
+                        self.update_focus_view(id);
+                }
+                self.reflow();
+                self.sync_focus_to_os();
+        }
+
         /// Execute a bound action. The navigation subset works on the
         /// focused window's workspace.
         fn dispatch(
@@ -1595,6 +1643,29 @@ impl AppState {
                                 return;
                         },
                         _ => {},
+                }
+
+                // Monitor navigation crosses the per-monitor layout, so it is
+                // handled before the single-monitor layout borrow below.
+                use crate::win::monitor::Dir;
+                let monitor_dir = match action {
+                        Action::FocusMonitorLeft => Some((Dir::Left, 0u8)),
+                        Action::FocusMonitorRight => Some((Dir::Right, 0)),
+                        Action::FocusMonitorUp => Some((Dir::Up, 0)),
+                        Action::FocusMonitorDown => Some((Dir::Down, 0)),
+                        Action::MoveColumnToMonitorLeft => Some((Dir::Left, 1)),
+                        Action::MoveColumnToMonitorRight => Some((Dir::Right, 1)),
+                        Action::MoveColumnToMonitorUp => Some((Dir::Up, 1)),
+                        Action::MoveColumnToMonitorDown => Some((Dir::Down, 1)),
+                        Action::MoveWindowToMonitorLeft => Some((Dir::Left, 2)),
+                        Action::MoveWindowToMonitorRight => Some((Dir::Right, 2)),
+                        Action::MoveWindowToMonitorUp => Some((Dir::Up, 2)),
+                        Action::MoveWindowToMonitorDown => Some((Dir::Down, 2)),
+                        _ => None,
+                };
+                if let Some((dir, kind)) = monitor_dir {
+                        self.dispatch_monitor(&device, dir, kind);
+                        return;
                 }
 
                 // Floating windows are not in the tiling: handle the small

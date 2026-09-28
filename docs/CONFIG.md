@@ -154,6 +154,9 @@ A config-provided `binds` section **replaces** the default binds.
 | `move-column-to-first` / `move-column-to-last` | move the focused column to the first/last position (Mod+Ctrl+Home / End) |
 | `move-window-down` / `move-window-up` | reorder within the column |
 | `move-window-to-column-left` / `move-window-to-column-right` | move the window into the neighboring column |
+| `focus-monitor-left` / `-right` / `-up` / `-down` | move focus to the adjacent monitor (Mod+Shift+arrows / HJKL) |
+| `move-column-to-monitor-left` / `-right` / `-up` / `-down` | move the focused column to the adjacent monitor (unbound; multi-monitor) |
+| `move-window-to-monitor-left` / `-right` / `-up` / `-down` | move the focused window to the adjacent monitor (unbound; multi-monitor) |
 | `consume-or-expel-window-left` / `-right` | merge into / split out of the neighboring column |
 | `set-column-width SPEC` | set focused column width (see below); bare = cycle `preset-column-widths` |
 | `switch-preset-column-width` / `-back` | cycle preset widths wider-first / narrower-first (Mod+R / Mod+Shift+R) |

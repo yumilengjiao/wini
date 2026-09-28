@@ -1168,6 +1168,57 @@ impl Layout {
                 self.monitor(device)?.active_workspace().focused_id()
         }
 
+        /// Move the focused window of `from` to the active workspace of
+        /// `to` (niri's move-window-to-monitor). Returns the moved id.
+        pub fn move_focused_window_to_monitor(
+                &mut self,
+                from: &str,
+                to: &str,
+        ) -> Option<WindowId> {
+                if from == to {
+                        return None;
+                }
+                let id = self.monitor(from)?.active_workspace().focused_id()?;
+                self.monitor_mut(from)?.remove_window(id);
+                let dst = self.monitor_mut(to)?;
+                dst.add_window(id);
+                Some(id)
+        }
+
+        /// Move the whole focused column of `from` to the active workspace
+        /// of `to` (niri's move-column-to-monitor). Returns the moved ids.
+        pub fn move_focused_column_to_monitor(
+                &mut self,
+                from: &str,
+                to: &str,
+        ) -> Option<Vec<WindowId>> {
+                if from == to {
+                        return None;
+                }
+                let src = self.monitor(from)?;
+                let ws = src.active_workspace();
+                let ids: Vec<WindowId> = ws
+                        .columns
+                        .get(ws.active_column_idx)?
+                        .tiles
+                        .iter()
+                        .map(|t| t.id)
+                        .collect();
+                if ids.is_empty() {
+                        return None;
+                }
+                let src = self.monitor_mut(from)?;
+                for &id in &ids {
+                        src.remove_window(id);
+                }
+                let dst = self.monitor_mut(to)?;
+                dst.active_workspace_mut().add_column(&ids);
+                for &id in &ids {
+                        dst.window_map.insert(id, dst.active_workspace_idx);
+                }
+                Some(ids)
+        }
+
         /// Add a window to the active workspace of a monitor.
         pub fn add_window(
                 &mut self,

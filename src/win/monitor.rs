@@ -135,7 +135,120 @@ pub fn monitor_at_cursor(monitors: &[Monitor]) -> Option<&Monitor> {
         monitors.iter().find(|m| m.handle == handle)
 }
 
+/// A compass direction for monitor navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+        Left,
+        Right,
+        Up,
+        Down,
+}
+
+/// The monitor adjacent to `current` in direction `dir`, if any.
+/// Chooses among monitors whose center lies on the correct side by the
+/// smallest center-to-center distance (niri only moves between directly
+/// adjacent outputs; nearest-center is a good Windows-side approximation).
+pub fn monitor_in_direction<'a>(
+        monitors: &'a [Monitor],
+        current: &Monitor,
+        dir: Dir,
+) -> Option<&'a Monitor> {
+        let cx = (current.full.left + current.full.right) as f64 / 2.0;
+        let cy = (current.full.top + current.full.bottom) as f64 / 2.0;
+        monitors.iter()
+                .filter(|m| m.device != current.device)
+                .filter_map(|m| {
+                        let mx = (m.full.left + m.full.right) as f64 / 2.0;
+                        let my = (m.full.top + m.full.bottom) as f64 / 2.0;
+                        let (dx, dy) = (mx - cx, my - cy);
+                        let ok = match dir {
+                                Dir::Left => dx < -1.0 && dx.abs() >= dy.abs(),
+                                Dir::Right => dx > 1.0 && dx.abs() >= dy.abs(),
+                                Dir::Up => dy < -1.0 && dy.abs() >= dx.abs(),
+                                Dir::Down => dy > 1.0 && dy.abs() >= dx.abs(),
+                        };
+                        ok.then_some((m, dx * dx + dy * dy))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(m, _)| m)
+}
+
 /// Primary monitor, if enumerated.
 pub fn primary(monitors: &[Monitor]) -> Option<&Monitor> {
         monitors.iter().find(|m| m.is_primary)
+}
+
+#[cfg(test)]
+mod tests {
+        use super::*;
+        use windows::Win32::Graphics::Gdi::HMONITOR;
+
+        fn mon(
+                device: &str,
+                l: i32,
+                t: i32,
+                r: i32,
+                b: i32,
+        ) -> Monitor {
+                Monitor {
+                        handle: HMONITOR(std::ptr::null_mut()),
+                        full: RECT {
+                                left: l,
+                                top: t,
+                                right: r,
+                                bottom: b,
+                        },
+                        work: RECT {
+                                left: l,
+                                top: t,
+                                right: r,
+                                bottom: b,
+                        },
+                        device: device.to_string(),
+                        is_primary: false,
+                }
+        }
+
+        #[test]
+        fn direction_picks_adjacent_output() {
+                // Three monitors in a row: A | B | C.
+                let a = mon("A", 0, 0, 1000, 1000);
+                let b = mon("B", 1000, 0, 2000, 1000);
+                let c = mon("C", 2000, 0, 3000, 1000);
+                let all = vec![a.clone(), b.clone(), c.clone()];
+                // From B: right = C, left = A.
+                assert_eq!(
+                        monitor_in_direction(&all, &b, Dir::Right).map(|m| m.device.as_str()),
+                        Some("C")
+                );
+                assert_eq!(
+                        monitor_in_direction(&all, &b, Dir::Left).map(|m| m.device.as_str()),
+                        Some("A")
+                );
+                // No monitor above/below.
+                assert!(monitor_in_direction(&all, &b, Dir::Up).is_none());
+                // From A: nothing to the left.
+                assert!(monitor_in_direction(&all, &a, Dir::Left).is_none());
+                // From A: right picks the NEAREST (B, not C).
+                assert_eq!(
+                        monitor_in_direction(&all, &a, Dir::Right).map(|m| m.device.as_str()),
+                        Some("B")
+                );
+        }
+
+        #[test]
+        fn direction_vertical_stack() {
+                let top = mon("T", 0, 0, 1000, 1000);
+                let bot = mon("B", 0, 1000, 1000, 2000);
+                let all = vec![top.clone(), bot.clone()];
+                assert_eq!(
+                        monitor_in_direction(&all, &top, Dir::Down).map(|m| m.device.as_str()),
+                        Some("B")
+                );
+                assert_eq!(
+                        monitor_in_direction(&all, &bot, Dir::Up).map(|m| m.device.as_str()),
+                        Some("T")
+                );
+                assert!(monitor_in_direction(&all, &top, Dir::Right).is_none());
+        }
 }
