@@ -795,6 +795,29 @@ impl Workspace {
                 true
         }
 
+        /// niri's center-column (Mod+C): center the focused column in the
+        /// view. Sets the view offset directly (sticky until the next focus
+        /// change re-runs `refresh_view_offset`).
+        pub fn center_active_column(
+                &mut self,
+                params: &crate::layout::geometry::LayoutParams,
+                view_width: f64,
+        ) -> bool {
+                if self.columns.is_empty() {
+                        return false;
+                }
+                let widths = crate::layout::geometry::column_widths(self, params, view_width);
+                let xs = crate::layout::geometry::column_xs(&widths, params.gaps);
+                let idx = self.active_column_idx;
+                self.view_offset = crate::layout::geometry::view_offset_centered(
+                        view_width,
+                        xs[idx],
+                        widths[idx],
+                );
+                self.pending_view_rebase = None;
+                true
+        }
+
         /// Toggle the focused column between maximized (fills the monitor)
         /// and normal. On Windows, "maximized" means covering the full
         /// monitor rect (including taskbar) — implemented as full-width +
@@ -1440,6 +1463,26 @@ mod tests {
                         vec![Some(A), Some(B), Some(C)]
                 );
                 assert_eq!(ws.active_column_idx, 2);
+        }
+
+        #[test]
+        fn center_active_column_sets_offset() {
+                use crate::layout::geometry::LayoutParams;
+                let params = LayoutParams {
+                        gaps: 0.0,
+                        ..LayoutParams::default()
+                };
+                let mut ws = Workspace::new();
+                // One 400px column (proportion 0.5 of a 800px view) at x=0.
+                ws.add_window(A);
+                ws.set_column_width(&SizeChange::Fixed(400.0));
+                assert!(ws.center_active_column(&params, 800.0));
+                // Centered offset = -(view - col)/2 = -(800-400)/2 = -200.
+                assert!(
+                        (ws.view_offset - (-200.0)).abs() < 0.01,
+                        "off={}",
+                        ws.view_offset
+                );
         }
 
         #[test]

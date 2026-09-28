@@ -163,6 +163,7 @@ A config-provided `binds` section **replaces** the default binds.
 | `set-window-height SPEC` | set focused window height (same SPEC syntax) |
 | `toggle-full-width` | column spans the full workspace width |
 | `maximize-column` | toggle column maximize |
+| `center-column` | center the focused column in the view (Mod+C) |
 | `toggle-windowed-fullscreen` | borderless fullscreen for one window |
 | `toggle-window-floating` | float / unfloat the focused window |
 | `toggle-overview` | zoomed-out overview of all columns |

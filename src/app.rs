@@ -1801,6 +1801,9 @@ impl AppState {
                 }
 
                 let mut changed = false;
+                // center-column sets the view offset directly; skip the
+                // post-action refresh_view_offset that would undo it.
+                let mut skip_view_refresh = false;
                 // Windowed-fullscreen bookkeeping, applied after the layout
                 // borrow ends (see below).
                 let mut fullscreen_prev: Option<isize> = None;
@@ -1892,6 +1895,11 @@ impl AppState {
                                 },
                                 ToggleFullWidth => changed = ws.toggle_full_width(),
                                 MaximizeColumn => changed = ws.toggle_maximized(),
+                                CenterColumn => {
+                                        changed =
+                                                ws.center_active_column(&layout_params, view_width);
+                                        skip_view_refresh = true;
+                                },
                                 ToggleWindowedFullscreen => {
                                         fullscreen_prev = ws.fullscreen_id;
                                         changed = ws.toggle_fullscreen();
@@ -2056,7 +2064,9 @@ impl AppState {
                                         self.reflow();
                                 }
                         } else {
-                                if let Some(id) = focused_id {
+                                if let Some(id) = focused_id
+                                        && !skip_view_refresh
+                                {
                                         self.update_focus_view(id);
                                 }
                                 self.reflow();

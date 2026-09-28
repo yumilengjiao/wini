@@ -101,6 +101,8 @@ pub enum Action {
         MoveColumnToLast,
         ToggleFullWidth,
         MaximizeColumn,
+        /// niri center-column (Mod+C): center the focused column.
+        CenterColumn,
         ToggleWindowedFullscreen,
         SetWindowHeight(String),
         FocusWorkspace(u8),
@@ -426,6 +428,7 @@ impl Default for Config {
                                 // and only matter with multiple monitors) — bind
                                 // them in your config if you use several outputs.
                                 bind("Mod+F", Action::MaximizeColumn),
+                                bind("Mod+C", Action::CenterColumn),
                                 bind("Mod+Shift+F", Action::ToggleWindowedFullscreen),
                                 // Real fullscreen: borderless, covering the whole
                                 // monitor (the F11 look), distinct from Mod+F's
@@ -1093,6 +1096,7 @@ fn parse_action(node: &KdlNode) -> Option<Action> {
                 "set-window-height" => Action::SetWindowHeight(arg.unwrap_or_default()),
                 "toggle-full-width" => Action::ToggleFullWidth,
                 "maximize-column" => Action::MaximizeColumn,
+                "center-column" => Action::CenterColumn,
                 "toggle-windowed-fullscreen" => Action::ToggleWindowedFullscreen,
                 "toggle-window-floating" => Action::ToggleWindowFloating,
                 "toggle-overview" => Action::ToggleOverview,
