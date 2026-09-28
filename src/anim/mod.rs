@@ -401,11 +401,6 @@ pub struct AnimatedRect {
         pub y: Val,
         pub w: Val,
         pub h: Val,
-        /// False when the rect's target changed but the final (at-rest)
-        /// geometry has not been pushed to the window yet. Guarantees
-        /// every `set_target` results in at least one `SetWindowPos`, even
-        /// when the animation snaps or finishes between ticks.
-        at_rest_pushed: bool,
 }
 
 impl AnimatedRect {
@@ -422,7 +417,6 @@ impl AnimatedRect {
                         y: Val::to(y, movement),
                         w: Val::to(w, resize),
                         h: Val::to(h, resize),
-                        at_rest_pushed: false,
                 }
         }
 
@@ -439,7 +433,6 @@ impl AnimatedRect {
                 self.y.retarget(y, movement);
                 self.w.retarget(w, resize);
                 self.h.retarget(h, resize);
-                self.at_rest_pushed = false;
         }
 
         pub fn finished(&self) -> bool {
@@ -454,143 +447,6 @@ impl AnimatedRect {
                         self.w.value().round().max(1.0) as i32,
                         self.h.value().round().max(1.0) as i32,
                 )
-        }
-
-        /// The target rect (no animation applied).
-        pub fn targets(&self) -> (f64, f64, f64, f64) {
-                (
-                        self.x.target(),
-                        self.y.target(),
-                        self.w.target(),
-                        self.h.target(),
-                )
-        }
-}
-
-/// Tracks all window animations and ticks them.
-#[derive(Debug, Default)]
-pub struct Animator {
-        /// Per-window animated rect, keyed by window id.
-        rects: std::collections::HashMap<isize, AnimatedRect>,
-        movement: AnimParams,
-        resize: AnimParams,
-}
-
-impl Animator {
-        pub fn new(
-                movement: AnimParams,
-                resize: AnimParams,
-        ) -> Self {
-                Animator {
-                        rects: std::collections::HashMap::new(),
-                        movement,
-                        resize,
-                }
-        }
-
-        /// Set/retarget a window's target rect.
-        pub fn set_target(
-                &mut self,
-                id: isize,
-                x: f64,
-                y: f64,
-                w: f64,
-                h: f64,
-        ) {
-                match self.rects.get_mut(&id) {
-                        Some(r) => r.retarget(x, y, w, h, self.movement, self.resize),
-                        None => {
-                                self.rects.insert(
-                                        id,
-                                        AnimatedRect::new(x, y, w, h, self.movement, self.resize),
-                                );
-                        },
-                }
-        }
-
-        /// Drop animation state for a window.
-        pub fn remove(
-                &mut self,
-                id: isize,
-        ) {
-                self.rects.remove(&id);
-        }
-
-        /// Replace the animation parameters (config hot reload). Applies
-        /// to animations started afterwards; in-flight ones keep their
-        /// original parameters.
-        pub fn set_params(
-                &mut self,
-                movement: AnimParams,
-                resize: AnimParams,
-        ) {
-                self.movement = movement;
-                self.resize = resize;
-        }
-
-        /// The rect this window should be at *right now* while its
-        /// animation is in flight — i.e. what `tick` last sent for it.
-        /// None when the window is at rest (or untracked); callers then
-        /// query the HWND's actual position instead.
-        ///
-        /// The focus ring needs this: window moves go out with
-        /// `SWP_ASYNCWINDOWPOS`, so immediately after a tick the HWND's
-        /// real rect is still the *previous* frame's position — reading it
-        /// would make the ring trail the window it outlines.
-        pub fn in_flight_value(
-                &self,
-                id: isize,
-        ) -> Option<(i32, i32, i32, i32)> {
-                match self.rects.get(&id) {
-                        Some(r) if !r.finished() => Some(r.value()),
-                        _ => None,
-                }
-        }
-
-        #[allow(dead_code)] // kept as API; tests and future callers use it
-        pub fn is_animating(&self) -> bool {
-                self.rects.values().any(|r| !r.finished())
-        }
-
-        /// Sample all animations. Returns (id, rect) pairs that need a
-        /// `SetWindowPos` this frame: in-flight ones every frame, and
-        /// at-rest ones exactly once after their target changed (the final
-        /// frame — without it a window would stop one frame short of its
-        /// target, or not move at all when the change snapped).
-        pub fn tick(&mut self) -> Vec<(isize, i32, i32, i32, i32)> {
-                let mut out = Vec::new();
-                for (id, r) in self.rects.iter_mut() {
-                        if r.finished() {
-                                if !r.at_rest_pushed {
-                                        let (x, y, w, h) = r.value();
-                                        out.push((*id, x, y, w, h));
-                                        r.at_rest_pushed = true;
-                                }
-                        } else {
-                                let (x, y, w, h) = r.value();
-                                out.push((*id, x, y, w, h));
-                        }
-                }
-                out
-        }
-
-        /// Snap every in-flight animation to its target and drop it,
-        /// returning the final rects. Used when management is suspended
-        /// (do-screen-transition): nothing should keep moving mid-pause.
-        pub fn finish_all(&mut self) -> Vec<(isize, i32, i32, i32, i32)> {
-                self.rects
-                        .drain()
-                        .map(|(id, r)| {
-                                let (x, y, w, h) = r.targets();
-                                (
-                                        id,
-                                        x.round() as i32,
-                                        y.round() as i32,
-                                        w.round().max(1.0) as i32,
-                                        h.round().max(1.0) as i32,
-                                )
-                        })
-                        .collect()
         }
 }
 
@@ -700,24 +556,6 @@ mod tests {
         }
 
         #[test]
-        fn animator_ticks_and_final_frame() {
-                let mut a = Animator::new(fast_params(), fast_params());
-                a.set_target(1, 0.0, 0.0, 100.0, 100.0);
-                assert!(a.is_animating());
-                std::thread::sleep(Duration::from_millis(10));
-                // After finish: the final frame is still delivered once...
-                let ticks = a.tick();
-                assert_eq!(ticks, vec![(1, 0, 0, 100, 100)]);
-                assert!(!a.is_animating());
-                // ...and only once.
-                assert!(a.tick().is_empty());
-                // A snapped retarget (target == current) still pushes once.
-                a.set_target(1, 0.0, 0.0, 100.0, 100.0);
-                assert_eq!(a.tick(), vec![(1, 0, 0, 100, 100)]);
-                assert!(a.tick().is_empty());
-        }
-
-        #[test]
         fn animated_rect_values() {
                 let mut r = AnimatedRect::new(0.0, 0.0, 100.0, 100.0, fast_params(), fast_params());
                 assert_eq!(r.value(), (0, 0, 100, 100));
@@ -725,27 +563,6 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
                 assert_eq!(r.value(), (10, 20, 30, 40));
                 assert!(r.finished());
-        }
-
-        #[test]
-        fn finish_all_snaps_to_targets() {
-                let mut a = Animator::new(
-                        AnimParams {
-                                kind: AnimKind::Easing {
-                                        duration: Duration::from_millis(10_000), // never finishes
-                                        curve: Curve::Linear,
-                                },
-                                slowdown: 1.0,
-                        },
-                        easing_params(),
-                );
-                a.set_target(7, 0.0, 0.0, 100.0, 100.0);
-                a.set_target(7, 50.0, 60.0, 70.0, 80.0);
-                assert!(a.is_animating());
-                let finals = a.finish_all();
-                assert_eq!(finals, vec![(7, 50, 60, 70, 80)]);
-                assert!(!a.is_animating());
-                assert!(a.finish_all().is_empty());
         }
 
         #[test]

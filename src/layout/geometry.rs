@@ -414,6 +414,62 @@ pub fn compute_workspace_geometry(
         out
 }
 
+/// The settled (clamped) view position for a workspace: the column-space
+/// x that should sit at the view's left edge. This is the *target* the
+/// animated horizontal scroll springs toward.
+pub fn target_view_pos(
+        ws: &Workspace,
+        params: &LayoutParams,
+        view_width: f64,
+) -> f64 {
+        let view_width = view_width.max(1.0);
+        let widths = column_widths(ws, params, view_width);
+        let xs = column_xs(&widths, params.gaps);
+        clamp_view_pos(view_pos(ws, &xs), &xs, &widths, view_width, params.gaps)
+}
+
+/// Tile rectangles in COLUMN SPACE: `x` is the column's column-space x
+/// (independent of the view scroll) and `y` is relative to the work
+/// area top. The unified transport composes screen coordinates as
+/// `area.left + x - view_pos` and `area.top + y + workspace_switch_dy`,
+/// so the horizontal scroll, the per-tile move/resize and the workspace
+/// switch each animate as an independent value (niri's model). Maximized
+/// columns fill the work area width/height like `compute_workspace_geometry`.
+pub fn workspace_colspace_rects(
+        ws: &Workspace,
+        params: &LayoutParams,
+        area: (f64, f64, f64, f64),
+) -> Vec<TileRect> {
+        let (_, _, aw, ah) = area;
+        let view_width = aw.max(1.0);
+        let view_height = ah.max(1.0);
+        let widths = column_widths(ws, params, view_width);
+        let xs = column_xs(&widths, params.gaps);
+        let mut out = Vec::new();
+        for (ci, col) in ws.columns.iter().enumerate() {
+                let (col_w, col_h) = if col.is_maximized {
+                        (aw, ah)
+                } else {
+                        (widths[ci], view_height)
+                };
+                let heights = if col.is_maximized {
+                        vec![(0.0, col_h)]
+                } else {
+                        tile_heights(ws, ci, params, col_h)
+                };
+                for (tile, &(y, h)) in col.tiles.iter().zip(heights.iter()) {
+                        out.push(TileRect {
+                                id: tile.id,
+                                x: xs[ci].round() as i32,
+                                y: y.round() as i32,
+                                w: col_w.round().max(1.0) as i32,
+                                h: h.round().max(1.0) as i32,
+                        });
+                }
+        }
+        out
+}
+
 #[cfg(test)]
 mod tests {
         use super::super::{DirH, Workspace};

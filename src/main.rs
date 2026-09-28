@@ -11,6 +11,7 @@ mod config;
 mod input;
 mod layout;
 mod logging;
+mod transport;
 mod win;
 
 use std::process::ExitCode;
