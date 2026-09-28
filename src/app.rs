@@ -166,14 +166,13 @@ struct ViewShift {
 /// gap — `workspace_size_with_gap`).
 ///
 /// These rects are THUMBNAIL rects, not real-window rects: while the
-/// overview is open the real windows keep their settled tile sizes
-/// but park one virtual-screen width to the right (off every monitor),
-/// so the transparent backdrop (see `win::thumbnail`) shows the bare
-/// desktop between the DWM live thumbnails drawn at the scaled rects.
-/// This sidesteps app minimum sizes (real windows refused to shrink
-/// → overlaps), per-frame app reflow (flicker), and the close
-/// handover (windows return to their tiles — exactly where the zoom-1
-/// thumbnails ended — before the backdrop drops).
+/// overview is open the real windows stay at their settled tile sizes
+/// and positions. An opaque host (see `win::thumbnail`) covers the work
+/// area on top of them and draws DWM live thumbnails at the scaled
+/// rects, with a desktop thumbnail as the backdrop. This sidesteps app
+/// minimum sizes (real windows refused to shrink → overlaps), per-frame
+/// app reflow (flicker), and the close handover (the host simply drops,
+/// revealing the windows exactly where they always were).
 #[derive(Debug, Clone)]
 struct Overview {
         /// Open/close progress (0 = closed, 1 = fully open).
@@ -184,8 +183,8 @@ struct Overview {
         /// workspace, exactly like the slide's finals. Refreshed by
         /// `refresh_overview` whenever the layout changes while open.
         finals: Vec<(usize, Vec<crate::layout::geometry::TileRect>)>,
-        /// The monitor's FULL rect (left, top, w, h) — the overview
-        /// canvas, like niri's view_size (bars float above it).
+        /// The monitor's WORK-AREA rect (left, top, w, h) — the overview
+        /// canvas. The native taskbar/sidebar stays outside it.
         full: (f64, f64, f64, f64),
         /// Zoom at progress = 1 (niri's overview.zoom, default 0.35).
         zoom_target: f64,
@@ -197,20 +196,18 @@ struct Overview {
         /// Rendering then applies niri's `workspace_render_idx` correction
         /// so the zoom+slide composite is monotonic.
         sync_from_progress: Option<f64>,
-        /// Horizontal shift applied to the real participant windows while
-        /// the overview is open: they park right of the whole virtual
-        /// screen (covers the leftmost settled tile, whose x can be very
-        /// negative) so the transparent backdrop shows the bare desktop
-        /// between the thumbnails. DWM thumbnails keep rendering
-        /// off-screen windows. 0 in tests (no shifting).
-        offscreen_shift: i32,
 }
 
 impl Overview {
-        /// Current zoom (niri clamps the configured zoom to a sane range
-        /// and never lets the divisor reach 0).
+        /// Current zoom. Clamped to `[zoom_target, 1.0]`: a spring can
+        /// overshoot its target, and a `progress` below 0 (on close) would
+        /// give a zoom > 1, i.e. thumbnails LARGER than the real window —
+        /// the visible "windows briefly maximize before shrinking back"
+        /// glitch. The upper clamp at 1.0 removes it while keeping the
+        /// motion continuous (the spring settles exactly at the bound).
         fn zoom(&self) -> f64 {
-                (1.0 - self.progress.value() * (1.0 - self.zoom_target)).max(0.0001)
+                (1.0 - self.progress.value() * (1.0 - self.zoom_target))
+                        .clamp(self.zoom_target, 1.0)
         }
 
         /// Whether the overview is (animating) open or closing.
@@ -304,32 +301,6 @@ impl Overview {
                         && self.camera.finished()
                         && self.view_shift.as_ref().is_none_or(|s| s.offset.finished())
         }
-
-        /// The participant rects shifted off-screen (where the real
-        /// windows park while the overview is open).
-        fn shifted(
-                &self,
-                rects: &[crate::layout::geometry::TileRect],
-        ) -> Vec<crate::layout::geometry::TileRect> {
-                rects.iter()
-                        .map(|r| crate::layout::geometry::TileRect {
-                                id: r.id,
-                                x: r.x + self.offscreen_shift,
-                                y: r.y,
-                                w: r.w,
-                                h: r.h,
-                        })
-                        .collect()
-        }
-}
-
-/// Leftmost settled x across all participant rects (tiles sit at
-/// very negative x when the view is scrolled right).
-fn ov_min_x(finals: &[(usize, Vec<geometry::TileRect>)]) -> i32 {
-        finals.iter()
-                .flat_map(|(_, rs)| rs.iter().map(|r| r.x))
-                .min()
-                .unwrap_or(0)
 }
 
 /// Current view position (column-space x at the content-area's left
@@ -760,11 +731,14 @@ impl AppState {
                 }
 
                 let params = self.params.clone();
+                // Use the Windows work area as the overview canvas. The
+                // native taskbar/sidebar remains outside the host and is never
+                // covered by the overview animation.
                 let full = (
-                        mon.full.left as f64,
-                        mon.full.top as f64,
-                        (mon.full.right - mon.full.left) as f64,
-                        (mon.full.bottom - mon.full.top) as f64,
+                        mon.work.left as f64,
+                        mon.work.top as f64,
+                        (mon.work.right - mon.work.left) as f64,
+                        (mon.work.bottom - mon.work.top) as f64,
                 );
                 let area = (
                         mon.work.left as f64,
@@ -787,18 +761,6 @@ impl AppState {
 
                 // Niri clamps the configured zoom to a sane range.
                 let zoom_target = self.config.overview.zoom.clamp(0.0001, 0.75);
-                // Participants park right of the whole virtual screen for the
-                // duration of the overview. The settled tiles can sit at very
-                // negative x (columns scrolled off the left edge), so the
-                // shift must cover the leftmost tile as well:
-                //   parked_x = settled_x + shift >= virtual_right + 256.
-                let min_x = ov_min_x(&finals);
-                let offscreen_shift = unsafe {
-                        use windows::Win32::UI::WindowsAndMessaging::{
-                                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-                        };
-                        GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN)
-                } + 256 - min_x;
                 let ov = Overview {
                         progress,
                         camera,
@@ -807,28 +769,56 @@ impl AppState {
                         zoom_target,
                         view_shift: None,
                         sync_from_progress: None,
-                        offscreen_shift,
                 };
-                // Backdrop host covering the full monitor. Every participant
-                // becomes visible (windows of inactive workspaces are
-                // normally hidden; hidden windows render blank thumbnails) —
-                // they sit behind the backdrop, invisible. Real windows do
-                // NOT move: the first thumbnail frame is at zoom 1, exactly
-                // their current rects.
+                // Floating windows would sit full-size over the transparent
+                // backdrop. Hide them BEFORE creating the host: OverviewHost
+                // is shown by its constructor, and a colorkey backdrop cannot
+                // conceal a float while it is being hidden.
+                let float_ids: Vec<isize> = self
+                        .floating
+                        .iter()
+                        .filter(|(_, fs)| fs.device == device)
+                        .map(|(id, _)| *id)
+                        .collect();
+                for &id in &float_ids {
+                        let hwnd = HWND(id as *mut _);
+                        // Register BEFORE hiding (hook race).
+                        self.hidden_by_us.insert(id);
+                        if crate::win::api::is_alive(hwnd) {
+                                placement::set_shown(hwnd, false);
+                        }
+                        self.animator.remove(id);
+                }
+
+                // The opaque host covers only the work area, leaving the
+                // native taskbar/sidebar visible. Source HWNDs stay at their
+                // settled geometry and cannot leak through the host.
                 let Some(mut host) = crate::win::thumbnail::OverviewHost::new((
-                        mon.full.left,
-                        mon.full.top,
-                        mon.full.right,
-                        mon.full.bottom,
+                        mon.work.left,
+                        mon.work.top,
+                        mon.work.right,
+                        mon.work.bottom,
                 )) else {
+                        // The float hide above is only an implementation
+                        // detail of a successful overview. Undo it if the
+                        // host cannot be created.
+                        for id in &float_ids {
+                                self.hidden_by_us.remove(id);
+                                let hwnd = HWND(*id as *mut _);
+                                if crate::win::api::is_alive(hwnd) {
+                                        placement::set_shown(hwnd, true);
+                                }
+                        }
                         log::warn!("overview[{device}]: no backdrop host; not opening");
                         return;
                 };
-                for r in ov.finals.iter().flat_map(|(_, rs)| rs.iter()) {
-                        let hwnd = HWND(r.id as *mut _);
-                        self.hidden_by_us.remove(&r.id);
-                        if crate::win::api::is_alive(hwnd) {
-                                placement::set_shown(hwnd, true);
+                for (_, rs) in &ov.finals {
+                        for r in rs {
+                                let hwnd = HWND(r.id as *mut _);
+                                self.hidden_by_us.remove(&r.id);
+                                if crate::win::api::is_alive(hwnd) {
+                                        placement::set_shown(hwnd, true);
+                                }
                         }
                 }
                 let sources: Vec<isize> = ov
@@ -839,34 +829,27 @@ impl AppState {
                 host.sync_sources(&sources);
                 host.update_rects(&ov.current_rects(), ov.thumb_inset());
                 host.raise();
-                // Only NOW move the real windows off-screen: the first
-                // thumbnail frame (zoom ~1) covers their tiles exactly, so
-                // the swap from real window to thumbnail is seamless.
-                // Synchronous, so nothing is drawn half-shifted.
-                let parked: Vec<crate::layout::geometry::TileRect> = ov
-                        .finals
-                        .iter()
-                        .flat_map(|(_, rs)| rs.iter().cloned())
-                        .collect();
-                placement::apply_geometry_sync(&ov.shifted(&parked));
-                // Floats would sit full-size over the backdrop; hide them for
-                // the duration (reflow brings them back once the overview
-                // state is gone).
-                let float_ids: Vec<isize> = self
-                        .floating
-                        .iter()
-                        .filter(|(_, fs)| fs.device == device)
-                        .map(|(id, _)| *id)
-                        .collect();
-                for id in float_ids {
-                        let hwnd = HWND(id as *mut _);
-                        // Register BEFORE hiding (hook race).
-                        self.hidden_by_us.insert(id);
-                        if crate::win::api::is_alive(hwnd) {
-                                placement::set_shown(hwnd, false);
-                        }
-                        self.animator.remove(id);
+                // Source windows remain at their settled geometry. Drop any
+                // stale layout animation; otherwise an old resize could still
+                // land while the host is opening and make the first frames
+                // look like a maximize-then-shrink transition.
+                for r in ov.finals.iter().flat_map(|(_, rs)| rs) {
+                        self.animator.remove(r.id);
                 }
+                // All participants can now be visible: the opaque host hides
+                // the real HWNDs while the DWM thumbnails are animated.
+                for (_, rs) in &ov.finals {
+                        for r in rs {
+                                let hwnd = HWND(r.id as *mut _);
+                                self.hidden_by_us.remove(&r.id);
+                                if crate::win::api::is_alive(hwnd) {
+                                        placement::set_shown(hwnd, true);
+                                }
+                        }
+                }
+                // A just-shown source may need one property refresh before DWM
+                // paints its first live thumbnail.
+                host.update_rects(&ov.current_rects(), ov.thumb_inset());
                 placement::raise_bars(&self.monitors);
                 log::debug!(
                         "overview[{device}]: opening ({} workspaces)",
@@ -1183,15 +1166,14 @@ impl AppState {
                 self.close_overview_to(&device, Some(ws_idx));
         }
 
-        /// Push the current open-overview monitor rects to the mouse
-        /// hook, which intercepts+swallows button presses inside them
-        /// (the colorkey backdrop is transparent to hit-testing).
+        /// Push the current open-overview work-area rects to the mouse
+        /// hook, which intercepts+swallows button presses inside them.
         fn sync_overview_regions(&self) {
                 let rects: Vec<(i32, i32, i32, i32)> = self
                         .overviews
                         .keys()
                         .filter_map(|d| self.monitors.iter().find(|m| &m.device == d))
-                        .map(|m| (m.full.left, m.full.top, m.full.right, m.full.bottom))
+                        .map(|m| (m.work.left, m.work.top, m.work.right, m.work.bottom))
                         .collect();
                 crate::input::mouse::set_overview_regions(rects);
         }
@@ -1266,9 +1248,9 @@ impl AppState {
                         return;
                 };
                 ov.finals = finals;
-                // Real windows: parked off-screen at their (shifted) settled
-                // tiles. Cancel any in-flight springs for them first so a
-                // stale animated rect can't land on top of this placement.
+                // Real windows stay at their settled geometry. Cancel any
+                // in-flight springs so a stale layout frame cannot resize a
+                // source while the opaque host is showing its thumbnail.
                 let settled: Vec<geometry::TileRect> = ov
                         .finals
                         .iter()
@@ -1282,7 +1264,6 @@ impl AppState {
                         }
                         self.animator.remove(r.id);
                 }
-                placement::apply_geometry(&ov.shifted(&settled));
                 // Thumbnails: reconcile the source set, then one frame at
                 // the current zoom/camera.
                 let sources: Vec<isize> = settled.iter().map(|r| r.id).collect();
@@ -2630,6 +2611,18 @@ impl AppState {
                         finals,
                         stride,
                 };
+                // A normal reflow animates the same HWNDs through
+                // `Animator`. Once a workspace slide takes ownership, no
+                // previously queued animator target may be allowed to land
+                // after the slide's synchronous first frame; that stale move
+                // is precisely a one-frame flash of the old tiled position.
+                for id in slide
+                        .finals
+                        .iter()
+                        .flat_map(|(_, rs)| rs.iter().map(|r| r.id))
+                {
+                        self.animator.remove(id);
+                }
                 placement::apply_geometry_sync(&slide.rects_at(cam_from));
 
                 // Show every participant; hide everything else on this
@@ -3413,7 +3406,6 @@ mod tests {
                         zoom_target: 0.35,
                         view_shift: None,
                         sync_from_progress: None,
-                        offscreen_shift: 0,
                 }
         }
 

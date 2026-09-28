@@ -1,35 +1,36 @@
-//! Overview host window: a transparent backdrop covering one monitor,
-//! carrying DWM live thumbnails of the (unmoved) real windows.
+//! Overview host window: an opaque backdrop covering one monitor's work
+//! area, carrying DWM live thumbnails of the (unmoved) real windows.
 //!
-//! The real windows keep their settled tile sizes and park one
-//! virtual-screen width to the right (off every monitor) while the
-//! overview is open — the transparent backdrop shows the bare
-//! desktop between the scaled DWM thumbnails of them. (Cross-process
-//! DWMWA_CLOAK is access-denied and SW_HIDE blanks the thumbnails;
-//! parking off-screen is the only approach that keeps live
-//! thumbnails AND clears the real windows from the desktop.) This
-//! avoids the three fatal problems of resizing real windows: apps
-//! have minimum sizes (overlap), apps reflow their content at every
-//! intermediate size (flicker), and real-window geometry churn races
-//! the layout.
+//! The real windows stay exactly at their settled tile geometry. The
+//! host sits on top of them (topmost, opaque) and renders:
+//!   - an opaque dark backdrop (the window class brush), so the space
+//!     between window thumbnails is a clean dimmed surface — niri dims
+//!     the overview background the same way;
+//!   - one DWM thumbnail per participant window, animated to the scaled
+//!     overview rects.
 //!
-//! - Backdrop: a `WS_POPUP` + `WS_EX_LAYERED` window painted with a
-//!   transparency color key (`SetLayeredWindowAttributes`,
-//!   `LWA_COLORKEY`) so the desktop wallpaper shows through; only the
-//!   DWM thumbnails (opaque window content) are visible.
-//!   `WS_EX_NOACTIVATE` + `WS_EX_TOOLWINDOW` so clicking it never
-//!   steals keyboard focus from the focused window behind it.
+//! Because the host is opaque and above every source window, no real
+//! window can ever leak through — this replaces the previous approach
+//! of parking windows off-screen behind a colorkey-transparent backdrop,
+//! which left a full-size duplicate visible whenever Windows denied our
+//! z-order raise. Not moving the windows also avoids apps' minimum-size
+//! clamping, per-frame content reflow, and geometry churn racing the
+//! layout.
+//!
+//! - Host: `WS_POPUP` + `WS_EX_LAYERED` (LWA_ALPHA 255 = fully opaque),
+//!   `WS_EX_TOPMOST` so it stays above the source windows, plus
+//!   `WS_EX_NOACTIVATE` + `WS_EX_TOOLWINDOW` so clicking it never steals
+//!   keyboard focus. It covers the work area only, leaving the native
+//!   taskbar/sidebar visible.
 //! - Thumbnails: `DwmRegisterThumbnail` per participant, destination
 //!   rects updated every animation frame (DWM composites them; no
 //!   per-frame app work).
-//! - Input: the colorkey window is fully transparent to hit-testing,
-//!   so button presses are intercepted one level lower, in the
+//! - Input: button presses inside the host area are intercepted in the
 //!   low-level mouse hook (see `input::mouse::set_overview_regions`),
 //!   which hit-tests them against the current thumbnail rects.
-//! - Z order: the host lives in the normal band, re-raised above the
-//!   real windows (which raise themselves on focus changes) but below
-//!   the desktop bars (`raise_bars` runs after every host raise) and
-//!   below our topmost focus ring.
+//! - Z order: the host is topmost while open. `raise_bars` runs after
+//!   each host raise so the desktop bars stay above it, and the focus
+//!   ring (also topmost) is raised last.
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
@@ -42,8 +43,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GW_HWNDPREV, GWL_EXSTYLE,
-        GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowThreadProcessId, HWND_TOP,
-        LWA_COLORKEY, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+        GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowThreadProcessId, HWND_TOPMOST,
+        LWA_ALPHA, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
         SWP_NOOWNERZORDER, SWP_NOSIZE, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
         WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
         WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -52,11 +53,9 @@ use windows::core::w;
 
 use crate::layout::geometry::TileRect;
 
-/// Transparency color key of the backdrop (COLORREF 0x00BBGGRR).
-/// Magenta: symmetric in RGB/BGR and essentially never present in
-/// real window content — every pixel painted in it composites fully
-/// transparent, so the desktop shows through around the thumbnails.
-const COLORKEY: u32 = 0x00FF_00FF;
+/// Opaque dark backdrop color (COLORREF 0x00BBGGRR): a dimmed surface
+/// shown between the window thumbnails, matching niri's overview.
+const BACKDROP: u32 = 0x0018_1818;
 
 /// One monitor's overview: backdrop window + thumbnail set.
 pub struct OverviewHost {
@@ -82,20 +81,21 @@ impl OverviewHost {
                                 lpfnWndProc: Some(wnd_proc),
                                 hInstance: hinstance.into(),
                                 lpszClassName: class_name,
-                                // Solid backdrop: the class brush paints it without
-                                // WM_PAINT flicker.
+                                // Opaque dark backdrop painted by the class brush.
                                 hbrBackground: backdrop_brush(),
                                 ..Default::default()
                         };
                         let _ = RegisterClassW(&wc);
 
-                        // WS_EX_LAYERED + LWA_COLORKEY: the colorkey-painted
-                        // client area composites fully transparent (desktop
-                        // visible), the DWM thumbnails stay opaque. No
-                        // WS_EX_TOPMOST (the focus ring must stay above).
+                        // This host is opaque: transparent colorkey pixels let
+                        // a source HWND show through when Windows denies a z-order
+                        // raise, which appeared as a duplicate full-size window.
                         let hwnd = CreateWindowExW(
                                 WINDOW_EX_STYLE(
-                                        WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0 | WS_EX_LAYERED.0,
+                                        WS_EX_NOACTIVATE.0
+                                                | WS_EX_TOOLWINDOW.0
+                                                | WS_EX_LAYERED.0
+                                                | WS_EX_TOPMOST.0,
                                 ),
                                 class_name,
                                 w!(""),
@@ -112,9 +112,9 @@ impl OverviewHost {
                         .ok()?;
                         let _ = SetLayeredWindowAttributes(
                                 hwnd,
-                                windows::Win32::Foundation::COLORREF(COLORKEY),
-                                0,
-                                LWA_COLORKEY,
+                                windows::Win32::Foundation::COLORREF(0),
+                                255,
+                                LWA_ALPHA,
                         );
                         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                         Some(OverviewHost {
@@ -164,7 +164,7 @@ impl OverviewHost {
                         }
                         let _ = SetWindowPos(
                                 self.hwnd,
-                                Some(HWND_TOP),
+                                Some(HWND_TOPMOST),
                                 0,
                                 0,
                                 0,
@@ -185,7 +185,7 @@ impl OverviewHost {
                                 let _ = AttachThreadInput(me, fg_thread, true);
                                 let _ = SetWindowPos(
                                         self.hwnd,
-                                        Some(HWND_TOP),
+                                        Some(HWND_TOPMOST),
                                         0,
                                         0,
                                         0,
@@ -322,10 +322,9 @@ impl Drop for OverviewHost {
 }
 
 /// Backdrop brush for the window class (leaked: one per process).
-/// Paints the transparency color key: with `LWA_COLORKEY` every such
-/// pixel composites fully transparent.
+/// Paints the opaque dark overview backdrop.
 fn backdrop_brush() -> HBRUSH {
-        unsafe { CreateSolidBrush(windows::Win32::Foundation::COLORREF(COLORKEY)) }
+        unsafe { CreateSolidBrush(windows::Win32::Foundation::COLORREF(BACKDROP)) }
 }
 
 extern "system" fn wnd_proc(
