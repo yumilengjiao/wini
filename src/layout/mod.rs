@@ -912,6 +912,9 @@ pub struct MonitorLayout {
         pub device: String,
         pub workspaces: Vec<Workspace>,
         pub active_workspace_idx: usize,
+        /// The workspace that was active before the current one (niri's
+        /// focus-workspace-previous target). None until the first switch.
+        pub previous_workspace_idx: Option<usize>,
         /// Fast lookup: window -> owning workspace index.
         window_map: HashMap<WindowId, usize>,
 }
@@ -922,6 +925,7 @@ impl MonitorLayout {
                         device,
                         workspaces: vec![Workspace::new()],
                         active_workspace_idx: 0,
+                        previous_workspace_idx: None,
                         window_map: HashMap::new(),
                 }
         }
@@ -996,6 +1000,7 @@ impl MonitorLayout {
                         return false;
                 }
                 self.ensure_workspaces(idx + 1);
+                self.previous_workspace_idx = Some(self.active_workspace_idx);
                 self.active_workspace_idx = idx;
                 true
         }
@@ -1016,6 +1021,7 @@ impl MonitorLayout {
                 self.workspaces[idx].add_window(id);
                 self.window_map.insert(id, idx);
                 if focus {
+                        self.previous_workspace_idx = Some(self.active_workspace_idx);
                         self.active_workspace_idx = idx;
                 }
                 Some(id)
@@ -1049,6 +1055,7 @@ impl MonitorLayout {
                 }
                 self.workspaces[idx].add_column(&ids);
                 if focus {
+                        self.previous_workspace_idx = Some(self.active_workspace_idx);
                         self.active_workspace_idx = idx;
                 }
                 Some(ids)
@@ -1388,6 +1395,21 @@ mod tests {
                 assert_eq!(ml.active_workspace_idx, 2, "focus=false keeps workspace");
                 assert_eq!(ml.workspace_of(C), Some(0));
                 assert_eq!(ml.workspaces[0].columns.len(), 2, "A + C's column");
+        }
+
+        #[test]
+        fn previous_workspace_tracks_switch() {
+                let mut ml = MonitorLayout::new("D".into());
+                assert_eq!(ml.previous_workspace_idx, None);
+                assert!(ml.switch_workspace(2)); // 0 -> 2
+                assert_eq!(ml.previous_workspace_idx, Some(0));
+                assert!(ml.switch_workspace(1)); // 2 -> 1
+                assert_eq!(ml.previous_workspace_idx, Some(2));
+                // focus-workspace-previous target is the recorded one.
+                let target = ml.previous_workspace_idx.unwrap();
+                assert!(ml.switch_workspace(target)); // 1 -> 2
+                assert_eq!(ml.active_workspace_idx, 2);
+                assert_eq!(ml.previous_workspace_idx, Some(1));
         }
 
         #[test]

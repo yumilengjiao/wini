@@ -163,8 +163,12 @@ A config-provided `binds` section **replaces** the default binds.
 | `toggle-overview` | zoomed-out overview of all columns |
 | `do-screen-transition` | cover the screen ~1s while management pauses (screenshot workflows) |
 | `focus-workspace N` | switch to workspace N |
+| `focus-workspace-down` / `-up` | switch to the next / previous workspace (Mod+U / Mod+I) |
+| `focus-workspace-previous` | toggle between the current and last workspace |
 | `move-window-to-workspace N` | move the focused window |
+| `move-window-to-workspace-down` / `-up` | move the focused window one workspace down / up |
 | `move-column-to-workspace N` | move the focused column |
+| `move-column-to-workspace-down` / `-up` | move the focused column one workspace down / up (Mod+Ctrl+U / I) |
 
 **Width/height `SPEC`:** `"+100"` / `"-100"` adjust by a delta, `"800"`
 sets fixed pixels, `"50%"` scales by a proportion. (Quotes are only

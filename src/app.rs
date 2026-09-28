@@ -1801,6 +1801,33 @@ impl AppState {
                                                 ws_prev = Some(prev);
                                         }
                                 },
+                                FocusWorkspaceDown | FocusWorkspaceUp => {
+                                        let prev = monitor_layout.active_workspace_idx;
+                                        let last =
+                                                monitor_layout.workspaces.len().saturating_sub(1);
+                                        let idx = if matches!(action, FocusWorkspaceDown) {
+                                                (prev + 1).min(last)
+                                        } else {
+                                                prev.saturating_sub(1)
+                                        };
+                                        changed = monitor_layout.switch_workspace(idx);
+                                        if changed {
+                                                ws_switch = Some(idx);
+                                                ws_prev = Some(prev);
+                                        }
+                                },
+                                FocusWorkspacePrevious => {
+                                        let prev = monitor_layout.active_workspace_idx;
+                                        if let Some(target) = monitor_layout.previous_workspace_idx
+                                                && target != prev
+                                        {
+                                                changed = monitor_layout.switch_workspace(target);
+                                                if changed {
+                                                        ws_switch = Some(target);
+                                                        ws_prev = Some(prev);
+                                                }
+                                        }
+                                },
                                 MoveWindowToWorkspace(n) => {
                                         let idx = n.saturating_sub(1) as usize;
                                         let prev = monitor_layout.active_workspace_idx;
@@ -1812,12 +1839,52 @@ impl AppState {
                                                 ws_prev = Some(prev);
                                         }
                                 },
+                                MoveWindowToWorkspaceDown | MoveWindowToWorkspaceUp => {
+                                        let prev = monitor_layout.active_workspace_idx;
+                                        let idx = if matches!(action, MoveWindowToWorkspaceDown) {
+                                                prev + 1
+                                        } else {
+                                                prev.saturating_sub(1)
+                                        };
+                                        // Down past the end grows a new workspace; up at
+                                        // the top is a no-op.
+                                        if idx != prev
+                                                || matches!(action, MoveWindowToWorkspaceDown)
+                                        {
+                                                changed = monitor_layout
+                                                        .move_focused_window_to_workspace(idx, true)
+                                                        .is_some();
+                                        }
+                                        if changed {
+                                                ws_switch = Some(idx);
+                                                ws_prev = Some(prev);
+                                        }
+                                },
                                 MoveColumnToWorkspace(n) => {
                                         let idx = n.saturating_sub(1) as usize;
                                         let prev = monitor_layout.active_workspace_idx;
                                         changed = monitor_layout
                                                 .move_focused_column_to_workspace(idx, true)
                                                 .is_some();
+                                        if changed {
+                                                ws_switch = Some(idx);
+                                                ws_prev = Some(prev);
+                                        }
+                                },
+                                MoveColumnToWorkspaceDown | MoveColumnToWorkspaceUp => {
+                                        let prev = monitor_layout.active_workspace_idx;
+                                        let idx = if matches!(action, MoveColumnToWorkspaceDown) {
+                                                prev + 1
+                                        } else {
+                                                prev.saturating_sub(1)
+                                        };
+                                        if idx != prev
+                                                || matches!(action, MoveColumnToWorkspaceDown)
+                                        {
+                                                changed = monitor_layout
+                                                        .move_focused_column_to_workspace(idx, true)
+                                                        .is_some();
+                                        }
                                         if changed {
                                                 ws_switch = Some(idx);
                                                 ws_prev = Some(prev);

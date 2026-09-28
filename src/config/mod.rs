@@ -99,8 +99,21 @@ pub enum Action {
         SetWindowHeight(String),
         FocusWorkspace(u8),
         WorkspaceSwitch(u8),
+        /// niri focus-workspace-down/up: move to the next/previous workspace
+        /// in the stack (relative, not by index).
+        FocusWorkspaceDown,
+        FocusWorkspaceUp,
+        /// niri focus-workspace-previous: toggle between the current and the
+        /// previously active workspace.
+        FocusWorkspacePrevious,
         MoveWindowToWorkspace(u8),
         MoveColumnToWorkspace(u8),
+        /// niri move-column-to-workspace-down/up (relative).
+        MoveColumnToWorkspaceDown,
+        MoveColumnToWorkspaceUp,
+        /// niri move-window-to-workspace-down/up (relative).
+        MoveWindowToWorkspaceDown,
+        MoveWindowToWorkspaceUp,
         ToggleWindowFloating,
         ToggleOverview,
         /// Niri's do-screen-transition: cover the screen briefly while
@@ -377,6 +390,13 @@ impl Default for Config {
                                 bind("Mod+Ctrl+WheelScrollUp", Action::MoveColumnLeft),
                                 bind("Mod+Home", Action::FocusColumnFirst),
                                 bind("Mod+End", Action::FocusColumnLast),
+                                // Relative workspace navigation (niri Mod+U/I and
+                                // Mod+Ctrl+U/I; niri also uses Page_Down/Up, which
+                                // wini keeps for column focus).
+                                bind("Mod+U", Action::FocusWorkspaceDown),
+                                bind("Mod+I", Action::FocusWorkspaceUp),
+                                bind("Mod+Ctrl+U", Action::MoveColumnToWorkspaceDown),
+                                bind("Mod+Ctrl+I", Action::MoveColumnToWorkspaceUp),
                                 bind("Mod+F", Action::MaximizeColumn),
                                 bind("Mod+Shift+F", Action::ToggleWindowedFullscreen),
                                 // Real fullscreen: borderless, covering the whole
@@ -1052,6 +1072,13 @@ fn parse_action(node: &KdlNode) -> Option<Action> {
                 "move-column-to-workspace" => {
                         Action::MoveColumnToWorkspace(first_u8_arg(node).unwrap_or(1))
                 },
+                "focus-workspace-down" => Action::FocusWorkspaceDown,
+                "focus-workspace-up" => Action::FocusWorkspaceUp,
+                "focus-workspace-previous" => Action::FocusWorkspacePrevious,
+                "move-column-to-workspace-down" => Action::MoveColumnToWorkspaceDown,
+                "move-column-to-workspace-up" => Action::MoveColumnToWorkspaceUp,
+                "move-window-to-workspace-down" => Action::MoveWindowToWorkspaceDown,
+                "move-window-to-workspace-up" => Action::MoveWindowToWorkspaceUp,
                 other => {
                         log::debug!("ignoring unknown action {other:?}");
                         Action::Unknown(other.to_string())
