@@ -431,11 +431,14 @@ impl AppState {
                                 if let Some(info) = self.windows.remove(hwnd) {
                                         log::info!("window hidden: \"{}\"", info.title);
                                         let id = hwnd.0 as isize;
-                                        self.layout.remove_window(id);
+                                        let device = self.layout.remove_window(id);
                                         self.animator.remove(id);
                                         self.restore_borders(id);
                                         self.floating.remove(&id);
                                         self.original_rects.remove(&id);
+                                        if let Some(d) = device {
+                                                self.reclaim_workspaces(&d);
+                                        }
                                         self.reflow();
                                 }
                         },
@@ -445,11 +448,14 @@ impl AppState {
                                 if let Some(info) = self.windows.remove(hwnd) {
                                         log::info!("window closed: \"{}\"", info.title);
                                         let id = dead_id;
-                                        self.layout.remove_window(id);
+                                        let device = self.layout.remove_window(id);
                                         self.animator.remove(id);
                                         self.restore_borders(id);
                                         self.floating.remove(&id);
                                         self.original_rects.remove(&id);
+                                        if let Some(d) = device {
+                                                self.reclaim_workspaces(&d);
+                                        }
                                         self.reflow();
                                 }
                         },
@@ -1505,6 +1511,22 @@ impl AppState {
                 }
         }
 
+        /// niri dynamic-workspace cleanup: drop empty non-active workspaces
+        /// and keep one trailing empty. Skipped while a slide or overview
+        /// owns the monitor (both hold workspace indices that reindexing
+        /// would invalidate); the next removal cleans up instead.
+        fn reclaim_workspaces(
+                &mut self,
+                device: &str,
+        ) {
+                if self.slides.contains_key(device) || self.overviews.contains_key(device) {
+                        return;
+                }
+                if let Some(ml) = self.layout.monitor_mut(device) {
+                        ml.normalize_workspaces();
+                }
+        }
+
         /// Handle a monitor-directional action. `kind`: 0 = focus-monitor,
         /// 1 = move-column-to-monitor, 2 = move-window-to-monitor.
         fn dispatch_monitor(
@@ -1544,6 +1566,12 @@ impl AppState {
                 if kind != 0 && moved_focus.is_none() {
                         // Nothing to move (empty column / no focus): no-op.
                         return;
+                }
+                // A cross-monitor move may have emptied a workspace on the
+                // source monitor; clean it up (no slide runs for cross-monitor
+                // moves, so reindexing is safe).
+                if kind != 0 {
+                        self.reclaim_workspaces(device);
                 }
                 self.focused = new_focus.map(|id| HWND(id as *mut _));
                 if let Some(id) = new_focus {

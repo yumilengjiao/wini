@@ -1044,6 +1044,56 @@ impl MonitorLayout {
                 }
         }
 
+        /// niri's dynamic-workspace invariant: keep every non-empty
+        /// workspace and the currently active one, drop the rest, and
+        /// ensure exactly one trailing empty workspace at the bottom.
+        /// Reindexes `window_map`, `active_workspace_idx` and
+        /// `previous_workspace_idx` to the compacted list.
+        pub fn normalize_workspaces(&mut self) {
+                let active = self.active_workspace_idx;
+                let prev = self.previous_workspace_idx;
+                // Decide which old indices survive, in order.
+                let keep: Vec<usize> = (0..self.workspaces.len())
+                        .filter(|&i| i == active || !self.workspaces[i].is_empty())
+                        .collect();
+                // old index -> new index
+                let mut remap = std::collections::HashMap::new();
+                for (new_i, &old_i) in keep.iter().enumerate() {
+                        remap.insert(old_i, new_i);
+                }
+                // Rebuild the workspace vec in kept order.
+                let mut old = std::mem::take(&mut self.workspaces);
+                // Take by draining in kept order (indices are ascending).
+                let mut rebuilt: Vec<Workspace> = Vec::with_capacity(keep.len());
+                // Move out kept workspaces; `Option` dance avoids clone.
+                let mut slots: Vec<Option<Workspace>> = old.drain(..).map(Some).collect();
+                for &old_i in &keep {
+                        rebuilt.push(slots[old_i].take().expect("kept index once"));
+                }
+                self.workspaces = rebuilt;
+                // Remap active / previous.
+                self.active_workspace_idx = *remap.get(&active).unwrap_or(&0);
+                self.previous_workspace_idx = prev
+                        .and_then(|p| remap.get(&p).copied())
+                        .filter(|&p| p != self.active_workspace_idx);
+                // Remap window ownership.
+                for v in self.window_map.values_mut() {
+                        if let Some(&new_i) = remap.get(v) {
+                                *v = new_i;
+                        }
+                }
+                // Ensure at least one workspace and a trailing empty one.
+                if self.workspaces.is_empty() {
+                        self.workspaces.push(Workspace::new());
+                }
+                if !self.workspaces.last().is_none_or(|w| w.is_empty()) {
+                        self.workspaces.push(Workspace::new());
+                }
+                if self.active_workspace_idx >= self.workspaces.len() {
+                        self.active_workspace_idx = self.workspaces.len() - 1;
+                }
+        }
+
         /// Switch the active workspace (niri focus-workspace), growing the
         /// list on demand. False if already active.
         pub fn switch_workspace(
@@ -1542,6 +1592,39 @@ mod tests {
                 assert!(ml.switch_workspace(target)); // 1 -> 2
                 assert_eq!(ml.active_workspace_idx, 2);
                 assert_eq!(ml.previous_workspace_idx, Some(1));
+        }
+
+        #[test]
+        fn normalize_reclaims_empty_and_keeps_trailing() {
+                let mut ml = MonitorLayout::new("D".into());
+                // Build: ws0 = {A}, ws1 = {}, ws2 = {B}, active = 2.
+                ml.add_window(A); // ws0
+                ml.switch_workspace(2);
+                ml.add_window(B); // ws2
+                assert_eq!(ml.workspaces.len(), 3);
+                ml.switch_workspace(0); // active 0, so empty ws1 can be reclaimed
+                ml.normalize_workspaces();
+                // ws1 dropped; B's workspace reindexed 2 -> 1; trailing empty added.
+                assert_eq!(ml.workspace_of(A), Some(0));
+                assert_eq!(ml.workspace_of(B), Some(1));
+                assert!(ml.workspaces.last().unwrap().is_empty());
+                assert_eq!(ml.workspaces.len(), 3); // {A}, {B}, {}
+                assert_eq!(ml.active_workspace_idx, 0);
+        }
+
+        #[test]
+        fn normalize_keeps_active_empty_workspace() {
+                let mut ml = MonitorLayout::new("D".into());
+                ml.add_window(A); // ws0
+                ml.switch_workspace(3); // active empty ws3
+                ml.normalize_workspaces();
+                // Active empty workspace is kept; interior empties dropped;
+                // one trailing empty ensured.
+                assert_eq!(ml.workspace_of(A), Some(0));
+                // {A}, {active empty} -> trailing empty already present, so len 2.
+                assert!(ml.active_workspace_idx < ml.workspaces.len());
+                assert!(ml.workspaces[ml.active_workspace_idx].is_empty());
+                assert!(ml.workspaces.last().unwrap().is_empty());
         }
 
         #[test]
