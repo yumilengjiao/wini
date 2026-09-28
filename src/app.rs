@@ -462,6 +462,11 @@ impl AppState {
         ) {
                 let id = info.id();
                 let hwnd = info.hwnd;
+                // Flatten the OS drop shadow on every managed window so the
+                // overview's shadow-less DWM thumbnails hand over to the real
+                // windows without the shadow popping in (also a niri-like flat
+                // look). Restored on exit.
+                placement::set_drop_shadow(hwnd, false);
                 let device = monitor::monitor_of_window(hwnd, &self.monitors)
                         .map(|m| m.device.clone())
                         .unwrap_or_default();
@@ -581,6 +586,8 @@ impl AppState {
                                 continue;
                         }
                         self.restore_borders(id);
+                        // Restore the OS drop shadow we flattened while managing.
+                        placement::set_drop_shadow(hwnd, true);
                         if let Some(rc) = self.original_rects.get(&id) {
                                 unsafe {
                                         let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(

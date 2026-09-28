@@ -18,6 +18,39 @@ use windows::core::BOOL;
 
 use crate::layout::geometry::TileRect;
 
+/// Remove (or restore) a window's DWM drop shadow. Tiled windows have
+/// their OS drop shadow removed so the overview's DWM thumbnails (which
+/// never render shadows) hand over to the real windows seamlessly — the
+/// shadow no longer "pops in" as a dark gap the instant the zoom-in
+/// completes. It also gives a flatter, niri-like look (niri's tiled
+/// windows have no OS shadow). Restored on exit / unmanage.
+///
+/// Implemented via `DWMWA_NCRENDERING_POLICY`: `DWMNCRP_DISABLED` stops
+/// DWM drawing the non-client shadow; `DWMNCRP_USEWINDOWSTYLE` restores
+/// the default.
+pub fn set_drop_shadow(
+        hwnd: HWND,
+        on: bool,
+) {
+        use windows::Win32::Graphics::Dwm::{
+                DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_NCRENDERING_POLICY,
+                DwmSetWindowAttribute,
+        };
+        let policy: u32 = if on {
+                DWMNCRP_USEWINDOWSTYLE.0 as u32
+        } else {
+                DWMNCRP_DISABLED.0 as u32
+        };
+        unsafe {
+                let _ = DwmSetWindowAttribute(
+                        hwnd,
+                        DWMWA_NCRENDERING_POLICY,
+                        &policy as *const u32 as *const core::ffi::c_void,
+                        std::mem::size_of::<u32>() as u32,
+                );
+        }
+}
+
 /// Decorations to strip for the borderless windowed-fullscreen look.
 const FULLSCREEN_STRIP: u32 =
         WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0;
