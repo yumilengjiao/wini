@@ -67,6 +67,9 @@ pub struct OverviewHost {
         /// Host window origin in screen coords (thumbnail destination
         /// rects are client-relative).
         origin: (i32, i32),
+        /// Exact visible destinations last submitted to DWM. Focus ring uses
+        /// these rather than independently sampling an advancing zoom spring.
+        visible_rects: std::collections::HashMap<isize, (i32, i32, i32, i32)>,
         /// Desktop source crop and destination in host-client coordinates.
         /// The desktop can span multiple monitors; never stretch it into
         /// the work area (which excludes taskbars).
@@ -150,6 +153,7 @@ impl OverviewHost {
                                 hwnd,
                                 thumbs: Vec::new(),
                                 origin: (l, t),
+                                visible_rects: std::collections::HashMap::new(),
                                 desktop_source,
                                 desktop_dest,
                                 desktop_thumb,
@@ -297,6 +301,14 @@ impl OverviewHost {
                 }
         }
 
+        /// Last visible rectangle actually submitted for this thumbnail.
+        pub fn visible_rect(
+                &self,
+                id: isize,
+        ) -> Option<(i32, i32, i32, i32)> {
+                self.visible_rects.get(&id).copied()
+        }
+
         /// Push one frame of destination rects (screen coords; converted
         /// to the host's client space here). The rects already carry the
         /// zoom-scaled layout gaps, so the close handover to the real
@@ -306,30 +318,55 @@ impl OverviewHost {
                 &mut self,
                 rects: &[TileRect],
         ) {
+                self.visible_rects.clear();
                 for r in rects {
                         let Some((_, thumb)) = self.thumbs.iter().find(|(id, _)| *id == r.id)
                         else {
                                 continue;
                         };
+                        let hwnd = HWND(r.id as *mut core::ffi::c_void);
+                        let Some((_, _, ow, oh)) = crate::win::api::window_rect(hwnd) else {
+                                continue;
+                        };
+                        let Ok(size) = (unsafe { DwmQueryThumbnailSourceSize(*thumb) }) else {
+                                continue;
+                        };
+                        if size.cx <= 0 || size.cy <= 0 {
+                                continue;
+                        }
+                        let insets = crate::win::api::frame_insets(hwnd);
+                        let (x, y, w, h) = insets
+                                .apply((r.x as f64, r.y as f64, r.w as f64, r.h as f64), (ow, oh));
+                        // Explicitly remove invisible resize margins from the
+                        // source AND destination. DWM then paints the visible
+                        // edge at the exact same rect used by the focus ring.
+                        let source = insets.source_crop((ow, oh), (size.cx, size.cy));
                         let props = DWM_THUMBNAIL_PROPERTIES {
                                 dwFlags: DWM_TNP_RECTDESTINATION
+                                        | DWM_TNP_RECTSOURCE
                                         | DWM_TNP_OPACITY
                                         | DWM_TNP_VISIBLE
                                         | DWM_TNP_SOURCECLIENTAREAONLY,
+                                rcSource: source,
                                 rcDestination: RECT {
-                                        left: r.x - self.origin.0,
-                                        top: r.y - self.origin.1,
-                                        right: r.x - self.origin.0 + r.w,
-                                        bottom: r.y - self.origin.1 + r.h,
+                                        left: x - self.origin.0,
+                                        top: y - self.origin.1,
+                                        right: x - self.origin.0 + w,
+                                        bottom: y - self.origin.1 + h,
                                 },
                                 opacity: 255,
                                 fVisible: windows::core::BOOL(1),
                                 fSourceClientAreaOnly: windows::core::BOOL(0),
-                                ..Default::default()
                         };
                         // Safety: thumbnail handle is valid (we own it).
-                        unsafe {
-                                let _ = DwmUpdateThumbnailProperties(*thumb, &props);
+                        match unsafe { DwmUpdateThumbnailProperties(*thumb, &props) } {
+                                Ok(()) => {
+                                        self.visible_rects.insert(r.id, (x, y, w, h));
+                                },
+                                Err(e) => log::debug!(
+                                        "overview: thumbnail update for {} failed: {e}",
+                                        r.id
+                                ),
                         }
                 }
         }

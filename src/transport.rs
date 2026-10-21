@@ -313,31 +313,6 @@ impl Transport {
                 }
         }
 
-        /// Current on-screen rect of `id`, sampling the springs right now.
-        /// Used by the focus ring (which must track the animated window).
-        pub fn window_rect(
-                &self,
-                layout: &Layout,
-                monitors: &[Monitor],
-                id: WindowId,
-        ) -> Option<(i32, i32, i32, i32)> {
-                for mon in monitors {
-                        let ml = layout.monitor(&mon.device)?;
-                        let Some(k) = ml.workspace_of(id) else {
-                                continue;
-                        };
-                        let m = self.monitors.get(&mon.device)?;
-                        let rect = m.tiles.get(&id)?;
-                        let (cx, cy, cw, ch) = rect.value();
-                        let vp = m.view.get(&k).map(|v| v.value()).unwrap_or(0.0);
-                        let dy = (k as f64 - m.wsp.value()) * m.stride;
-                        let sx = m.origin.0 + (cx as f64 - vp).round() as i32;
-                        let sy = m.origin.1 + cy + dy.round() as i32;
-                        return Some((sx, sy, cw, ch));
-                }
-                None
-        }
-
         /// Sample every monitor's springs and produce the frame to apply.
         /// `skip` names monitors whose geometry the caller owns this frame
         /// (an open overview), which the transport must not touch.

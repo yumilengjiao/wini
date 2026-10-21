@@ -1930,17 +1930,13 @@ impl AppState {
                         return;
                 };
                 let id = hwnd.0 as isize;
-                // Use the source window's visible-frame margins in both
-                // modes, scaled with the thumbnail. At zoom=1 the ring has
-                // exactly the same inner edge before and after the handoff.
-                if let Some((r, zoom)) = self.overviews.values().find_map(|ov| {
-                        ov.current_rects()
-                                .into_iter()
-                                .find(|r| r.id == id)
-                                .map(|r| (r, ov.zoom()))
-                }) {
-                        let (x, y, w, h) = crate::win::api::frame_insets(hwnd)
-                                .apply((r.x as f64, r.y as f64, r.w as f64, r.h as f64), zoom);
+                // Use the exact visible destination submitted to DWM, not a
+                // new spring sample a few milliseconds ahead of the thumbnail.
+                if let Some((x, y, w, h)) = self
+                        .overview_hosts
+                        .values()
+                        .find_map(|host| host.visible_rect(id))
+                {
                         let rgb = ring.active_color;
                         let bgr = ((rgb & 0xFF) << 16) | (rgb & 0x00_FF_00) | ((rgb >> 16) & 0xFF);
                         fb.update(
@@ -1971,34 +1967,19 @@ impl AppState {
                         fb.hide();
                         return;
                 }
-                // Hug the *visible* window edge: `frame_rect` (DWM extended
-                // frame bounds) skips the invisible resize borders that
-                // `window_rect` includes — the ring would otherwise float
-                // ~10px off the window on three sides.
-                //
-                // While the window animates, the HWND's rects are stale: moves
-                // go out with SWP_ASYNCWINDOWPOS, so right after a tick the
-                // window is still at the previous frame's position — reading
-                // it makes the ring trail the window. Use the transport's
-                // in-flight rect (what we just sent) plus the visible-edge
-                // insets measured from the live rects (insets don't change
-                // mid-motion; both rects are stale by the same amount).
-                let rect = if self.transport.animating()
-                        && let Some((ax, ay, aw, ah)) =
-                                self.transport.window_rect(&self.layout, &self.monitors, id)
-                {
-                        Some(crate::win::api::frame_insets(hwnd)
-                                .apply((ax as f64, ay as f64, aw as f64, ah as f64), 1.0))
-                } else {
-                        crate::win::api::frame_rect(hwnd).map(|(x, y, w, h)| {
-                                (
-                                        x.round() as i32,
-                                        y.round() as i32,
-                                        w.round() as i32,
-                                        h.round() as i32,
-                                )
-                        })
-                };
+                // Normal mode follows the actual visible HWND edge. Async
+                // SetWindowPos can lag or be clamped by the app's minimum size;
+                // a transport prediction can put the ring well outside it.
+                // This also avoids following a tiled rect for a floating or
+                // windowed-fullscreen window while another monitor animates.
+                let rect = crate::win::api::frame_rect(hwnd).map(|(x, y, w, h)| {
+                        (
+                                x.round() as i32,
+                                y.round() as i32,
+                                w.round() as i32,
+                                h.round() as i32,
+                        )
+                });
                 if let Some((x, y, w, h)) = rect {
                         // Config stores 0xRRGGBB; COLORREF wants 0x00BBGGRR.
                         let rgb = ring.active_color;
