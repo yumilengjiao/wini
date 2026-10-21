@@ -394,6 +394,7 @@ pub fn refresh_view_offset(
         area_width: f64,
         prev_idx_hint: Option<usize>,
 ) {
+        ws.explicit_view_position = false;
         if ws.columns.is_empty() {
                 ws.view_offset = 0.0;
                 ws.pending_view_rebase = None;
@@ -447,7 +448,7 @@ pub fn compute_workspace_geometry(
 
         let widths = column_widths(ws, params, view_width);
         let xs = column_xs(&widths, params.gaps);
-        let vp = clamp_view_pos(view_pos(ws, &xs), &xs, &widths, view_width, params.gaps);
+        let vp = target_view_pos(ws, params, view_width);
 
         let mut out = Vec::new();
         for (ci, col) in ws.columns.iter().enumerate() {
@@ -493,7 +494,12 @@ pub fn target_view_pos(
         let view_width = view_width.max(1.0);
         let widths = column_widths(ws, params, view_width);
         let xs = column_xs(&widths, params.gaps);
-        clamp_view_pos(view_pos(ws, &xs), &xs, &widths, view_width, params.gaps)
+        let vp = view_pos(ws, &xs);
+        if ws.explicit_view_position {
+                vp
+        } else {
+                clamp_view_pos(vp, &xs, &widths, view_width, params.gaps)
+        }
 }
 
 /// Tile rectangles in COLUMN SPACE: `x` is the column's column-space x

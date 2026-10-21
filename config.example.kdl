@@ -129,6 +129,8 @@ binds {
     Mod+W     { set-column-width; }
     Mod+Shift+W { set-window-height "+100"; }
     Mod+F     { maximize-column; }
+    Mod+Ctrl+C { center-visible-columns; }
+    Mod+Ctrl+F { expand-column-to-available-width; }
     Mod+Shift+F { toggle-windowed-fullscreen; }
 
     // Workspaces / overview / windows

@@ -29,6 +29,7 @@
 #![allow(dead_code)]
 
 pub mod geometry;
+mod viewport;
 
 use std::collections::HashMap;
 
@@ -115,6 +116,9 @@ pub struct Workspace {
         /// centers the active column. Positive = view scrolled right.
         /// (Geometry module interprets this.)
         pub view_offset: f64,
+        /// Explicit center/expand actions may intentionally leave blank space
+        /// even when all columns fit. Cleared by the next focus/view refresh.
+        pub explicit_view_position: bool,
         /// The windowed-fullscreen window, rendered covering the whole
         /// monitor (niri's `toggle-windowed-fullscreen`). The layout
         /// structure underneath stays intact.
@@ -139,6 +143,7 @@ impl Workspace {
                         columns: Vec::new(),
                         active_column_idx: 0,
                         view_offset: 0.0,
+                        explicit_view_position: false,
                         fullscreen_id: None,
                         activate_prev_column_on_removal: None,
                         pending_view_rebase: None,
@@ -155,6 +160,7 @@ impl Workspace {
         /// between), keep the older anchor — `view_offset` hasn't been
         /// rebased since.
         fn rebase_view_to_current(&mut self) {
+                self.explicit_view_position = false;
                 if self.pending_view_rebase.is_none() {
                         self.pending_view_rebase = Some((self.active_column_idx, self.view_offset));
                 }
@@ -809,29 +815,6 @@ impl Workspace {
                 } else {
                         col.is_full_width = !col.is_full_width;
                 }
-                true
-        }
-
-        /// niri's center-column (Mod+C): center the focused column in the
-        /// view. Sets the view offset directly (sticky until the next focus
-        /// change re-runs `refresh_view_offset`).
-        pub fn center_active_column(
-                &mut self,
-                params: &crate::layout::geometry::LayoutParams,
-                view_width: f64,
-        ) -> bool {
-                if self.columns.is_empty() {
-                        return false;
-                }
-                let widths = crate::layout::geometry::column_widths(self, params, view_width);
-                let xs = crate::layout::geometry::column_xs(&widths, params.gaps);
-                let idx = self.active_column_idx;
-                self.view_offset = crate::layout::geometry::view_offset_centered(
-                        view_width,
-                        xs[idx],
-                        widths[idx],
-                );
-                self.pending_view_rebase = None;
                 true
         }
 

@@ -103,6 +103,8 @@ pub enum Action {
         MaximizeColumn,
         /// niri center-column (Mod+C): center the focused column.
         CenterColumn,
+        CenterVisibleColumns,
+        ExpandColumnToAvailableWidth,
         ToggleWindowedFullscreen,
         SetWindowHeight(String),
         FocusWorkspace(u8),
@@ -429,6 +431,8 @@ impl Default for Config {
                                 // them in your config if you use several outputs.
                                 bind("Mod+F", Action::MaximizeColumn),
                                 bind("Mod+C", Action::CenterColumn),
+                                bind("Mod+Ctrl+C", Action::CenterVisibleColumns),
+                                bind("Mod+Ctrl+F", Action::ExpandColumnToAvailableWidth),
                                 bind("Mod+Shift+F", Action::ToggleWindowedFullscreen),
                                 // Real fullscreen: borderless, covering the whole
                                 // monitor (the F11 look), distinct from Mod+F's
@@ -1122,6 +1126,8 @@ fn parse_action(node: &KdlNode) -> Option<Action> {
                 "toggle-full-width" => Action::ToggleFullWidth,
                 "maximize-column" => Action::MaximizeColumn,
                 "center-column" => Action::CenterColumn,
+                "center-visible-columns" => Action::CenterVisibleColumns,
+                "expand-column-to-available-width" => Action::ExpandColumnToAvailableWidth,
                 "toggle-windowed-fullscreen" => Action::ToggleWindowedFullscreen,
                 "toggle-window-floating" => Action::ToggleWindowFloating,
                 "toggle-overview" => Action::ToggleOverview,
@@ -1212,6 +1218,29 @@ fn has_property(
 #[cfg(test)]
 mod tests {
         use super::*;
+
+        #[test]
+        fn viewport_actions_parse_and_have_niri_default_binds() {
+                let cfg = parse("binds { Mod+Ctrl+C { center-visible-columns; }; Mod+Ctrl+F { expand-column-to-available-width; }; }").unwrap();
+                assert!(cfg
+                        .binds
+                        .iter()
+                        .any(|b| b.action == Action::CenterVisibleColumns));
+                assert!(cfg
+                        .binds
+                        .iter()
+                        .any(|b| b.action == Action::ExpandColumnToAvailableWidth));
+                let defaults = Config::default();
+                for (combo, action) in [
+                        ("Mod+Ctrl+C", Action::CenterVisibleColumns),
+                        ("Mod+Ctrl+F", Action::ExpandColumnToAvailableWidth),
+                ] {
+                        assert!(defaults
+                                .binds
+                                .iter()
+                                .any(|b| b.combo == combo && b.action == action));
+                }
+        }
 
         #[test]
         fn default_config_is_sane() {

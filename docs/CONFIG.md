@@ -168,6 +168,8 @@ A config-provided `binds` section **replaces** the default binds.
 | `toggle-full-width` | column spans the full workspace width |
 | `maximize-column` | toggle column maximize |
 | `center-column` | center the focused column in the view (Mod+C) |
+| `center-visible-columns` | center the fully visible column group, keeping focus and gaps (Mod+Ctrl+C) |
+| `expand-column-to-available-width` | expand the active column into free space without displacing other fully visible columns (Mod+Ctrl+F); lone column uses reversible full-width mode |
 | `toggle-windowed-fullscreen` | borderless fullscreen for one window |
 | `toggle-window-floating` | float / unfloat the focused window |
 | `toggle-overview` | zoomed-out overview of all columns |

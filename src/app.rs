@@ -1519,6 +1519,19 @@ impl AppState {
                                                 ws.center_active_column(&layout_params, view_width);
                                         skip_view_refresh = true;
                                 },
+                                CenterVisibleColumns => {
+                                        changed = ws
+                                                .center_visible_columns(&layout_params, view_width);
+                                        skip_view_refresh = true;
+                                },
+                                ExpandColumnToAvailableWidth => {
+                                        changed = ws.expand_column_to_available_width(
+                                                &layout_params,
+                                                view_width,
+                                        );
+                                        skip_view_refresh = layout_params.center_focused_column
+                                                != geometry::CenterFocused::Always;
+                                },
                                 ToggleWindowedFullscreen => {
                                         fullscreen_prev = ws.fullscreen_id;
                                         changed = ws.toggle_fullscreen();
