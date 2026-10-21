@@ -126,6 +126,9 @@ struct Overview {
         /// Rendering then applies niri's `workspace_render_idx` correction
         /// so the zoom+slide composite is monotonic.
         sync_from_progress: Option<f64>,
+        /// Final thumbnail/real-window geometry has been submitted under
+        /// the cover. Reveal on the following tick, not in the same DWM batch.
+        handoff_ready: bool,
 }
 
 impl Overview {
@@ -694,6 +697,7 @@ impl AppState {
                         zoom_target,
                         view_shift: None,
                         sync_from_progress: None,
+                        handoff_ready: false,
                 };
                 // Floating windows would sit full-size over the transparent
                 // backdrop. Hide them BEFORE creating the host: OverviewHost
@@ -804,6 +808,7 @@ impl AppState {
                         return;
                 };
                 let anim = self.config.animations.overview_open_close_params();
+                ov.handoff_ready = false;
                 if ov.opening() {
                         ov.progress.retarget(0.0, anim);
                         // Snap any in-flight thumbnail view-shift so the close
@@ -857,6 +862,7 @@ impl AppState {
                         })
                         .map(|i| i as f64)
                         .unwrap_or_else(|| ov.camera.target());
+                ov.handoff_ready = false;
                 ov.progress.retarget(0.0, anim);
                 ov.camera.retarget(target, anim);
                 ov.view_shift = None;
@@ -1204,6 +1210,7 @@ impl AppState {
                 let Some(ov) = self.overviews.get_mut(device) else {
                         return;
                 };
+                ov.handoff_ready = false;
                 ov.finals = finals;
                 // Real windows stay at their settled geometry, shown so DWM
                 // can thumbnail them.
@@ -2924,67 +2931,67 @@ impl AppState {
                                 placement::raise_bars(&self.monitors);
                                 continue;
                         }
-                        let ov = self.overviews.remove(&device).expect("checked above");
-                        log::debug!("overview[{device}]: closed");
-                        // Bring the real windows back BEFORE dropping the
-                        // backdrop: hide the non-active participants (invisible —
-                        // they are off-screen) and park the active ones at their
-                        // settled tiles SYNCHRONOUSLY. At zoom 1 the thumbnails
-                        // cover those tiles pixel-exactly (the inset converged to
-                        // 0), so the host drop below is seamless.
-                        let active_idx = self
-                                .layout
-                                .monitor(&device)
-                                .map(|ml| ml.active_workspace_idx);
-                        let mut back: Vec<crate::layout::geometry::TileRect> = Vec::new();
-                        for (k, rs) in &ov.finals {
-                                if Some(*k) == active_idx {
-                                        back.extend(rs.iter().cloned());
-                                        continue;
+                        if ov.handoff_ready {
+                                // The prepared frame has survived a message-loop
+                                // turn. Flush once at the handoff, never per frame;
+                                // if DWM is unavailable, continue with the covered
+                                // synchronous geometry rather than getting stuck.
+                                if let Err(e) = unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }
+                                {
+                                        log::debug!("overview: DWM handoff flush unavailable: {e}");
                                 }
-                                for r in rs {
-                                        let hwnd = HWND(r.id as *mut _);
-                                        // Register BEFORE hiding (hook race).
-                                        self.hidden_by_us.insert(r.id);
-                                        if crate::win::api::is_alive(hwnd) {
-                                                placement::set_shown(hwnd, false);
-                                        }
-                                }
+                                self.overviews.remove(&device);
+                                self.overview_hosts.remove(&device);
+                                self.sync_overview_regions();
+                                self.reflow();
+                                self.sync_focus_to_os();
+                                log::debug!("overview[{device}]: revealed prepared frame");
+                                continue;
                         }
-                        placement::apply_geometry_sync(&back);
-                        // Final thumbnail frame at EXACTLY zoom 1 / camera on the
-                        // active workspace, so the thumbnails coincide with the
-                        // real windows to the pixel before the host is dropped.
-                        // The last animating frame was at zoom ~0.99; without this
-                        // the vanishing thumbnail and the appearing real window
-                        // differ by a hair, which reads as the gaps "snapping
-                        // bigger" at the very end of the zoom-in.
-                        if let Some(idx) = active_idx
-                                && let Some(host) = self.overview_hosts.get_mut(&device)
-                        {
-                                let exact = ov.rects_at(1.0, idx as f64);
-                                host.update_rects(&exact);
-                        }
-                        // Dropping the host destroys the backdrop + thumbnails;
-                        // the real windows are revealed exactly where the
-                        // thumbnails ended (zoom 1 == settled tiles).
-                        self.overview_hosts.remove(&device);
-                        self.sync_overview_regions();
-                        // The overview no longer owns this monitor's geometry.
-                        // Snap the transport to the settled targets first so the
-                        // real windows are revealed exactly where the thumbnails
-                        // ended, instead of animating back from their stale
-                        // pre-overview spring positions (the "move back on
-                        // zoom-in complete" glitch).
+                        // Prepare while the opaque host still owns this monitor.
+                        // Use the same settled transport frame that normal mode
+                        // will render, not a second independently rounded layout.
                         let params = self.params.clone();
                         self.transport.sync(&self.layout, &self.monitors, &params);
                         self.transport.snap(&device);
-                        self.reflow();
-                        // Focus only moved internally while the overview was open
-                        // (overview_focus / sync deferral); now that the backdrop
-                        // is gone, push it to the OS — a foreground change can no
-                        // longer pop anything above a destroyed backdrop.
-                        self.sync_focus_to_os();
+                        let skip = self
+                                .monitors
+                                .iter()
+                                .filter(|m| m.device != device)
+                                .map(|m| m.device.clone())
+                                .collect();
+                        let frame = self.transport.frame(&self.layout, &self.monitors, &skip);
+                        for id in frame.hide {
+                                self.hidden_by_us.insert(id);
+                                self.shown.remove(&id);
+                                let hwnd = HWND(id as *mut _);
+                                if crate::win::api::is_alive(hwnd) {
+                                        placement::set_shown(hwnd, false);
+                                }
+                        }
+                        placement::apply_geometry_sync(&frame.moves);
+                        for id in frame.show {
+                                self.hidden_by_us.remove(&id);
+                                self.shown.insert(id);
+                                let hwnd = HWND(id as *mut _);
+                                if crate::win::api::is_alive(hwnd)
+                                        && !crate::win::api::is_visible(hwnd)
+                                {
+                                        placement::set_shown(hwnd, true);
+                                }
+                        }
+                        if let Some(host) = self.overview_hosts.get_mut(&device) {
+                                host.update_rects(&frame.moves);
+                        }
+                        // Restore OS focus under the cover, so activation repaint
+                        // is not first triggered after the thumbnails disappear.
+                        if let Some(id) = self.layout.focused_id(&device) {
+                                crate::win::api::force_set_foreground(HWND(id as *mut _));
+                        }
+                        if let Some(ov) = self.overviews.get_mut(&device) {
+                                ov.handoff_ready = true;
+                        }
+                        self.update_focus_border();
                 }
         }
 }
@@ -3315,6 +3322,7 @@ mod tests {
                         zoom_target: 0.35,
                         view_shift: None,
                         sync_from_progress: None,
+                        handoff_ready: false,
                 }
         }
 

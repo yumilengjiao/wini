@@ -304,6 +304,18 @@ fn apply_geometry_with(
                         continue;
                 }
                 let ok = unsafe {
+                        let mut current = RECT::default();
+                        // Re-applying an unchanged size can still trigger an
+                        // application resize/repaint. At the overview handoff
+                        // it produced a second repaint after the cover dropped.
+                        let unchanged_size = GetWindowRect(hwnd, &mut current).is_ok()
+                                && current.right - current.left == r.w
+                                && current.bottom - current.top == r.h;
+                        let size_flags = if unchanged_size {
+                                SWP_NOSIZE
+                        } else {
+                                windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS(0)
+                        };
                         SetWindowPos(
                                 hwnd,
                                 None,
@@ -311,7 +323,11 @@ fn apply_geometry_with(
                                 r.y,
                                 r.w,
                                 r.h,
-                                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | extra,
+                                SWP_NOACTIVATE
+                                        | SWP_NOZORDER
+                                        | SWP_NOOWNERZORDER
+                                        | extra
+                                        | size_flags,
                         )
                 };
                 if ok.is_err() {
