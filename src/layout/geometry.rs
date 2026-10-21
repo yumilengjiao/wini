@@ -26,6 +26,43 @@ pub enum CenterFocused {
         Always,
 }
 
+/// Independent work-area edge spacing in physical pixels.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Struts {
+        pub left: f64,
+        pub right: f64,
+        pub top: f64,
+        pub bottom: f64,
+}
+
+impl Struts {
+        pub fn uniform(value: f64) -> Self {
+                Self {
+                        left: value,
+                        right: value,
+                        top: value,
+                        bottom: value,
+                }
+        }
+
+        fn axis(
+                a: f64,
+                b: f64,
+                size: f64,
+        ) -> (f64, f64) {
+                let clean = |v: f64| if v.is_finite() { v.max(0.0) } else { 0.0 };
+                let (a, b) = (clean(a), clean(b));
+                let sum = a + b;
+                let available = (size - 1.0).max(0.0);
+                let scale = if sum > available {
+                        available / sum
+                } else {
+                        1.0
+                };
+                (a * scale, b * scale)
+        }
+}
+
 /// Layout tuning parameters (will be driven by config later).
 #[derive(Debug, Clone)]
 pub struct LayoutParams {
@@ -40,6 +77,8 @@ pub struct LayoutParams {
         /// (niri's preset-column-widths).
         pub preset_column_widths: Vec<ColumnWidth>,
         pub center_focused_column: CenterFocused,
+        /// Independent outer spacing in physical pixels. Fullscreen ignores it.
+        pub struts: Struts,
 }
 
 impl Default for LayoutParams {
@@ -60,7 +99,36 @@ impl Default for LayoutParams {
                                 ColumnWidth::Proportion(0.66667),
                         ],
                         center_focused_column: CenterFocused::Never,
+                        struts: Struts::default(),
                 }
+        }
+}
+
+impl LayoutParams {
+        /// Work area inset on each edge. Oversized values are reduced
+        /// proportionally to preserve at least one pixel of usable space.
+        pub fn tiling_area(
+                &self,
+                work: (f64, f64, f64, f64),
+        ) -> (f64, f64, f64, f64) {
+                let (x, y, w, h) = work;
+                let (w, h) = (w.max(1.0), h.max(1.0));
+                let (left, right) = Struts::axis(self.struts.left, self.struts.right, w);
+                let (top, bottom) = Struts::axis(self.struts.top, self.struts.bottom, h);
+                (
+                        x + left,
+                        y + top,
+                        (w - left - right).max(1.0),
+                        (h - top - bottom).max(1.0),
+                )
+        }
+
+        /// Must agree with tiling_area for scroll/focus calculations.
+        pub fn tiling_view_width(
+                &self,
+                work_width: f64,
+        ) -> f64 {
+                self.tiling_area((0.0, 0.0, work_width, 1.0)).2
         }
 }
 
@@ -484,11 +552,32 @@ mod tests {
                         default_column_width: ColumnWidth::Proportion(0.25),
                         preset_column_widths: Vec::new(),
                         center_focused_column: CenterFocused::OnOverflow,
+                        struts: Struts::default(),
                 }
         }
 
         fn area() -> (f64, f64, f64, f64) {
                 (0.0, 0.0, W, H)
+        }
+
+        #[test]
+        fn struts_preserve_usable_area_and_width_agreement() {
+                let mut p = params();
+                p.struts = Struts {
+                        left: 3.0,
+                        right: 7.0,
+                        top: 11.0,
+                        bottom: 13.0,
+                };
+                assert_eq!(
+                        p.tiling_area((-1920.0, 48.0, 1920.0, 1032.0)),
+                        (-1917.0, 59.0, 1910.0, 1008.0)
+                );
+                assert_eq!(p.tiling_view_width(1920.0), 1910.0);
+                p.struts = Struts::uniform(10000.0);
+                let area = p.tiling_area((0.0, 0.0, 100.0, 80.0));
+                assert_eq!((area.2, area.3), (1.0, 1.0));
+                assert_eq!(p.tiling_view_width(100.0), area.2);
         }
 
         #[test]
@@ -534,6 +623,7 @@ mod tests {
                         default_column_width: ColumnWidth::Proportion(0.5),
                         preset_column_widths: Vec::new(),
                         center_focused_column: CenterFocused::OnOverflow,
+                        struts: Struts::default(),
                 };
                 // Half-width columns: [1 2] 3 with col 3's right edge
                 // partially past the view's right edge (the user's layout:

@@ -36,6 +36,10 @@ layout {
     // Gap between windows, in pixels (default 8).
     gaps 8
 
+    // Outer spacing from the work-area edges, in physical pixels (default 0).
+    // Each side is independent; `struts 3` is shorthand for all four.
+    struts { left 0; right 0; top 0; bottom 0; }
+
     // Padding at the left/right edges of the monitor (default 8).
     edge-padding 8
 

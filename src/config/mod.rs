@@ -632,6 +632,26 @@ fn parse_layout(
                                         };
                                 }
                         },
+                        "struts" => {
+                                use crate::layout::geometry::Struts;
+                                if let Some(v) = first_float_arg(n) {
+                                        config.layout.struts = Struts::uniform(v.max(0.0));
+                                } else if let Some(doc) = n.children() {
+                                        for side in doc.nodes() {
+                                                let Some(v) = first_float_arg(side) else {
+                                                        continue;
+                                                };
+                                                let v = v.max(0.0);
+                                                match side.name().value() {
+                                                        "left" => config.layout.struts.left = v,
+                                                        "right" => config.layout.struts.right = v,
+                                                        "top" => config.layout.struts.top = v,
+                                                        "bottom" => config.layout.struts.bottom = v,
+                                                        _ => {},
+                                                }
+                                        }
+                                }
+                        },
                         "default-column-width" => {
                                 config.layout.default_column_width = parse_width_node(n);
                         },
@@ -1217,6 +1237,31 @@ mod tests {
                 // Wheel binds parse like any key.
                 let cfg = parse("binds { Mod+WheelScrollDown { focus-column-right; } }").unwrap();
                 assert!(cfg.binds.iter().any(|b| b.combo == "Mod+WheelScrollDown"));
+        }
+
+        #[test]
+        fn struts_config() {
+                use crate::layout::geometry::Struts;
+                let cfg = parse("layout { struts 3; }").unwrap();
+                assert_eq!(cfg.layout.struts, Struts::uniform(3.0));
+                let cfg = parse("layout { struts { left 4; right 2; top 6; bottom 1; } }").unwrap();
+                assert_eq!(
+                        cfg.layout.struts,
+                        Struts {
+                                left: 4.0,
+                                right: 2.0,
+                                top: 6.0,
+                                bottom: 1.0
+                        }
+                );
+                assert_eq!(
+                        parse("layout { gaps 8; }").unwrap().layout.struts,
+                        Struts::default()
+                );
+                assert_eq!(
+                        parse("layout { struts -5; }").unwrap().layout.struts,
+                        Struts::default()
+                );
         }
 
         #[test]

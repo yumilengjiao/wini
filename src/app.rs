@@ -565,7 +565,9 @@ impl AppState {
                                 else {
                                         continue;
                                 };
-                                let view_width = (mon.work.right - mon.work.left) as f64;
+                                let view_width = self
+                                        .params
+                                        .tiling_view_width((mon.work.right - mon.work.left) as f64);
                                 let ws = &mut m.workspaces[ws_idx];
                                 geometry::refresh_view_offset(ws, &params, view_width, None);
                                 return;
@@ -663,12 +665,12 @@ impl AppState {
                         (mon.work.right - mon.work.left) as f64,
                         (mon.work.bottom - mon.work.top) as f64,
                 );
-                let area = (
+                let area = params.tiling_area((
                         mon.work.left as f64,
                         mon.work.top as f64,
                         (mon.work.right - mon.work.left) as f64,
                         (mon.work.bottom - mon.work.top) as f64,
-                );
+                ));
                 let mut finals = Vec::new();
                 for (k, ws) in ml.workspaces.iter().enumerate() {
                         if ws.is_empty() {
@@ -988,7 +990,9 @@ impl AppState {
                 device: &str,
         ) -> Option<f64> {
                 let mon = self.monitors.iter().find(|m| m.device == device)?;
-                let view_width = (mon.work.right - mon.work.left) as f64;
+                let view_width = self
+                        .params
+                        .tiling_view_width((mon.work.right - mon.work.left) as f64);
                 let ws = self.layout.monitor(device)?.active_workspace();
                 let widths = geometry::column_widths(ws, &self.params, view_width);
                 let xs = geometry::column_xs(&widths, self.params.gaps);
@@ -1011,7 +1015,9 @@ impl AppState {
                 let Some(mon) = self.monitors.iter().find(|m| m.device == device) else {
                         return;
                 };
-                let view_width = (mon.work.right - mon.work.left) as f64;
+                let view_width = self
+                        .params
+                        .tiling_view_width((mon.work.right - mon.work.left) as f64);
                 if let Some(ml) = self.layout.monitor_mut(device)
                         && let Some(idx) = ml.workspace_of(id)
                 {
@@ -1182,12 +1188,12 @@ impl AppState {
                         return;
                 };
                 let params = self.params.clone();
-                let area = (
+                let area = params.tiling_area((
                         mon.work.left as f64,
                         mon.work.top as f64,
                         (mon.work.right - mon.work.left) as f64,
                         (mon.work.bottom - mon.work.top) as f64,
-                );
+                ));
                 let mut finals = Vec::new();
                 for (k, ws) in ml.workspaces.iter().enumerate() {
                         if ws.is_empty() {
@@ -1782,7 +1788,10 @@ impl AppState {
                         .monitors
                         .iter()
                         .find(|m| m.device == device)
-                        .map(|m| (m.work.right - m.work.left) as f64)
+                        .map(|m| {
+                                self.params
+                                        .tiling_view_width((m.work.right - m.work.left) as f64)
+                        })
                         .unwrap_or(1920.0);
                 {
                         let monitor_layout = self.layout.monitor_mut(&device).unwrap();
@@ -2374,12 +2383,12 @@ impl AppState {
                         self.reflow();
                         return;
                 };
-                let area = (
+                let area = params.tiling_area((
                         mon.work.left as f64,
                         mon.work.top as f64,
                         (mon.work.right - mon.work.left) as f64,
                         (mon.work.bottom - mon.work.top) as f64,
-                );
+                ));
                 let Some(ml) = self.layout.monitor(&source_device) else {
                         self.reflow();
                         return;

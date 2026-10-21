@@ -63,6 +63,9 @@ struct MonitorT {
         stride: f64,
         /// Target active workspace index (what `wsp` springs toward).
         active: usize,
+        /// Screen origin of the tiling area (work area inset by struts).
+        /// Column-space rects are composed relative to it.
+        origin: (i32, i32),
 }
 
 /// The unified transport for every monitor.
@@ -145,12 +148,13 @@ impl Transport {
                         let Some(ml) = layout.monitor(&mon.device) else {
                                 continue;
                         };
-                        let area = (
+                        let area = params.tiling_area((
                                 mon.work.left as f64,
                                 mon.work.top as f64,
                                 (mon.work.right - mon.work.left) as f64,
                                 (mon.work.bottom - mon.work.top) as f64,
-                        );
+                        ));
+                        let origin = (area.0.round() as i32, area.1.round() as i32);
                         let view_width = area.2.max(1.0);
                         let stride = (mon.full.bottom - mon.full.top) as f64 * 1.1;
 
@@ -161,9 +165,11 @@ impl Transport {
                                         tiles: HashMap::new(),
                                         stride,
                                         active: ml.active_workspace_idx,
+                                        origin,
                                 }
                         });
                         entry.stride = stride;
+                        entry.origin = origin;
                         entry.active = ml.active_workspace_idx;
                         entry.wsp
                                 .retarget(ml.active_workspace_idx as f64, self.switch);
@@ -272,8 +278,8 @@ impl Transport {
                         let (cx, cy, cw, ch) = rect.value();
                         let vp = m.view.get(&k).map(|v| v.value()).unwrap_or(0.0);
                         let dy = (k as f64 - m.wsp.value()) * m.stride;
-                        let sx = mon.work.left + (cx as f64 - vp).round() as i32;
-                        let sy = mon.work.top + cy + dy.round() as i32;
+                        let sx = m.origin.0 + (cx as f64 - vp).round() as i32;
+                        let sy = m.origin.1 + cy + dy.round() as i32;
                         return Some((sx, sy, cw, ch));
                 }
                 None
@@ -300,8 +306,7 @@ impl Transport {
                                 continue;
                         };
                         let wsp = m.wsp.value();
-                        let ax = mon.work.left;
-                        let ay = mon.work.top;
+                        let (ax, ay) = m.origin;
 
                         // A workspace renders when it is within the switch sweep (its
                         // strip slot overlaps the view) or it is the active target.
@@ -362,6 +367,7 @@ mod tests {
                         default_column_width: ColumnWidth::Proportion(0.5),
                         preset_column_widths: Vec::new(),
                         center_focused_column: CenterFocused::Never,
+                        struts: geometry::Struts::default(),
                 }
         }
 
@@ -438,6 +444,40 @@ mod tests {
                 let frame = t.frame(&layout, &mons, &HashSet::new());
                 assert!(!frame.moves.iter().any(|r| r.id == 2));
                 assert!(frame.moves.iter().any(|r| r.id == 1));
+        }
+
+        #[test]
+        fn struts_match_settled_geometry_on_offset_monitor() {
+                let mut layout = Layout::new();
+                layout.add_window("D", 1);
+                let mut mon = monitor("D");
+                mon.work = RECT {
+                        left: -1000,
+                        top: 48,
+                        right: 0,
+                        bottom: 800,
+                };
+                let mons = vec![mon];
+                let mut p = params();
+                p.struts = geometry::Struts {
+                        left: 3.0,
+                        right: 7.0,
+                        top: 11.0,
+                        bottom: 13.0,
+                };
+                let mut t = transport();
+                t.sync(&layout, &mons, &p);
+                let frame = t.frame(&layout, &mons, &HashSet::new());
+                let area = p.tiling_area((-1000.0, 48.0, 1000.0, 752.0));
+                let exact = geometry::compute_workspace_geometry(
+                        layout.monitor("D").unwrap().active_workspace(),
+                        &p,
+                        area,
+                );
+                assert_eq!(frame.moves, exact);
+                assert_eq!(frame.moves[0].x, -997);
+                assert_eq!(frame.moves[0].y, 59);
+                assert_eq!(frame.moves[0].h, 728);
         }
 
         #[test]

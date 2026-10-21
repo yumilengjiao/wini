@@ -20,6 +20,10 @@ layout {
     gaps 8
     edge-padding 8
 
+    // Outer spacing in physical pixels. Each side is independent.
+    // `struts 3` is shorthand for all four sides.
+    struts { left 0; right 0; top 0; bottom 0; }
+
     // "never" | "on-overflow" (default) | "always"
     center-focused-column "on-overflow"
 
