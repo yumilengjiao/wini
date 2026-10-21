@@ -334,7 +334,7 @@ impl OverviewHost {
                         if size.cx <= 0 || size.cy <= 0 {
                                 continue;
                         }
-                        let insets = crate::win::api::frame_insets(hwnd);
+                        let insets = crate::win::frame::frame_insets(hwnd);
                         let (x, y, w, h) = insets
                                 .apply((r.x as f64, r.y as f64, r.w as f64, r.h as f64), (ow, oh));
                         // Explicitly remove invisible resize margins from the

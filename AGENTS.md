@@ -65,6 +65,17 @@ Do not modify files inside the Niri reference directory unless explicitly reques
 
 ---
 
+# Code Organization
+
+- Split code by clear responsibilities (layout, animation state, overview,
+  focus/borders, input, Win32 backend), rather than continually growing one file.
+- Keep the application shell focused on orchestration; put independently
+  testable geometry and state transitions in dedicated modules with their tests.
+- Avoid arbitrary line-count splits or needless abstraction. A larger file is
+  acceptable when separating it would obscure a cohesive responsibility.
+
+---
+
 # Core Architecture
 
 This project runs on Windows.
