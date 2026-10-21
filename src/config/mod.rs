@@ -130,6 +130,7 @@ pub enum Action {
         MoveWindowToWorkspaceDown,
         MoveWindowToWorkspaceUp,
         ToggleWindowFloating,
+        SwitchFocusBetweenFloatingAndTiling,
         ToggleOverview,
         /// niri focus-monitor-left/right/up/down.
         FocusMonitorLeft,
@@ -456,6 +457,7 @@ impl Default for Config {
                                 bind("Mod+Ctrl+Home", Action::MoveColumnToFirst),
                                 bind("Mod+Ctrl+End", Action::MoveColumnToLast),
                                 bind("Mod+V", Action::ToggleWindowFloating),
+                                bind("Mod+Shift+V", Action::SwitchFocusBetweenFloatingAndTiling),
                                 bind("Mod+Q", Action::CloseWindow),
                                 bind("Mod+Shift+Slash", Action::ToggleOverview),
                                 // Mod+O is an extra overview alias (niri's own default
@@ -1144,6 +1146,9 @@ fn parse_action(node: &KdlNode) -> Option<Action> {
                 "expand-column-to-available-width" => Action::ExpandColumnToAvailableWidth,
                 "toggle-windowed-fullscreen" => Action::ToggleWindowedFullscreen,
                 "toggle-window-floating" => Action::ToggleWindowFloating,
+                "switch-focus-between-floating-and-tiling" => {
+                        Action::SwitchFocusBetweenFloatingAndTiling
+                },
                 "toggle-overview" => Action::ToggleOverview,
                 "do-screen-transition" => Action::DoScreenTransition,
                 "focus-workspace" | "workspace-switch" => {
@@ -1232,6 +1237,29 @@ fn has_property(
 #[cfg(test)]
 mod tests {
         use super::*;
+
+        #[test]
+        fn focus_layer_action_parses_and_default_bind_does_not_toggle_floating() {
+                let cfg = parse(
+                        "binds { Mod+Shift+V { switch-focus-between-floating-and-tiling; } }",
+                )
+                .unwrap();
+                assert_eq!(
+                        cfg.binds
+                                .iter()
+                                .find(|b| b.combo.eq_ignore_ascii_case("Mod+Shift+V"))
+                                .unwrap()
+                                .action,
+                        Action::SwitchFocusBetweenFloatingAndTiling
+                );
+                let defaults = Config::default();
+                assert!(defaults.binds.iter().any(|b| b.combo == "Mod+Shift+V"
+                        && b.action == Action::SwitchFocusBetweenFloatingAndTiling));
+                assert!(defaults
+                        .binds
+                        .iter()
+                        .any(|b| b.combo == "Mod+V" && b.action == Action::ToggleWindowFloating));
+        }
 
         #[test]
         fn viewport_actions_parse_and_have_niri_default_binds() {

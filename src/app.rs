@@ -46,19 +46,8 @@ impl From<String> for AppError {
         }
 }
 
-/// A floating window: freed from the tiling grid, placed freely.
-/// Niri remembers the floating position per window while it floats;
-/// toggling back re-tiles it.
-#[derive(Debug, Clone)]
-struct FloatState {
-        /// Which monitor / workspace the float belongs to.
-        device: String,
-        workspace_idx: usize,
-        x: f64,
-        y: f64,
-        w: f64,
-        h: f64,
-}
+mod floating;
+use floating::{FloatState, FloatingFocus};
 
 mod overview;
 use overview::Overview;
@@ -104,6 +93,7 @@ struct AppState {
         borderless: std::collections::HashSet<isize>,
         /// Floating windows (out of the tiling grid).
         floating: std::collections::HashMap<isize, FloatState>,
+        floating_focus: FloatingFocus,
         /// Windows WE hid via `set_shown(hwnd, false)` (inactive
         /// workspaces, invisible floats). Their `EVENT_OBJECT_HIDE` is
         /// self-inflicted and must not unmanage them — otherwise switching
@@ -184,6 +174,7 @@ impl AppState {
                                         self.transport.remove_window(id);
                                         self.restore_borders(id);
                                         self.floating.remove(&id);
+                                        self.floating_focus.remove(id);
                                         self.original_rects.remove(&id);
                                         if let Some(d) = device {
                                                 self.reclaim_workspaces(&d);
@@ -201,6 +192,7 @@ impl AppState {
                                         self.transport.remove_window(id);
                                         self.restore_borders(id);
                                         self.floating.remove(&id);
+                                        self.floating_focus.remove(id);
                                         self.original_rects.remove(&id);
                                         if let Some(d) = device {
                                                 self.reclaim_workspaces(&d);
@@ -253,6 +245,9 @@ impl AppState {
                                 if self.focused != Some(hwnd) {
                                         self.focused = Some(hwnd);
                                         let id = hwnd.0 as isize;
+                                        if self.floating.contains_key(&id) {
+                                                self.floating_focus.record(id);
+                                        }
                                         if self.layout.focus_window(id) {
                                                 self.update_focus_view(id);
                                                 self.reflow();
@@ -315,6 +310,7 @@ impl AppState {
                                         h,
                                 },
                         );
+                        self.floating_focus.record(id);
                         log::debug!("window-rule: {id} opens floating");
                         return;
                 }
@@ -1188,11 +1184,37 @@ impl AppState {
                                         .monitors
                                         .iter()
                                         .find_map(|m| m.workspace_of(id).map(|_| m.device.clone()))
+                                        .or_else(|| {
+                                                self.floating.get(&id).map(|fs| fs.device.clone())
+                                        })
                         })
                         .or_else(|| {
                                 monitor::monitor_at_cursor(&self.monitors).map(|m| m.device.clone())
                         });
                 let Some(device) = device else { return };
+
+                if matches!(action, SwitchFocusBetweenFloatingAndTiling) {
+                        let Some(ml) = self.layout.monitor(&device) else {
+                                return;
+                        };
+                        let target = self.floating_focus.switch_target(
+                                &self.floating,
+                                focused_id,
+                                ml.active_workspace().focused_id(),
+                                &device,
+                                ml.active_workspace_idx,
+                                self.overviews.contains_key(&device),
+                        );
+                        if let Some(id) = target {
+                                self.focused = Some(HWND(id as *mut _));
+                                if self.floating.contains_key(&id) {
+                                        self.floating_focus.record(id);
+                                }
+                                self.sync_focus_to_os();
+                                self.update_focus_border();
+                        }
+                        return;
+                }
 
                 // The overview owns several actions while open: they act on the
                 // per-monitor overview state (camera scroll) instead of the
@@ -2203,6 +2225,7 @@ impl AppState {
                                 h: rect.3,
                         },
                 );
+                self.floating_focus.record(id);
                 // Close the gap in the tiling (reflow positions the float too).
                 self.reflow();
         }
@@ -2215,6 +2238,7 @@ impl AppState {
                 fs: FloatState,
         ) {
                 self.floating.remove(&id);
+                self.floating_focus.remove(id);
                 self.layout.add_window(&fs.device, id);
                 self.reflow();
                 self.sync_focus_to_os();
@@ -2257,6 +2281,9 @@ impl AppState {
                                         .monitors
                                         .iter()
                                         .find_map(|m| m.workspace_of(id).map(|_| m.device.clone()))
+                                        .or_else(|| {
+                                                self.floating.get(&id).map(|fs| fs.device.clone())
+                                        })
                         })
                         .or_else(|| {
                                 monitor::monitor_at_cursor(&self.monitors).map(|m| m.device.clone())
@@ -2264,7 +2291,15 @@ impl AppState {
                 else {
                         return;
                 };
-                let Some(focused_id) = self.layout.focused_id(&device) else {
+                let float = self.focused.map(|h| h.0 as isize).filter(|id| {
+                        self.floating.get(id).is_some_and(|fs| {
+                                fs.device == device
+                                        && self.layout.monitor(&device).is_some_and(|ml| {
+                                                ml.active_workspace_idx == fs.workspace_idx
+                                        })
+                        })
+                });
+                let Some(focused_id) = float.or_else(|| self.layout.focused_id(&device)) else {
                         return;
                 };
                 // While an overview is open on this device, the focused
@@ -2742,6 +2777,7 @@ impl App {
                         interact_start_rect: None,
                         borderless: std::collections::HashSet::new(),
                         floating: std::collections::HashMap::new(),
+                        floating_focus: FloatingFocus::default(),
                         hidden_by_us: std::collections::HashSet::new(),
                         overviews: std::collections::HashMap::new(),
                         overview_hosts: std::collections::HashMap::new(),

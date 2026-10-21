@@ -138,6 +138,7 @@ binds {
     Mod+Ctrl+R { reset-window-height; }
     Mod+Shift+W { set-window-height "+100"; }
     Mod+F     { maximize-column; }
+    Mod+Shift+V { switch-focus-between-floating-and-tiling; }
     Mod+Ctrl+C { center-visible-columns; }
     Mod+Ctrl+F { expand-column-to-available-width; }
     Mod+Shift+F { toggle-windowed-fullscreen; }

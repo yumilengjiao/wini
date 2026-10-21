@@ -181,6 +181,7 @@ A config-provided `binds` section **replaces** the default binds.
 | `expand-column-to-available-width` | expand the active column into free space without displacing other fully visible columns (Mod+Ctrl+F); lone column uses reversible full-width mode |
 | `toggle-windowed-fullscreen` | borderless fullscreen for one window |
 | `toggle-window-floating` | float / unfloat the focused window |
+| `switch-focus-between-floating-and-tiling` | switch focus layers on the current workspace, remembering the last float (Mod+Shift+V); empty destination layer / overview is a no-op |
 | `toggle-overview` | zoomed-out overview of all columns |
 | `do-screen-transition` | cover the screen ~1s while management pauses (screenshot workflows) |
 | `focus-workspace N` | switch to workspace N |
