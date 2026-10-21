@@ -669,40 +669,28 @@ impl AppState {
                 }
         }
 
-        /// Focus a workspace while the overview is open: activate it (so
-        /// focus follows and the overview closes into it), scroll the
-        /// camera to center it, and move `self.focused` to that workspace's
-        /// focused window. Clamped to the workspaces that exist.
+        /// Focus a workspace without leaving overview. Numbered shortcuts
+        /// create their target; relative navigation stays within the strip.
         fn overview_activate(
                 &mut self,
                 device: &str,
                 idx: usize,
+                create: bool,
         ) {
-                let max = self
-                        .layout
-                        .monitor(device)
-                        .map(|ml| ml.workspaces.len().saturating_sub(1))
-                        .unwrap_or(0);
-                let idx = idx.min(max);
-                if let Some(ml) = self.layout.monitor_mut(device)
-                        && ml.active_workspace_idx != idx
-                {
-                        ml.previous_workspace_idx = Some(ml.active_workspace_idx);
-                        ml.active_workspace_idx = idx;
-                }
-                // Move focus to the newly active workspace's focused window
-                // (the ring follows; OS foreground stays put until close).
-                let new_focus = self
-                        .layout
-                        .monitor(device)
-                        .and_then(|ml| ml.workspaces.get(idx))
-                        .and_then(|ws| ws.focused_id());
+                let (Some(ml), Some(ov)) = (
+                        self.layout.monitor_mut(device),
+                        self.overviews.get_mut(device),
+                ) else {
+                        return;
+                };
+                let new_focus = ov.activate_workspace(
+                        ml,
+                        idx,
+                        create,
+                        self.config.animations.workspace_switch_params(),
+                );
+                // Internal focus follows; OS foreground remains under cover.
                 self.focused = new_focus.map(|id| HWND(id as *mut _));
-                if let Some(ov) = self.overviews.get_mut(device) {
-                        let switch = self.config.animations.workspace_switch_params();
-                        ov.camera.retarget(idx as f64, switch);
-                        ov.sync_from_progress = None;
-                }
                 self.refresh_overview(device);
                 self.update_focus_border();
         }
@@ -1220,7 +1208,7 @@ impl AppState {
                                         .monitor(&device)
                                         .map(|ml| ml.active_workspace_idx)
                                         .unwrap_or(0);
-                                self.overview_activate(&device, cur + 1);
+                                self.overview_activate(&device, cur + 1, false);
                                 return;
                         },
                         Action::FocusWindowUp if self.overviews.contains_key(&device) => {
@@ -1229,7 +1217,7 @@ impl AppState {
                                         .monitor(&device)
                                         .map(|ml| ml.active_workspace_idx)
                                         .unwrap_or(0);
-                                self.overview_activate(&device, cur.saturating_sub(1));
+                                self.overview_activate(&device, cur.saturating_sub(1), false);
                                 return;
                         },
                         // Column focus in the overview moves the INTERNAL
@@ -1255,7 +1243,7 @@ impl AppState {
                         Action::FocusWorkspace(n) | Action::WorkspaceSwitch(n)
                                 if self.overviews.contains_key(&device) =>
                         {
-                                self.overview_activate(&device, n.saturating_sub(1) as usize);
+                                self.overview_activate(&device, n.saturating_sub(1) as usize, true);
                                 return;
                         },
                         Action::FocusWorkspaceDown if self.overviews.contains_key(&device) => {
@@ -1264,7 +1252,7 @@ impl AppState {
                                         .monitor(&device)
                                         .map(|ml| ml.active_workspace_idx)
                                         .unwrap_or(0);
-                                self.overview_activate(&device, cur + 1);
+                                self.overview_activate(&device, cur + 1, false);
                                 return;
                         },
                         Action::FocusWorkspaceUp if self.overviews.contains_key(&device) => {
@@ -1273,7 +1261,7 @@ impl AppState {
                                         .monitor(&device)
                                         .map(|ml| ml.active_workspace_idx)
                                         .unwrap_or(0);
-                                self.overview_activate(&device, cur.saturating_sub(1));
+                                self.overview_activate(&device, cur.saturating_sub(1), false);
                                 return;
                         },
                         Action::FocusWorkspacePrevious if self.overviews.contains_key(&device) => {
@@ -1282,7 +1270,7 @@ impl AppState {
                                         .monitor(&device)
                                         .and_then(|ml| ml.previous_workspace_idx)
                                 {
-                                        self.overview_activate(&device, prev);
+                                        self.overview_activate(&device, prev, false);
                                 }
                                 return;
                         },

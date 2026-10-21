@@ -5,6 +5,7 @@
 
 use crate::anim::{AnimParams, Val};
 use crate::layout::geometry::TileRect;
+use crate::layout::{MonitorLayout, WindowId};
 
 #[derive(Debug, Clone)]
 pub(super) struct Overview {
@@ -96,6 +97,27 @@ impl Overview {
                 self.sync_from_progress = None;
         }
 
+        /// Numbered navigation creates workspaces on demand, exactly like
+        /// normal mode. Relative navigation remains bounded to existing ones.
+        pub(super) fn activate_workspace(
+                &mut self,
+                layout: &mut MonitorLayout,
+                requested: usize,
+                create: bool,
+                anim: AnimParams,
+        ) -> Option<WindowId> {
+                let idx = if create {
+                        requested
+                } else {
+                        requested.min(layout.workspaces.len().saturating_sub(1))
+                };
+                layout.switch_workspace(idx);
+                self.handoff_ready = false;
+                self.camera.retarget(idx as f64, anim);
+                self.sync_from_progress = None;
+                layout.active_workspace().focused_id()
+        }
+
         pub(super) fn settled(&self) -> bool {
                 self.progress.finished() && self.camera.finished()
         }
@@ -137,6 +159,56 @@ mod tests {
                         sync_from_progress: None,
                         handoff_ready: false,
                 }
+        }
+
+        #[test]
+        fn startup_overview_numbered_navigation_creates_workspace() {
+                let mut layout = MonitorLayout::new("D".into());
+                layout.add_window(1);
+                assert_eq!(layout.workspaces.len(), 1);
+                let mut ov = overview();
+                ov.handoff_ready = true;
+                assert_eq!(ov.activate_workspace(&mut layout, 1, true, instant()), None);
+                assert_eq!(layout.workspaces.len(), 2);
+                assert_eq!(layout.active_workspace_idx, 1);
+                assert_eq!(layout.previous_workspace_idx, Some(0));
+                assert_eq!(ov.camera.target(), 1.0);
+                assert!(!ov.handoff_ready);
+                assert!(ov.opening());
+                assert_eq!(
+                        ov.activate_workspace(&mut layout, 0, true, instant()),
+                        Some(1)
+                );
+                assert_eq!(layout.previous_workspace_idx, Some(1));
+                assert_eq!(ov.camera.target(), 0.0);
+        }
+
+        #[test]
+        fn overview_numbered_navigation_matches_normal_mode_without_warmup() {
+                let mut normal = MonitorLayout::new("D".into());
+                normal.add_window(1);
+                let mut preview = normal.clone();
+                let mut ov = overview();
+                for idx in [1, 0, 8, 1, 8, 0] {
+                        normal.switch_workspace(idx);
+                        ov.activate_workspace(&mut preview, idx, true, instant());
+                        assert_eq!(preview.active_workspace_idx, normal.active_workspace_idx);
+                        assert_eq!(
+                                preview.previous_workspace_idx,
+                                normal.previous_workspace_idx
+                        );
+                        assert_eq!(preview.workspaces.len(), normal.workspaces.len());
+                        assert_eq!(preview.workspace_of(1), normal.workspace_of(1));
+                }
+        }
+
+        #[test]
+        fn overview_relative_navigation_does_not_grow_workspaces() {
+                let mut layout = MonitorLayout::new("D".into());
+                let mut ov = overview();
+                ov.activate_workspace(&mut layout, 1, false, instant());
+                assert_eq!(layout.workspaces.len(), 1);
+                assert_eq!(ov.camera.target(), 0.0);
         }
 
         #[test]
