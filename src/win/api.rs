@@ -304,6 +304,12 @@ pub fn force_set_foreground(hwnd: HWND) -> bool {
                 }
                 let me = GetCurrentThreadId();
                 let fg = GetForegroundWindow();
+                // Overview prepares focus under its cover. Revealing it must
+                // not trigger another activation/z-order cycle for the same
+                // HWND (some applications repaint their decorations on it).
+                if fg == hwnd {
+                        return true;
+                }
                 let fg_thread = if fg.0.is_null() {
                         0
                 } else {

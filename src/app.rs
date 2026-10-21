@@ -219,6 +219,29 @@ impl Overview {
                 self.rects_at(self.zoom(), self.render_cam())
         }
 
+        /// Closing invalidates any previously prepared reveal. Navigation or
+        /// reopening must prepare a new frame before the host can disappear.
+        fn close_to(
+                &mut self,
+                target: f64,
+                anim: crate::anim::AnimParams,
+        ) {
+                self.handoff_ready = false;
+                self.progress.retarget(0.0, anim);
+                self.camera.retarget(target, anim);
+                self.view_shift = None;
+                self.sync_from_progress = Some(self.progress.from());
+        }
+
+        fn reopen(
+                &mut self,
+                anim: crate::anim::AnimParams,
+        ) {
+                self.handoff_ready = false;
+                self.progress.retarget(1.0, anim);
+                self.sync_from_progress = None;
+        }
+
         /// Both springs at rest?
         fn settled(&self) -> bool {
                 self.progress.finished()
@@ -808,33 +831,15 @@ impl AppState {
                         return;
                 };
                 let anim = self.config.animations.overview_open_close_params();
-                ov.handoff_ready = false;
                 if ov.opening() {
-                        ov.progress.retarget(0.0, anim);
-                        // Snap any in-flight thumbnail view-shift so the close
-                        // starts from the settled view (otherwise the shift
-                        // finishes DURING the close, which looks like the
-                        // windows sliding sideways as the overview zooms in).
-                        ov.view_shift = None;
-                        // Close back into the active workspace. The camera must
-                        // run with the SAME params as the zoom (niri passes the
-                        // overview open/close config to activate_workspace) so
-                        // both springs start and end together — otherwise the
-                        // opaque backdrop lingers waiting for a longer camera
-                        // slide after the zoom already finished.
-                        if let Some(active) = self
+                        let target = self
                                 .layout
                                 .monitor(device)
-                                .map(|ml| ml.active_workspace_idx)
-                        {
-                                ov.camera.retarget(active as f64, anim);
-                                ov.sync_from_progress = Some(ov.progress.from());
-                        }
+                                .map(|ml| ml.active_workspace_idx as f64)
+                                .unwrap_or_else(|| ov.camera.target());
+                        ov.close_to(target, anim);
                 } else {
-                        // Reopening mid-close: keep the camera wherever it is; the
-                        // zoom/camera pair is no longer synchronized.
-                        ov.progress.retarget(1.0, anim);
-                        ov.sync_from_progress = None;
+                        ov.reopen(anim);
                 }
         }
 
@@ -862,11 +867,7 @@ impl AppState {
                         })
                         .map(|i| i as f64)
                         .unwrap_or_else(|| ov.camera.target());
-                ov.handoff_ready = false;
-                ov.progress.retarget(0.0, anim);
-                ov.camera.retarget(target, anim);
-                ov.view_shift = None;
-                ov.sync_from_progress = Some(ov.progress.from());
+                ov.close_to(target, anim);
         }
 
         /// Scroll the overview camera one workspace up/down (niri's bare
@@ -3325,6 +3326,38 @@ mod tests {
                         sync_from_progress: None,
                         handoff_ready: false,
                 }
+        }
+
+        #[test]
+        fn closing_retargets_and_invalidates_prepared_frame() {
+                let mut ov = overview();
+                ov.handoff_ready = true;
+                ov.view_shift = Some(ViewShift {
+                        ws_idx: 0,
+                        offset: crate::anim::Val::to(200.0, instant()),
+                });
+                ov.close_to(1.0, instant());
+                assert!(!ov.handoff_ready);
+                assert!(!ov.opening());
+                assert!(ov.settled());
+                assert!(ov.view_shift.is_none());
+                assert_eq!(ov.camera.target(), 1.0);
+                let target = ov.current_rects().into_iter().find(|r| r.id == 2).unwrap();
+                assert_eq!(target, tile(2, 150, 60, 400, 700));
+        }
+
+        #[test]
+        fn rapid_reopening_cancels_prepared_reveal() {
+                let mut ov = overview();
+                ov.close_to(0.0, instant());
+                ov.handoff_ready = true;
+                ov.reopen(instant());
+                assert!(ov.opening());
+                assert!(!ov.handoff_ready);
+                assert!(ov.sync_from_progress.is_none());
+                ov.close_to(1.0, instant());
+                assert_eq!(ov.camera.target(), 1.0);
+                assert!(!ov.handoff_ready);
         }
 
         #[test]
