@@ -181,7 +181,7 @@ pub fn column_widths(
                         // windows: apps clamp SetWindowPos to their minimum track
                         // size, which would visually overlap the next column.
                         let min_w = c.tiles.iter().map(|t| t.min_w).fold(0.0, f64::max) + reserve;
-                        if c.is_maximized {
+                        if c.is_maximized || c.is_edge_maximized {
                                 // A maximized column occupies a full-view slot in scroll
                                 // space, so the view can scroll to and away from it like
                                 // any other column (niri semantics).
@@ -413,9 +413,13 @@ pub fn refresh_view_offset(
                 },
                 None => (view_pos(ws, &xs), prev_idx_hint),
         };
-        let new_offset = view_offset_for_column(
-                cur_vp, params, area_width, view_width, &xs, &widths, idx, prev_idx,
-        );
+        let new_offset = if ws.columns[idx].is_edge_maximized {
+                0.0
+        } else {
+                view_offset_for_column(
+                        cur_vp, params, area_width, view_width, &xs, &widths, idx, prev_idx,
+                )
+        };
         log::debug!(
                 "refresh_view_offset: idx={idx} prev={prev_idx:?} cur_vp={cur_vp:.1} \
          xs={:?} widths={:?} view_w={view_width:.1} -> off={new_offset:.1} (vp={:.1})",
@@ -463,12 +467,67 @@ pub fn target_view_pos(
         let view_width = view_width.max(1.0);
         let widths = column_widths(ws, params, view_width);
         let xs = column_xs(&widths, params.gaps);
+        if ws.columns
+                .get(ws.active_column_idx)
+                .is_some_and(|col| col.is_edge_maximized)
+        {
+                return xs[ws.active_column_idx];
+        }
         let vp = view_pos(ws, &xs);
         if ws.explicit_view_position {
                 vp
         } else {
                 clamp_view_pos(vp, &xs, &widths, view_width, params.gaps)
         }
+}
+
+/// Build column-space requests from the raw work area. Edge-maximized
+/// windows use raw bounds, whereas ordinary columns still obey struts. The
+/// transport composes the same camera/view springs with both kinds.
+pub fn workspace_colspace_rects_in_work_area(
+        ws: &Workspace,
+        params: &LayoutParams,
+        work: (f64, f64, f64, f64),
+) -> Vec<TileRect> {
+        let area = params.tiling_area(work);
+        let widths = column_widths(ws, params, area.2);
+        let xs = column_xs(&widths, params.gaps);
+        let mut rects = workspace_colspace_rects(ws, params, area);
+        for r in &mut rects {
+                if let Some((ci, _)) = ws
+                        .find(r.id)
+                        .filter(|&(ci, _)| ws.columns[ci].is_edge_maximized)
+                {
+                        // Edge mode has no indicator/content inset, even if
+                        // tabs normally reserve space inside the column.
+                        r.x = (xs[ci] - (area.0 - work.0)).round() as i32;
+                        r.y = (work.1 - area.1).round() as i32;
+                        r.w = work.2.round().max(1.0) as i32;
+                        r.h = work.3.round().max(1.0) as i32;
+                }
+        }
+        rects
+}
+
+/// Work-area geometry including edge maximization. Edge-mode rectangles here
+/// are visible bounds; the Win32 boundary adds measured resize margins to get
+/// outer HWND targets. Ordinary rectangles remain outer HWND bounds.
+pub fn compute_workspace_geometry_in_work_area(
+        ws: &Workspace,
+        params: &LayoutParams,
+        work: (f64, f64, f64, f64),
+) -> Vec<TileRect> {
+        let area = params.tiling_area(work);
+        let vp = target_view_pos(ws, params, area.2);
+        workspace_colspace_rects_in_work_area(ws, params, work)
+                .into_iter()
+                .filter(|r| ws.rendered_ids().any(|id| id == r.id))
+                .map(|mut r| {
+                        r.x = (area.0 + r.x as f64 - vp).round() as i32;
+                        r.y = (area.1 + r.y as f64).round() as i32;
+                        r
+                })
+                .collect()
 }
 
 /// Tile rectangles in COLUMN SPACE: `x` is the column's column-space x

@@ -67,6 +67,8 @@ struct MonitorT {
         origin: (i32, i32),
         /// Last selected tab keyed by the column's first tile. Seed a newly
         /// selected tab from the old rendered rect, not its stale stack slot.
+        /// Stable invisible resize margins, measured on entry to edge mode.
+        edge_insets: HashMap<WindowId, crate::win::frame::FrameInsets>,
         selected_tabs: HashMap<WindowId, WindowId>,
 }
 
@@ -150,12 +152,13 @@ impl Transport {
                         let Some(ml) = layout.monitor(&mon.device) else {
                                 continue;
                         };
-                        let area = params.tiling_area((
+                        let work = (
                                 mon.work.left as f64,
                                 mon.work.top as f64,
                                 (mon.work.right - mon.work.left) as f64,
                                 (mon.work.bottom - mon.work.top) as f64,
-                        ));
+                        );
+                        let area = params.tiling_area(work);
                         let origin = (area.0.round() as i32, area.1.round() as i32);
                         let view_width = area.2.max(1.0);
                         let stride = (mon.full.bottom - mon.full.top) as f64 * 1.1;
@@ -168,6 +171,7 @@ impl Transport {
                                         stride,
                                         active: ml.active_workspace_idx,
                                         origin,
+                                        edge_insets: HashMap::new(),
                                         selected_tabs: HashMap::new(),
                                 }
                         });
@@ -181,6 +185,7 @@ impl Transport {
                         let mut live_ids: HashSet<WindowId> = HashSet::new();
                         let mut live_ws: HashSet<usize> = HashSet::new();
                         let mut next_tabs = HashMap::new();
+                        let mut edge_ids = HashSet::new();
 
                         for (k, ws) in ml.workspaces.iter().enumerate() {
                                 if ws.is_empty() {
@@ -217,7 +222,32 @@ impl Transport {
                                         }
                                         next_tabs.insert(key, active);
                                 }
-                                for r in geometry::workspace_colspace_rects(ws, params, area) {
+                                for mut r in geometry::workspace_colspace_rects_in_work_area(
+                                        ws, params, work,
+                                ) {
+                                        if ws.find(r.id).is_some_and(|(ci, _)| {
+                                                ws.columns[ci].is_edge_maximized
+                                        }) {
+                                                edge_ids.insert(r.id);
+                                                let insets = *entry.edge_insets.entry(r.id).or_insert_with(|| crate::win::frame::frame_insets(
+                                                        windows::Win32::Foundation::HWND(r.id as *mut _)));
+                                                let (x, y, w, h) = insets
+                                                        .outer_for_visible((r.x, r.y, r.w, r.h));
+                                                r.x = x;
+                                                r.y = y;
+                                                r.w = w;
+                                                r.h = h;
+                                        }
+                                        if ws.fullscreen_id == Some(r.id) {
+                                                // Fullscreen must be part of the SAME scene for
+                                                // overview/handoff/normal frames, not overridden
+                                                // only after the host has disappeared.
+                                                r.x = target_vp.round() as i32 + mon.full.left
+                                                        - origin.0;
+                                                r.y = mon.full.top - origin.1;
+                                                r.w = mon.full.right - mon.full.left;
+                                                r.h = mon.full.bottom - mon.full.top;
+                                        }
                                         live_ids.insert(r.id);
                                         match entry.tiles.get_mut(&r.id) {
                                                 Some(rect) => rect.retarget(
@@ -244,6 +274,7 @@ impl Transport {
                                         }
                                 }
                         }
+                        entry.edge_insets.retain(|id, _| edge_ids.contains(id));
                         entry.selected_tabs = next_tabs;
                         entry.tiles.retain(|id, _| live_ids.contains(id));
                         entry.view.retain(|k, _| live_ws.contains(k));
@@ -724,6 +755,125 @@ mod tests {
                 assert!((before.y - after.y).abs() <= 1);
                 assert!((before.h - after.h).abs() <= 1);
                 assert_eq!(after.id, 1);
+        }
+
+        #[test]
+        fn sizing_modes_share_exact_overview_handoff_and_normal_targets() {
+                let mut layout = Layout::new();
+                layout.add_window("D", 1);
+                let mut mon = monitor("D");
+                mon.full = RECT {
+                        left: -1000,
+                        top: -100,
+                        right: 0,
+                        bottom: 700,
+                };
+                let mut p = params();
+                p.struts = geometry::Struts {
+                        left: 3.0,
+                        right: 7.0,
+                        top: 12.0,
+                        bottom: 6.0,
+                };
+                for work in [
+                        RECT {
+                                left: -1000,
+                                top: -52,
+                                right: 0,
+                                bottom: 700,
+                        },
+                        RECT {
+                                left: -1000,
+                                top: -100,
+                                right: 0,
+                                bottom: 652,
+                        },
+                        RECT {
+                                left: -952,
+                                top: -100,
+                                right: 0,
+                                bottom: 700,
+                        },
+                        RECT {
+                                left: -1000,
+                                top: -100,
+                                right: -48,
+                                bottom: 700,
+                        },
+                ] {
+                        mon.work = work;
+                        let mons = vec![mon.clone()];
+                        let mut t = transport();
+                        let ws = layout.monitor_mut("D").unwrap().active_workspace_mut();
+                        ws.fullscreen_id = None;
+                        ws.columns[0].is_edge_maximized = false;
+                        ws.toggle_maximize_window_to_edges();
+                        t.sync(&layout, &mons, &p);
+                        let frame = t.frame(&layout, &mons, &HashSet::new());
+                        let expected = (
+                                work.left,
+                                work.top,
+                                work.right - work.left,
+                                work.bottom - work.top,
+                        );
+                        let r = frame.moves[0];
+                        assert_eq!((r.x, r.y, r.w, r.h), expected);
+                        assert_eq!(t.workspace_rects(&layout, "D")[0].1, frame.moves);
+                        let work_tuple = (
+                                work.left as f64,
+                                work.top as f64,
+                                (work.right - work.left) as f64,
+                                (work.bottom - work.top) as f64,
+                        );
+                        assert_eq!(
+                                geometry::compute_workspace_geometry_in_work_area(
+                                        layout.monitor("D").unwrap().active_workspace(),
+                                        &p,
+                                        work_tuple
+                                ),
+                                frame.moves
+                        );
+                        layout.monitor_mut("D")
+                                .unwrap()
+                                .active_workspace_mut()
+                                .toggle_fullscreen();
+                        t.sync(&layout, &mons, &p);
+                        let full = t.frame(&layout, &mons, &HashSet::new());
+                        let r = full.moves[0];
+                        assert_eq!((r.x, r.y, r.w, r.h), (-1000, -100, 1000, 800));
+                        assert_eq!(t.workspace_rects(&layout, "D")[0].1, full.moves);
+                }
+        }
+
+        #[test]
+        fn edge_mode_resize_remains_animated_under_overview_interruption() {
+                let mut layout = Layout::new();
+                layout.add_window("D", 1);
+                let mons = vec![monitor("D")];
+                let p = params();
+                let slow = AnimParams {
+                        kind: AnimKind::Easing {
+                                duration: std::time::Duration::from_secs(60),
+                                curve: crate::anim::Curve::Linear,
+                        },
+                        slowdown: 1.0,
+                };
+                let mut t = Transport::new(slow, slow, slow, slow);
+                t.sync(&layout, &mons, &p);
+                layout.monitor_mut("D")
+                        .unwrap()
+                        .active_workspace_mut()
+                        .toggle_maximize_window_to_edges();
+                t.sync(&layout, &mons, &p);
+                assert!(t.layout_animating("D"));
+                let r = t.workspace_rects(&layout, "D")[0].1[0];
+                assert!(r.w < 1000);
+                assert!((r.w - 500).abs() <= 1);
+                t.snap("D");
+                assert_eq!(
+                        t.workspace_rects(&layout, "D")[0].1,
+                        t.frame(&layout, &mons, &HashSet::new()).moves
+                );
         }
 
         #[test]

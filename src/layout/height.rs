@@ -213,6 +213,7 @@ impl Workspace {
                                 t.height = None;
                         }
                 }
+                col.is_edge_maximized = false;
                 col.tiles[ti].height = Some(WindowHeight::Fixed(height));
                 col.is_maximized = false;
                 true
@@ -253,6 +254,7 @@ impl Workspace {
                                 t.height = None;
                         }
                 }
+                col.is_edge_maximized = false;
                 col.tiles[ti].height = Some(WindowHeight::Preset(next));
                 col.is_maximized = false;
                 true

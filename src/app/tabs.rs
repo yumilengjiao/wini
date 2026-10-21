@@ -34,6 +34,7 @@ impl AppState {
                                 for col in &ws.columns {
                                         if col.display != ColumnDisplay::Tabbed
                                                 || col.is_maximized
+                                                || col.is_edge_maximized
                                                 || ws.fullscreen_id.is_some()
                                         {
                                                 continue;

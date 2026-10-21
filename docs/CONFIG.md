@@ -211,12 +211,13 @@ A config-provided `binds` section **replaces** the default binds.
 | `switch-preset-window-height` / `-back` | cycle height presets taller-first / shorter-first (forward: Mod+Ctrl+Shift+R; reverse unbound) |
 | `reset-window-height` | return focused window to automatic height sharing (Mod+Ctrl+R) |
 | `toggle-full-width` | column spans the full workspace width |
-| `maximize-column` | toggle column maximize |
+| `maximize-column` | fill the strut-inset tiling area (Mod+F), retaining window decorations |
+| `maximize-window-to-edges` | toggle the focused window to fill the raw work area, ignoring gaps/struts and keeping taskbar/decorations (Mod+M); extract a stacked window, keep tabbed groups |
 | `center-column` | center the focused column in the view (Mod+C) |
 | `center-visible-columns` | center the fully visible column group, keeping focus and gaps (Mod+Ctrl+C) |
 | `expand-column-to-available-width` | expand the active column into free space without displacing other fully visible columns (Mod+Ctrl+F); lone column uses reversible full-width mode |
 | `toggle-column-tabbed-display` | switch the column between stacking and tabs (Mod+W); select via Mod+J/K or indicator clicks |
-| `toggle-windowed-fullscreen` | borderless fullscreen for one window |
+| `fullscreen-window` / `toggle-windowed-fullscreen` | manager-side borderless fullscreen over the whole monitor (Mod+Shift+F); this does not request exclusive fullscreen from the application |
 | `toggle-window-floating` | float / unfloat the focused window |
 | `switch-focus-between-floating-and-tiling` | switch focus layers on the current workspace, remembering the last float (Mod+Shift+V); empty destination layer / overview is a no-op |
 | `toggle-overview` | zoomed-out overview of all columns |
@@ -242,6 +243,28 @@ the column extends below the work area rather than overlapping. Reset
 returns the focused window to auto weight 1; a sole fixed-height window may
 leave unused space below it. Floating `set-window-height` keeps its existing
 behavior; preset/reset height actions currently apply to tiled windows only.
+
+## Window sizing modes on Windows
+
+- **Mod+F — maximize-column:** fills the tiling area and keeps configured
+  struts. **Mod+M — maximize-window-to-edges:** fills the raw Windows work
+  area (taskbar remains outside), ignoring struts/gaps. The visible window
+  edge is aligned using measured invisible resize margins, not a fixed DPI
+  guess; titlebar/CSD and DWM non-client rendering are preserved.
+- If edge-maximizing a window in a vertically stacked column, that window
+  becomes a standalone column to the right, as in niri. A tabbed group stays
+  together and shows its selected tab. Toggle again to restore size hints;
+  an extracted window remains a standalone column. Explicit width/height
+  requests leave edge maximization. The action currently targets tiled
+  windows; floating edge maximization is not implemented yet.
+- **Mod+Shift+F — fullscreen-window:** a Windows manager-side borderless
+  approximation (also available as `toggle-windowed-fullscreen`), covering
+  the full monitor, including the taskbar area. It is not F11 injection,
+  application-exclusive fullscreen, or a game display-mode request.
+- All three modes use the same transport/overview geometry. Borderless
+  fullscreen remembers only the decoration bits it changes and restores
+  their exact previous values; it does not add a caption/resize frame to
+  previously borderless custom-decorated windows.
 
 ## `window-rule`
 

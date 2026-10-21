@@ -153,10 +153,12 @@ binds {
     Mod+Ctrl+R { reset-window-height; }
     Mod+Shift+W { set-window-height "+100"; }
     Mod+F     { maximize-column; }
+    Mod+M     { maximize-window-to-edges; }
     Mod+Shift+V { switch-focus-between-floating-and-tiling; }
     Mod+Ctrl+C { center-visible-columns; }
     Mod+Ctrl+F { expand-column-to-available-width; }
-    Mod+Shift+F { toggle-windowed-fullscreen; }
+    // Manager-side borderless fullscreen; not application-exclusive fullscreen.
+    Mod+Shift+F { fullscreen-window; }
 
     // Workspaces / overview / windows
     Mod+V       { toggle-window-floating; }

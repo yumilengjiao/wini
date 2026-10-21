@@ -32,6 +32,7 @@ pub mod geometry;
 pub mod height;
 pub mod tabbed;
 mod viewport;
+mod window_mode;
 
 use std::collections::HashMap;
 
@@ -87,6 +88,8 @@ pub struct Column {
         /// Whether the column is maximized (covers the whole monitor, no
         /// padding, like niri's maximize-column).
         pub is_maximized: bool,
+        /// Fill the raw work area, ignoring gaps/struts, keeping decorations.
+        pub is_edge_maximized: bool,
         pub display: tabbed::ColumnDisplay,
 }
 
@@ -98,6 +101,7 @@ impl Column {
                         width: None,
                         is_full_width: false,
                         is_maximized: false,
+                        is_edge_maximized: false,
                         display: tabbed::ColumnDisplay::Normal,
                 }
         }
@@ -308,6 +312,7 @@ impl Workspace {
                 if self.fullscreen_id == Some(id) {
                         self.fullscreen_id = None;
                 } else {
+                        self.columns[self.active_column_idx].is_edge_maximized = false;
                         self.fullscreen_id = Some(id);
                 }
                 true
@@ -607,6 +612,7 @@ impl Workspace {
                                 width: self.columns[ci].width,
                                 is_full_width: false,
                                 is_maximized: false,
+                                is_edge_maximized: false,
                                 display: tabbed::ColumnDisplay::Normal,
                         };
                         let at = match dir {
@@ -666,6 +672,7 @@ impl Workspace {
                         width,
                         is_full_width: false,
                         is_maximized: false,
+                        is_edge_maximized: false,
                         display: tabbed::ColumnDisplay::Normal,
                 };
                 self.columns.insert(ci + 1, col);
@@ -727,6 +734,7 @@ impl Workspace {
                                 ));
                         },
                 }
+                col.is_edge_maximized = false;
                 col.is_full_width = false;
                 // Niri's set_column_width leaves the maximized state: an
                 // explicit width request un-maximizes the column (otherwise
@@ -802,6 +810,7 @@ impl Workspace {
                         },
                 };
                 col.width = Some(next);
+                col.is_edge_maximized = false;
                 col.is_full_width = false;
                 // Like niri (whose preset cycling goes through set_column_width):
                 // un-maximize so the new width actually shows.
@@ -815,6 +824,7 @@ impl Workspace {
                 let Some(col) = self.columns.get_mut(self.active_column_idx) else {
                         return false;
                 };
+                col.is_edge_maximized = false;
                 // Niri: while maximized, toggle-full-width un-maximizes.
                 if col.is_maximized {
                         col.is_maximized = false;
@@ -834,6 +844,7 @@ impl Workspace {
                 let Some(col) = self.columns.get_mut(self.active_column_idx) else {
                         return false;
                 };
+                col.is_edge_maximized = false;
                 col.is_maximized = !col.is_maximized;
                 col.is_full_width = col.is_maximized;
                 true

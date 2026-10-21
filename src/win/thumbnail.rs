@@ -317,6 +317,18 @@ impl OverviewHost {
                 }
         }
 
+        /// A deliberate style transition (fullscreen on/off) changes frame
+        /// margins. Refresh only affected sources, never every resize frame.
+        pub fn refresh_frame_insets(
+                &mut self,
+                id: isize,
+        ) {
+                if self.source_insets.contains_key(&id) {
+                        self.source_insets
+                                .insert(id, crate::win::frame::frame_insets(HWND(id as *mut _)));
+                }
+        }
+
         /// Last visible rectangle actually submitted for this thumbnail.
         pub fn visible_rect(
                 &self,

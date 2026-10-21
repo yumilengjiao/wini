@@ -53,6 +53,23 @@ impl FrameInsets {
                 }
         }
 
+        /// Expand a visible edge target into the outer HWND rectangle needed
+        /// by SetWindowPos. Used only by edge maximization, never normal tiling.
+        pub fn outer_for_visible(
+                self,
+                rect: (i32, i32, i32, i32),
+        ) -> (i32, i32, i32, i32) {
+                let (x, y, w, h) = rect;
+                let l = self.left.round() as i32;
+                let t = self.top.round() as i32;
+                (
+                        x - l,
+                        y - t,
+                        w + l + self.right.round() as i32,
+                        h + t + self.bottom.round() as i32,
+                )
+        }
+
         /// Convert an animated outer destination to its visible frame. Resize
         /// margins stay physical; only overview zoom scales them. A width
         /// animation must NOT multiply margins by target_width/source_width.
@@ -93,6 +110,26 @@ pub fn frame_insets(hwnd: HWND) -> FrameInsets {
 #[cfg(test)]
 mod tests {
         use super::*;
+
+        #[test]
+        fn edge_maximize_outer_target_maps_back_to_exact_visible_work_area() {
+                let insets =
+                        FrameInsets::between((0.0, 0.0, 1000.0, 800.0), (10.0, 0.0, 980.0, 790.0));
+                let target = insets.outer_for_visible((-1920, 48, 1920, 1032));
+                assert_eq!(target, (-1930, 48, 1940, 1042));
+                assert_eq!(
+                        insets.apply(
+                                (
+                                        target.0 as f64,
+                                        target.1 as f64,
+                                        target.2 as f64,
+                                        target.3 as f64
+                                ),
+                                1.0
+                        ),
+                        (-1920, 48, 1920, 1032)
+                );
+        }
 
         #[test]
         fn visible_bounds_agree_at_thumbnail_handoff() {

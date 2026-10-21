@@ -108,6 +108,7 @@ pub enum Action {
         CenterColumn,
         CenterVisibleColumns,
         ExpandColumnToAvailableWidth,
+        MaximizeWindowToEdges,
         ToggleColumnTabbedDisplay,
         ToggleWindowedFullscreen,
         SetWindowHeight(String),
@@ -443,10 +444,8 @@ impl Default for Config {
                                 bind("Mod+Ctrl+C", Action::CenterVisibleColumns),
                                 bind("Mod+Ctrl+F", Action::ExpandColumnToAvailableWidth),
                                 bind("Mod+Shift+F", Action::ToggleWindowedFullscreen),
-                                // Real fullscreen: borderless, covering the whole
-                                // monitor (the F11 look), distinct from Mod+F's
-                                // maximize which keeps the title bar and work area.
-                                bind("Mod+M", Action::ToggleWindowedFullscreen),
+                                // Edge maximization retains decorations and taskbar.
+                                bind("Mod+M", Action::MaximizeWindowToEdges),
                                 // Cycle preset column widths (niri: 1/3, 1/2, 2/3).
                                 bind("Mod+R", Action::SwitchPresetColumnWidth),
                                 bind("Mod+Shift+R", Action::SwitchPresetColumnWidthBack),
@@ -1148,6 +1147,10 @@ fn parse_action(node: &KdlNode) -> Option<Action> {
                 "center-column" => Action::CenterColumn,
                 "center-visible-columns" => Action::CenterVisibleColumns,
                 "expand-column-to-available-width" => Action::ExpandColumnToAvailableWidth,
+                "maximize-window-to-edges" => Action::MaximizeWindowToEdges,
+                // Windows manager-side borderless fullscreen, not exclusive
+                // application fullscreen; preserve the explicit legacy name.
+                "fullscreen-window" => Action::ToggleWindowedFullscreen,
                 "toggle-column-tabbed-display" => Action::ToggleColumnTabbedDisplay,
                 "toggle-windowed-fullscreen" => Action::ToggleWindowedFullscreen,
                 "toggle-window-floating" => Action::ToggleWindowFloating,
@@ -1287,6 +1290,26 @@ mod tests {
                                 .iter()
                                 .any(|b| b.combo == combo && b.action == action));
                 }
+        }
+
+        #[test]
+        fn edge_maximize_and_fullscreen_bindings_are_distinct() {
+                let defaults = Config::default();
+                assert!(defaults
+                        .binds
+                        .iter()
+                        .any(|b| b.combo == "Mod+M" && b.action == Action::MaximizeWindowToEdges));
+                assert!(defaults.binds.iter().any(|b| b.combo == "Mod+Shift+F"
+                        && b.action == Action::ToggleWindowedFullscreen));
+                let cfg=parse("binds { Mod+M { maximize-window-to-edges; }; Mod+Shift+F { fullscreen-window; }; }").unwrap();
+                assert!(cfg
+                        .binds
+                        .iter()
+                        .any(|b| b.action == Action::MaximizeWindowToEdges));
+                assert!(cfg
+                        .binds
+                        .iter()
+                        .any(|b| b.action == Action::ToggleWindowedFullscreen));
         }
 
         #[test]

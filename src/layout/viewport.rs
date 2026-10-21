@@ -99,7 +99,11 @@ impl Workspace {
                 let Some(col) = self.columns.get(self.active_column_idx) else {
                         return false;
                 };
-                if col.is_full_width || col.is_maximized || self.fullscreen_id.is_some() {
+                if col.is_full_width
+                        || col.is_maximized
+                        || col.is_edge_maximized
+                        || self.fullscreen_id.is_some()
+                {
                         return false;
                 }
                 if params.center_focused_column == CenterFocused::Always {

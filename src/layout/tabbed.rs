@@ -57,7 +57,9 @@ impl Column {
                         .iter()
                         .enumerate()
                         .filter(move |(i, _)| {
-                                (self.display != ColumnDisplay::Tabbed && !self.is_maximized)
+                                (self.display != ColumnDisplay::Tabbed
+                                        && !self.is_maximized
+                                        && !self.is_edge_maximized)
                                         || *i == self.active_tile_idx
                         })
                         .map(|(_, t)| t.id)
@@ -116,6 +118,7 @@ impl Workspace {
                         ColumnDisplay::Normal
                 };
                 if col.display == ColumnDisplay::Normal && col.tiles.len() > 1 {
+                        col.is_edge_maximized = false;
                         if col.is_maximized {
                                 col.is_maximized = false;
                                 col.is_full_width = false;

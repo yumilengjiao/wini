@@ -48,6 +48,7 @@ impl From<String> for AppError {
 
 mod floating;
 mod tabs;
+mod window_mode;
 use floating::{FloatState, FloatingFocus};
 
 mod overview;
@@ -91,7 +92,7 @@ struct AppState {
         interact_start_rect: Option<(f64, f64, f64, f64)>,
         /// Windows we stripped decorations from (windowed fullscreen);
         /// used to restore them on exit/removal.
-        borderless: std::collections::HashSet<isize>,
+        decorations: crate::win::decorations::Decorations,
         /// Floating windows (out of the tiling grid).
         floating: std::collections::HashMap<isize, FloatState>,
         floating_focus: FloatingFocus,
@@ -470,6 +471,7 @@ impl AppState {
                 if self.interacting_window.is_some() || self.suspended {
                         return;
                 }
+                self.sync_fullscreen_decorations();
                 // Keep layout springs alive across overview entry. Only the
                 // workspace camera is replaced by the overview's own camera.
                 let params = self.params.clone();
@@ -864,6 +866,7 @@ impl AppState {
                 &mut self,
                 device: &str,
         ) {
+                self.sync_fullscreen_decorations();
                 let params = self.params.clone();
                 self.transport.sync(&self.layout, &self.monitors, &params);
                 let finals = self.transport.workspace_rects(&self.layout, device);
@@ -1647,6 +1650,11 @@ impl AppState {
                                         skip_view_refresh = layout_params.center_focused_column
                                                 != geometry::CenterFocused::Always;
                                 },
+                                MaximizeWindowToEdges => {
+                                        fullscreen_prev = ws.fullscreen_id;
+                                        changed = ws.toggle_maximize_window_to_edges();
+                                        fullscreen_now = ws.fullscreen_id;
+                                },
                                 ToggleColumnTabbedDisplay => {
                                         fullscreen_prev = ws.fullscreen_id;
                                         changed = ws.toggle_column_tabbed_display();
@@ -1781,9 +1789,11 @@ impl AppState {
                         if let Some(cur_id) = fullscreen_now {
                                 let hwnd = HWND(cur_id as *mut _);
                                 if crate::win::api::is_alive(hwnd) {
-                                        placement::set_borderless(hwnd, true);
+                                        self.decorations.make_borderless(hwnd);
+                                        for host in self.overview_hosts.values_mut() {
+                                                host.refresh_frame_insets(cur_id);
+                                        }
                                         placement::raise(hwnd);
-                                        self.borderless.insert(cur_id);
                                 }
                         }
                         if let Some(idx) = ws_switch {
@@ -2058,11 +2068,9 @@ impl AppState {
                 &mut self,
                 id: isize,
         ) {
-                if self.borderless.remove(&id) {
-                        let hwnd = HWND(id as *mut _);
-                        if crate::win::api::is_alive(hwnd) {
-                                placement::set_borderless(hwnd, false);
-                        }
+                self.decorations.restore(id);
+                for host in self.overview_hosts.values_mut() {
+                        host.refresh_frame_insets(id);
                 }
         }
 
@@ -2406,6 +2414,10 @@ impl AppState {
                 if self.interacting_window.is_some() || self.suspended {
                         return;
                 }
+                // Sizing modes can change through tab/column moves as well
+                // as explicit fullscreen actions. Reconcile saved styles before
+                // measuring the geometry for this frame.
+                self.sync_fullscreen_decorations();
                 let params = self.params.clone();
                 // The transport owns all tiled-window geometry: retarget its
                 // per-tile / view-offset / workspace-switch springs to the
@@ -2474,36 +2486,24 @@ impl AppState {
                 self.update_focus_border();
         }
 
-        /// Sample the transport, apply moves/visibility to real windows,
-        /// and handle the windowed-fullscreen override (cover the whole
-        /// monitor + stay on top). Visibility is diffed against `shown` so
-        /// `set_shown` only fires when a window actually appears/disappears
-        /// (during a workspace switch, workspaces enter/leave the sweep).
+        /// Apply the shared scene frame. Geometry for all sizing modes is
+        /// produced by Transport, including overview's final handoff frame.
         fn apply_transport_frame(&mut self) {
                 let skip: std::collections::HashSet<String> =
                         self.overviews.keys().cloned().collect();
                 let frame = self.transport.frame(&self.layout, &self.monitors, &skip);
 
-                // Fullscreen ids per monitor (active workspace only).
-                let mut fs_ids: std::collections::HashSet<isize> = std::collections::HashSet::new();
-                let mut fs_rect: std::collections::HashMap<isize, (i32, i32, i32, i32)> =
-                        std::collections::HashMap::new();
-                for mon in &self.monitors {
-                        if let Some(ml) = self.layout.monitor(&mon.device)
-                                && let Some(id) = ml.active_workspace().fullscreen_id
-                        {
-                                fs_ids.insert(id);
-                                fs_rect.insert(
-                                        id,
-                                        (
-                                                mon.full.left,
-                                                mon.full.top,
-                                                mon.full.right - mon.full.left,
-                                                mon.full.bottom - mon.full.top,
-                                        ),
-                                );
-                        }
-                }
+                let fs_ids: std::collections::HashSet<_> = self
+                        .monitors
+                        .iter()
+                        .filter(|mon| !skip.contains(&mon.device))
+                        .filter_map(|mon| {
+                                self.layout
+                                        .monitor(&mon.device)?
+                                        .active_workspace()
+                                        .fullscreen_id
+                        })
+                        .collect();
 
                 // Visibility. `frame.hide` is authoritative for windows on
                 // non-rendered workspaces (of monitors this frame owns), and
@@ -2521,22 +2521,7 @@ impl AppState {
                         }
                         self.shown.remove(&id);
                 }
-                // Apply moves, overriding fullscreen windows to cover the
-                // whole monitor.
-                let mut moves: Vec<geometry::TileRect> = Vec::with_capacity(frame.moves.len());
-                for r in frame.moves {
-                        if let Some(&(x, y, w, h)) = fs_rect.get(&r.id) {
-                                moves.push(geometry::TileRect {
-                                        id: r.id,
-                                        x,
-                                        y,
-                                        w,
-                                        h,
-                                });
-                        } else {
-                                moves.push(r);
-                        }
-                }
+                let moves = frame.moves;
                 // Newly selected tabs must be placed while still hidden.
                 // Showing first exposes the old stacked/off-screen rectangle
                 // before the asynchronous SetWindowPos lands.
@@ -2856,7 +2841,7 @@ impl App {
                         interacting_window: None,
                         suspended: false,
                         interact_start_rect: None,
-                        borderless: std::collections::HashSet::new(),
+                        decorations: crate::win::decorations::Decorations::default(),
                         floating: std::collections::HashMap::new(),
                         floating_focus: FloatingFocus::default(),
                         hidden_by_us: std::collections::HashSet::new(),

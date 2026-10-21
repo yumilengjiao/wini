@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub mod api;
+pub mod decorations;
 pub mod events;
 pub mod focus_border;
 pub mod frame;

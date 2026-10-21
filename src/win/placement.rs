@@ -7,56 +7,14 @@
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, GetWindowRect,
-        GetWindowThreadProcessId, HWND_TOP, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE,
-        SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-        SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-        WINDOW_LONG_PTR_INDEX, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX,
-        WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+        EnumWindows, GWL_EXSTYLE, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+        HWND_TOP, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, ShowWindow,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows::core::BOOL;
 
 use crate::layout::geometry::TileRect;
-
-/// Decorations to strip for the borderless windowed-fullscreen look.
-const FULLSCREEN_STRIP: u32 =
-        WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0;
-
-/// Strip (on) / restore (off) window decorations for the windowed
-/// fullscreen mode. `on=false` only re-adds what we previously stripped
-/// — callers must only call it for windows they borderlessed.
-pub fn set_borderless(
-        hwnd: HWND,
-        on: bool,
-) {
-        let style = super::api::get_window_long_ptr(hwnd, GWL_STYLE.0) as u32;
-        let new_style = if on {
-                style & !FULLSCREEN_STRIP
-        } else {
-                style | FULLSCREEN_STRIP
-        };
-        if new_style == style {
-                return;
-        }
-        unsafe {
-                let _ = SetWindowLongPtrW(
-                        hwnd,
-                        WINDOW_LONG_PTR_INDEX(GWL_STYLE.0),
-                        new_style as isize,
-                );
-                // Frame-changed without moving/resizing so the app redraws its
-                // frame area immediately.
-                let _ = SetWindowPos(
-                        hwnd,
-                        None,
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                );
-        }
-}
 
 /// Bring a window to the top of the Z order without moving it (used
 /// for the windowed-fullscreen window, which must cover its tile
