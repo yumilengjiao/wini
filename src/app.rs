@@ -554,7 +554,7 @@ impl AppState {
                         .flat_map(|(_, rs)| rs.iter().map(|r| r.id))
                         .collect();
                 host.sync_sources(&sources);
-                host.update_rects(&ov.current_rects());
+                host.update_rects(&ov.current_rects(), ov.zoom());
                 // The host is opaque and topmost from the first frame, which
                 // covers the real windows completely (no see-through
                 // duplicate). At the opening frame the zoom is ~1 so the
@@ -575,7 +575,7 @@ impl AppState {
                 }
                 // A just-shown source may need one property refresh before DWM
                 // paints its first live thumbnail.
-                host.update_rects(&ov.current_rects());
+                host.update_rects(&ov.current_rects(), ov.zoom());
                 placement::raise_bars(&self.monitors);
                 log::debug!(
                         "overview[{device}]: opening ({} workspaces)",
@@ -878,7 +878,7 @@ impl AppState {
                 let sources: Vec<isize> = settled.iter().map(|r| r.id).collect();
                 if let Some(host) = self.overview_hosts.get_mut(device) {
                         host.sync_sources(&sources);
-                        host.update_rects(&ov.current_rects());
+                        host.update_rects(&ov.current_rects(), ov.zoom());
                         host.raise();
                 }
                 placement::raise_bars(&self.monitors);
@@ -2533,7 +2533,7 @@ impl AppState {
                                 log::debug!("overview[{device}]: zoom={zoom:.3} cam={cam:.2}");
                                 let rects = ov.rects_at(zoom, cam);
                                 if let Some(host) = self.overview_hosts.get_mut(&device) {
-                                        host.update_rects(&rects);
+                                        host.update_rects(&rects, zoom);
                                 }
                                 // No per-frame re-raise: the host is opaque and
                                 // topmost and the real windows don't move during the
@@ -2546,7 +2546,7 @@ impl AppState {
                                 // thumbnails keep the last pre-settle sample while
                                 // the focus ring has already reached its target.
                                 if let Some(host) = self.overview_hosts.get_mut(&device) {
-                                        host.update_rects(&ov.current_rects());
+                                        host.update_rects(&ov.current_rects(), ov.zoom());
                                 }
                                 // Open and settled: maintain z order as a defense in
                                 // depth — windows can raise themselves for reasons we
@@ -2608,7 +2608,7 @@ impl AppState {
                                 }
                         }
                         if let Some(host) = self.overview_hosts.get_mut(&device) {
-                                host.update_rects(&frame.moves);
+                                host.update_rects(&frame.moves, 1.0);
                         }
                         // Restore OS focus under the cover, so activation repaint
                         // is not first triggered after the thumbnails disappear.

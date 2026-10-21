@@ -1,4 +1,4 @@
-//! Visible window geometry and DWM thumbnail cropping.
+//! Visible window geometry for real HWNDs and native DWM thumbnail destinations.
 //!
 //! All coordinates are physical pixels; margins are measured per HWND, not
 //! guessed from a particular Windows version, DPI, or application class.
@@ -53,61 +53,41 @@ impl FrameInsets {
                 }
         }
 
-        /// DWM can report a full outer surface or an already-trimmed surface.
-        /// Avoid cropping the latter twice; otherwise map margins to source px.
-        pub fn source_crop(
-                self,
-                outer_size: (f64, f64),
-                source_size: (i32, i32),
-        ) -> RECT {
-                let (sw, sh) = (source_size.0.max(1), source_size.1.max(1));
-                let visible_w = outer_size.0 - self.left - self.right;
-                let visible_h = outer_size.1 - self.top - self.bottom;
-                if (sw as f64 - visible_w).abs() <= 1.0 && (sh as f64 - visible_h).abs() <= 1.0 {
-                        return RECT {
-                                left: 0,
-                                top: 0,
-                                right: sw,
-                                bottom: sh,
-                        };
-                }
-                let sx = sw as f64 / outer_size.0.max(1.0);
-                let sy = sh as f64 / outer_size.1.max(1.0);
-                let left = ((self.left * sx).round() as i32).clamp(0, sw - 1);
-                let top = ((self.top * sy).round() as i32).clamp(0, sh - 1);
-                RECT {
-                        left,
-                        top,
-                        right: (sw - (self.right * sx).round() as i32).clamp(left + 1, sw),
-                        bottom: (sh - (self.bottom * sy).round() as i32).clamp(top + 1, sh),
-                }
-        }
-
-        /// Independent X/Y scaling is required while a parked source window
-        /// is stretched by a width animation in addition to overview zoom.
+        /// Convert an animated outer destination to its visible frame. Resize
+        /// margins stay physical; only overview zoom scales them. A width
+        /// animation must NOT multiply margins by target_width/source_width.
         pub fn apply(
                 self,
                 rect: (f64, f64, f64, f64),
-                source_size: (f64, f64),
+                zoom: f64,
         ) -> (i32, i32, i32, i32) {
                 let (x, y, w, h) = rect;
-                let sx = w / source_size.0.max(1.0);
-                let sy = h / source_size.1.max(1.0);
                 let (l, t, r, b) = (
-                        (x + self.left * sx).round() as i32,
-                        (y + self.top * sy).round() as i32,
-                        (x + w - self.right * sx).round() as i32,
-                        (y + h - self.bottom * sy).round() as i32,
+                        (x + self.left * zoom).round() as i32,
+                        (y + self.top * zoom).round() as i32,
+                        (x + w - self.right * zoom).round() as i32,
+                        (y + h - self.bottom * zoom).round() as i32,
                 );
                 (l, t, (r - l).max(1), (b - t).max(1))
         }
 }
 
+/// Measure margins only when the outer bounds bracket a stable DWM read.
+/// The two APIs are not an atomic snapshot; during asynchronous window resize,
+/// combining different frames can manufacture huge or negative margins.
 pub fn frame_insets(hwnd: HWND) -> FrameInsets {
-        match (window_rect(hwnd), frame_rect(hwnd)) {
-                (Some(win), Some(frame)) => FrameInsets::between(win, frame),
-                _ => FrameInsets::default(),
+        for _ in 0..2 {
+                let Some(before) = window_rect(hwnd) else {
+                        break;
+                };
+                let Some(frame) = frame_rect(hwnd) else {
+                        break;
+                };
+                if window_rect(hwnd) == Some(before) {
+                        return FrameInsets::between(before, frame);
+                }
         }
+        FrameInsets::default()
 }
 
 #[cfg(test)]
@@ -121,52 +101,66 @@ mod tests {
                         (-993.0, 48.0, 986.0, 745.0),
                 );
                 assert_eq!(
-                        margins.apply((-1000.0, 48.0, 1000.0, 752.0), (1000.0, 752.0)),
+                        margins.apply((-1000.0, 48.0, 1000.0, 752.0), 1.0),
                         (-993, 48, 986, 745)
                 );
                 assert_eq!(
-                        margins.apply((100.0, 100.0, 500.0, 376.0), (1000.0, 752.0)),
+                        margins.apply((100.0, 100.0, 500.0, 376.0), 0.5),
                         (104, 100, 493, 373)
                 );
         }
 
         #[test]
-        fn thumbnail_margins_follow_independent_resize_axes() {
-                let margins =
-                        FrameInsets::between((0.0, 0.0, 1000.0, 800.0), (10.0, 0.0, 980.0, 790.0));
+        fn resize_keeps_physical_margins_instead_of_stretching_them() {
+                let margins = FrameInsets::between(
+                        (4.0, 3.0, 1235.0, 1594.0),
+                        (14.0, 3.0, 1215.0, 1584.0),
+                );
                 assert_eq!(
-                        margins.apply((100.0, 50.0, 800.0, 400.0), (1000.0, 800.0)),
-                        (108, 50, 784, 395)
+                        margins.apply((4.0, 3.0, 2470.0, 1594.0), 1.0),
+                        (14, 3, 2450, 1584)
+                );
+                assert_eq!(
+                        margins.apply((100.0, 100.0, 1235.0, 797.0), 0.5),
+                        (105, 100, 1225, 792)
                 );
         }
 
         #[test]
-        fn source_crop_handles_full_and_already_visible_dwm_surfaces() {
-                let margins =
-                        FrameInsets::between((0.0, 0.0, 1000.0, 800.0), (10.0, 0.0, 980.0, 790.0));
-                let full = margins.source_crop((1000.0, 800.0), (1000, 800));
-                assert_eq!(
-                        (full.left, full.top, full.right, full.bottom),
-                        (10, 0, 990, 790)
-                );
-                let visible = margins.source_crop((1000.0, 800.0), (980, 790));
-                assert_eq!(
-                        (visible.left, visible.top, visible.right, visible.bottom),
-                        (0, 0, 980, 790)
-                );
-                let scaled = margins.source_crop((1000.0, 800.0), (2000, 1600));
-                assert_eq!(
-                        (scaled.left, scaled.top, scaled.right, scaled.bottom),
-                        (20, 0, 1980, 1580)
-                );
+        fn real_terminal_fixture_returns_same_edge_before_and_after_zoom() {
+                // Read-only HWND/DWM probe on the user's desktop: native
+                // thumbnail is 1215x1584, NOT the 1235x1594 outer HWND.
+                let outer = (4.0, 3.0, 1235.0, 1594.0);
+                let frame = (14.0, 3.0, 1215.0, 1584.0);
+                let insets = FrameInsets::between(outer, frame);
+                let (fx, fy, fw, fh) = (0.0, 0.0, 2478.0, 1600.0);
+                for zoom in [1.0, 0.75, 0.35, 0.75, 1.0] {
+                        let destination = (
+                                fx + fw * (1.0 - zoom) / 2.0 + (outer.0 - fx) * zoom,
+                                fy + fh * (1.0 - zoom) / 2.0 + (outer.1 - fy) * zoom,
+                                outer.2 * zoom,
+                                outer.3 * zoom,
+                        );
+                        let actual = insets.apply(destination, zoom);
+                        let expected_left = (fx + fw * (1.0 - zoom) / 2.0 + (frame.0 - fx) * zoom)
+                                .round() as i32;
+                        let expected_right =
+                                (fx + fw * (1.0 - zoom) / 2.0 + (frame.0 + frame.2 - fx) * zoom)
+                                        .round() as i32;
+                        assert_eq!(actual.0, expected_left);
+                        assert_eq!(actual.0 + actual.2, expected_right);
+                }
+                assert_eq!(insets.apply(outer, 1.0), (14, 3, 1215, 1584));
         }
 
         #[test]
-        fn tiny_source_crop_remains_nonempty() {
-                let margins =
-                        FrameInsets::between((0.0, 0.0, 100.0, 100.0), (49.0, 49.0, 2.0, 2.0));
-                let crop = margins.source_crop((100.0, 100.0), (1, 1));
-                assert_eq!((crop.left, crop.top, crop.right, crop.bottom), (0, 0, 1, 1));
+        fn negative_monitor_visible_edges_use_same_coordinate_space() {
+                let outer = (-2467.0, 3.0, 2470.0, 1594.0);
+                let frame = (-2457.0, 3.0, 2450.0, 1584.0);
+                assert_eq!(
+                        FrameInsets::between(outer, frame).apply(outer, 1.0),
+                        (-2457, 3, 2450, 1584)
+                );
         }
 
         #[test]
@@ -176,7 +170,7 @@ mod tests {
                         (-10.0, -10.0, 820.0, 620.0),
                 );
                 assert_eq!(
-                        margins.apply((0.0, 0.0, 800.0, 600.0), (800.0, 600.0)),
+                        margins.apply((0.0, 0.0, 800.0, 600.0), 1.0),
                         (0, 0, 800, 600)
                 );
         }

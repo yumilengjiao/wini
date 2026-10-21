@@ -64,6 +64,10 @@ pub struct OverviewHost {
         /// is an `isize` in windows-rs). Dead/deregistered entries are
         /// pruned by `sync_sources`.
         thumbs: Vec<(isize, isize)>,
+        /// Measure decorations once when registering the source. Reading
+        /// outer rect + asynchronously updated DWM bounds after handoff resize
+        /// can combine two different frames and manufacture a large inset.
+        source_insets: std::collections::HashMap<isize, crate::win::frame::FrameInsets>,
         /// Host window origin in screen coords (thumbnail destination
         /// rects are client-relative).
         origin: (i32, i32),
@@ -152,6 +156,7 @@ impl OverviewHost {
                         let host = OverviewHost {
                                 hwnd,
                                 thumbs: Vec::new(),
+                                source_insets: std::collections::HashMap::new(),
                                 origin: (l, t),
                                 visible_rects: std::collections::HashMap::new(),
                                 desktop_source,
@@ -271,6 +276,7 @@ impl OverviewHost {
                 &mut self,
                 sources: &[isize],
         ) {
+                self.source_insets.retain(|id, _| sources.contains(id));
                 self.thumbs.retain(|(id, thumb)| {
                         if sources.contains(id) {
                                 true
@@ -293,7 +299,17 @@ impl OverviewHost {
                         // Safety: both HWNDs are valid; the host belongs to this
                         // thread.
                         match unsafe { DwmRegisterThumbnail(self.hwnd, hwnd) } {
-                                Ok(thumb) => self.thumbs.push((id, thumb)),
+                                Ok(thumb) => {
+                                        let insets = crate::win::frame::frame_insets(hwnd);
+                                        log::debug!(
+                                                "overview source {id}: outer={:?}, frame={:?}, native={:?}, insets={insets:?}",
+                                                crate::win::api::window_rect(hwnd),
+                                                crate::win::frame::frame_rect(hwnd),
+                                                unsafe { DwmQueryThumbnailSourceSize(thumb) }
+                                        );
+                                        self.source_insets.insert(id, insets);
+                                        self.thumbs.push((id, thumb));
+                                },
                                 Err(e) => log::warn!(
                                         "overview: thumbnail for window {id} failed: {e}"
                                 ),
@@ -317,6 +333,7 @@ impl OverviewHost {
         pub fn update_rects(
                 &mut self,
                 rects: &[TileRect],
+                zoom: f64,
         ) {
                 self.visible_rects.clear();
                 for r in rects {
@@ -324,40 +341,17 @@ impl OverviewHost {
                         else {
                                 continue;
                         };
-                        let hwnd = HWND(r.id as *mut core::ffi::c_void);
-                        let Some((_, _, ow, oh)) = crate::win::api::window_rect(hwnd) else {
+                        let Some(insets) = self.source_insets.get(&r.id) else {
                                 continue;
                         };
-                        let Ok(size) = (unsafe { DwmQueryThumbnailSourceSize(*thumb) }) else {
-                                continue;
-                        };
-                        if size.cx <= 0 || size.cy <= 0 {
-                                continue;
-                        }
-                        let insets = crate::win::frame::frame_insets(hwnd);
                         let (x, y, w, h) = insets
-                                .apply((r.x as f64, r.y as f64, r.w as f64, r.h as f64), (ow, oh));
-                        // Explicitly remove invisible resize margins from the
-                        // source AND destination. DWM then paints the visible
-                        // edge at the exact same rect used by the focus ring.
-                        let source = insets.source_crop((ow, oh), (size.cx, size.cy));
-                        let props = DWM_THUMBNAIL_PROPERTIES {
-                                dwFlags: DWM_TNP_RECTDESTINATION
-                                        | DWM_TNP_RECTSOURCE
-                                        | DWM_TNP_OPACITY
-                                        | DWM_TNP_VISIBLE
-                                        | DWM_TNP_SOURCECLIENTAREAONLY,
-                                rcSource: source,
-                                rcDestination: RECT {
-                                        left: x - self.origin.0,
-                                        top: y - self.origin.1,
-                                        right: x - self.origin.0 + w,
-                                        bottom: y - self.origin.1 + h,
-                                },
-                                opacity: 255,
-                                fVisible: windows::core::BOOL(1),
-                                fSourceClientAreaOnly: windows::core::BOOL(0),
-                        };
+                                .apply((r.x as f64, r.y as f64, r.w as f64, r.h as f64), zoom);
+                        // Application thumbnails are DWM's native visible
+                        // surface (source size matches extended frame bounds).
+                        // Leave rcSource unset: full-source rcSource is not an
+                        // identity transform for every framed/CSD window. Only
+                        // desktop thumbnails need explicit source cropping.
+                        let props = application_thumbnail_properties((x, y, w, h), self.origin);
                         // Safety: thumbnail handle is valid (we own it).
                         match unsafe { DwmUpdateThumbnailProperties(*thumb, &props) } {
                                 Ok(()) => {
@@ -369,6 +363,31 @@ impl OverviewHost {
                                 ),
                         }
                 }
+        }
+}
+
+/// Use the native whole application surface. Unlike wallpaper, app sources
+/// must not receive a source rect derived from HWND outer-frame coordinates.
+fn application_thumbnail_properties(
+        visible: (i32, i32, i32, i32),
+        origin: (i32, i32),
+) -> DWM_THUMBNAIL_PROPERTIES {
+        let (x, y, w, h) = visible;
+        DWM_THUMBNAIL_PROPERTIES {
+                dwFlags: DWM_TNP_RECTDESTINATION
+                        | DWM_TNP_OPACITY
+                        | DWM_TNP_VISIBLE
+                        | DWM_TNP_SOURCECLIENTAREAONLY,
+                rcDestination: RECT {
+                        left: x - origin.0,
+                        top: y - origin.1,
+                        right: x - origin.0 + w,
+                        bottom: y - origin.1 + h,
+                },
+                opacity: 255,
+                fVisible: windows::core::BOOL(1),
+                fSourceClientAreaOnly: windows::core::BOOL(0),
+                ..Default::default()
         }
 }
 
@@ -539,6 +558,19 @@ mod tests {
                         bottom: b,
                 }
         }
+        #[test]
+        fn application_surface_uses_native_source_and_exact_visible_destination() {
+                let visible = (-993, 48, 986, 745);
+                let props = application_thumbnail_properties(visible, (-1000, 0));
+                assert_eq!(props.dwFlags & DWM_TNP_RECTSOURCE, 0);
+                assert_ne!(props.dwFlags & DWM_TNP_RECTDESTINATION, 0);
+                assert!(!props.fSourceClientAreaOnly.as_bool());
+                let destination = props.rcDestination;
+                let source = props.rcSource;
+                assert_eq!(destination, rect(7, 48, 993, 793));
+                assert_eq!(source, RECT::default());
+        }
+
         #[test]
         fn desktop_crop_preserves_taskbar_edges() {
                 let bounds = rect(0, 0, 2560, 1600);
