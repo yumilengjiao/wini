@@ -1438,6 +1438,21 @@ impl AppState {
                                         .tiling_view_width((m.work.right - m.work.left) as f64)
                         })
                         .unwrap_or(1920.0);
+                let view_height = self
+                        .monitors
+                        .iter()
+                        .find(|m| m.device == device)
+                        .map(|m| {
+                                self.params
+                                        .tiling_area((
+                                                m.work.left as f64,
+                                                m.work.top as f64,
+                                                (m.work.right - m.work.left) as f64,
+                                                (m.work.bottom - m.work.top) as f64,
+                                        ))
+                                        .3
+                        })
+                        .unwrap_or(1080.0);
                 {
                         let monitor_layout = self.layout.monitor_mut(&device).unwrap();
                         let ws = monitor_layout.active_workspace_mut();
@@ -1509,9 +1524,28 @@ impl AppState {
                                 MoveColumnToLast => changed = ws.move_column_to_edge(Edge::Last),
                                 SetWindowHeight(spec) => {
                                         if let Some(change) = SizeChange::parse(&spec) {
-                                                changed = ws.set_window_height(&change);
+                                                changed = ws.set_window_height(
+                                                        &change,
+                                                        &layout_params,
+                                                        view_height,
+                                                );
                                         }
                                 },
+                                SwitchPresetWindowHeight => {
+                                        changed = ws.cycle_window_height(
+                                                &layout_params,
+                                                view_height,
+                                                true,
+                                        );
+                                },
+                                SwitchPresetWindowHeightBack => {
+                                        changed = ws.cycle_window_height(
+                                                &layout_params,
+                                                view_height,
+                                                false,
+                                        );
+                                },
+                                ResetWindowHeight => changed = ws.reset_window_height(),
                                 ToggleFullWidth => changed = ws.toggle_full_width(),
                                 MaximizeColumn => changed = ws.toggle_maximized(),
                                 CenterColumn => {

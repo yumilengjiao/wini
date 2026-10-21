@@ -64,6 +64,8 @@ pub struct Bind {
         pub action: Action,
 }
 
+mod sizing;
+
 /// Everything the WM can do from a key press. Mirrors the niri action
 /// names we intend to support (a growing subset).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +109,9 @@ pub enum Action {
         ExpandColumnToAvailableWidth,
         ToggleWindowedFullscreen,
         SetWindowHeight(String),
+        SwitchPresetWindowHeight,
+        SwitchPresetWindowHeightBack,
+        ResetWindowHeight,
         FocusWorkspace(u8),
         WorkspaceSwitch(u8),
         /// niri focus-workspace-down/up: move to the next/previous workspace
@@ -441,6 +446,8 @@ impl Default for Config {
                                 // Cycle preset column widths (niri: 1/3, 1/2, 2/3).
                                 bind("Mod+R", Action::SwitchPresetColumnWidth),
                                 bind("Mod+Shift+R", Action::SwitchPresetColumnWidthBack),
+                                bind("Mod+Ctrl+Shift+R", Action::SwitchPresetWindowHeight),
+                                bind("Mod+Ctrl+R", Action::ResetWindowHeight),
                                 // Finer width/height adjustments (niri defaults).
                                 bind("Mod+Minus", Action::SetColumnWidth("-10%".into())),
                                 bind("Mod+Equal", Action::SetColumnWidth("+10%".into())),
@@ -661,6 +668,10 @@ fn parse_layout(
                         },
                         "preset-column-widths" => {
                                 config.layout.preset_column_widths = parse_preset_widths(n);
+                        },
+                        "preset-window-heights" => {
+                                config.layout.preset_window_heights =
+                                        sizing::parse_height_presets(n);
                         },
                         "focus-ring" => parse_focus_ring(n, config),
                         other => log::debug!("ignoring layout node {other:?}"),
@@ -1123,6 +1134,9 @@ fn parse_action(node: &KdlNode) -> Option<Action> {
                 "move-column-to-first" => Action::MoveColumnToFirst,
                 "move-column-to-last" => Action::MoveColumnToLast,
                 "set-window-height" => Action::SetWindowHeight(arg.unwrap_or_default()),
+                "switch-preset-window-height" => Action::SwitchPresetWindowHeight,
+                "switch-preset-window-height-back" => Action::SwitchPresetWindowHeightBack,
+                "reset-window-height" => Action::ResetWindowHeight,
                 "toggle-full-width" => Action::ToggleFullWidth,
                 "maximize-column" => Action::MaximizeColumn,
                 "center-column" => Action::CenterColumn,

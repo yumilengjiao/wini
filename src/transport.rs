@@ -394,6 +394,7 @@ mod tests {
                         gaps: 0.0,
                         default_column_width: ColumnWidth::Proportion(0.5),
                         preset_column_widths: Vec::new(),
+                        preset_window_heights: Vec::new(),
                         center_focused_column: CenterFocused::Never,
                         struts: geometry::Struts::default(),
                 }
@@ -583,6 +584,39 @@ mod tests {
                         t.workspace_rects(&layout, "D")[0].1,
                         t.frame(&layout, &mons, &HashSet::new()).moves
                 );
+        }
+
+        #[test]
+        fn height_resize_is_shared_by_overview_and_normal_transport() {
+                let mut layout = Layout::new();
+                layout.add_window("D", 1);
+                layout.add_window("D", 2);
+                let ws = layout.monitor_mut("D").unwrap().active_workspace_mut();
+                ws.consume_or_expel(crate::layout::DirH::Left);
+                let mons = vec![monitor("D")];
+                let p = params();
+                let slow = AnimParams {
+                        kind: AnimKind::Easing {
+                                duration: std::time::Duration::from_secs(60),
+                                curve: crate::anim::Curve::Linear,
+                        },
+                        slowdown: 1.0,
+                };
+                let mut t = Transport::new(slow, slow, slow, slow);
+                t.sync(&layout, &mons, &p);
+                let before = t.workspace_rects(&layout, "D")[0].1.clone();
+                let ws = layout.monitor_mut("D").unwrap().active_workspace_mut();
+                ws.set_window_height(&crate::layout::SizeChange::Fixed(600.0), &p, 800.0);
+                t.sync(&layout, &mons, &p);
+                assert!(t.layout_animating("D"));
+                let during = t.workspace_rects(&layout, "D")[0].1.clone();
+                for (a, b) in before.iter().zip(during) {
+                        assert!((a.h - b.h).abs() <= 1);
+                }
+                t.snap("D");
+                let final_rects = t.workspace_rects(&layout, "D")[0].1.clone();
+                assert_eq!(final_rects, t.frame(&layout, &mons, &HashSet::new()).moves);
+                assert_eq!(final_rects.iter().find(|r| r.id == 2).unwrap().h, 600);
         }
 
         #[test]

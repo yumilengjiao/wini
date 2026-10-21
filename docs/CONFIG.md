@@ -62,6 +62,13 @@ layout {
         fixed 1280
     }
 
+    // Heights cycled by Mod+Ctrl+Shift+R; empty keeps 1/3, 1/2, 2/3 defaults.
+    preset-window-heights {
+        proportion 0.33333
+        proportion 0.5
+        proportion 0.66667
+    }
+
     // Outline around the focused window.
     focus-ring {
         // off                 - disable the ring
@@ -164,7 +171,9 @@ A config-provided `binds` section **replaces** the default binds.
 | `consume-or-expel-window-left` / `-right` | merge into / split out of the neighboring column |
 | `set-column-width SPEC` | set focused column width (see below); bare = cycle `preset-column-widths` |
 | `switch-preset-column-width` / `-back` | cycle preset widths wider-first / narrower-first (Mod+R / Mod+Shift+R) |
-| `set-window-height SPEC` | set focused window height (same SPEC syntax) |
+| `set-window-height SPEC` | set focused window height in physical pixels or a proportion of tiling-area height |
+| `switch-preset-window-height` / `-back` | cycle height presets taller-first / shorter-first (forward: Mod+Ctrl+Shift+R; reverse unbound) |
+| `reset-window-height` | return focused window to automatic height sharing (Mod+Ctrl+R) |
 | `toggle-full-width` | column spans the full workspace width |
 | `maximize-column` | toggle column maximize |
 | `center-column` | center the focused column in the view (Mod+C) |
@@ -187,7 +196,14 @@ A config-provided `binds` section **replaces** the default binds.
 view, and `"+10%"` / `"-10%"` adjust the proportion by a signed delta.
 (Quotes are only needed for values with `+`/`-`/`%`.) Default binds:
 Mod+Minus / Mod+Equal adjust column width by ±10%, Mod+Shift+Minus /
-Mod+Shift+Equal adjust window height.
+Mod+Shift+Equal adjust window height. Height percentage deltas are relative
+to the tiling area's height (after struts), not a guessed reference size.
+A fixed/preset-height window reserves its requested height; auto-height
+siblings share the rest, honoring minimum heights. If minimums cannot fit,
+the column extends below the work area rather than overlapping. Reset
+returns the focused window to auto weight 1; a sole fixed-height window may
+leave unused space below it. Floating `set-window-height` keeps its existing
+behavior; preset/reset height actions currently apply to tiled windows only.
 
 ## `window-rule`
 

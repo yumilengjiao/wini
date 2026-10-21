@@ -76,6 +76,7 @@ pub struct LayoutParams {
         /// Preset column widths cycled through by a bare `set-column-width`
         /// (niri's preset-column-widths).
         pub preset_column_widths: Vec<ColumnWidth>,
+        pub preset_window_heights: Vec<super::height::HeightPreset>,
         pub center_focused_column: CenterFocused,
         /// Independent outer spacing in physical pixels. Fullscreen ignores it.
         pub struts: Struts,
@@ -98,6 +99,7 @@ impl Default for LayoutParams {
                                 ColumnWidth::Proportion(0.5),
                                 ColumnWidth::Proportion(0.66667),
                         ],
+                        preset_window_heights: super::height::default_presets(),
                         center_focused_column: CenterFocused::Never,
                         struts: Struts::default(),
                 }
@@ -357,32 +359,7 @@ pub fn tile_heights(
         params: &LayoutParams,
         area_h: f64,
 ) -> Vec<(f64, f64)> {
-        let col = &ws.columns[ci];
-        let n = col.tiles.len();
-        if n == 0 {
-                return Vec::new();
-        }
-        let available = (area_h - params.gaps * (n - 1) as f64).max(n as f64);
-        let total_weight: f64 = col.tiles.iter().map(|t| t.height_weight).sum();
-        let mut out = Vec::with_capacity(n);
-        let mut y = 0.0;
-        let mut used = 0.0;
-        for (i, tile) in col.tiles.iter().enumerate() {
-                let share = if i == n - 1 {
-                        // Last tile takes the remainder to avoid rounding loss.
-                        available - used
-                } else {
-                        let h = available * tile.height_weight / total_weight;
-                        used += h;
-                        h
-                };
-                // Respect the window's enforced minimum height; advance by the
-                // clamped height so tiles never stack on top of each other.
-                let h = share.max(1.0).max(tile.min_h);
-                out.push((y, h));
-                y += h + params.gaps;
-        }
-        out
+        super::height::allocate(&ws.columns[ci], params, area_h)
 }
 
 /// Recompute and store the workspace's view offset so the active
@@ -557,6 +534,7 @@ mod tests {
                         gaps: 8.0,
                         default_column_width: ColumnWidth::Proportion(0.25),
                         preset_column_widths: Vec::new(),
+                        preset_window_heights: Vec::new(),
                         center_focused_column: CenterFocused::OnOverflow,
                         struts: Struts::default(),
                 }
@@ -628,6 +606,7 @@ mod tests {
                         gaps: 8.0,
                         default_column_width: ColumnWidth::Proportion(0.5),
                         preset_column_widths: Vec::new(),
+                        preset_window_heights: Vec::new(),
                         center_focused_column: CenterFocused::OnOverflow,
                         struts: Struts::default(),
                 };

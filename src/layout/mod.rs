@@ -29,6 +29,7 @@
 #![allow(dead_code)]
 
 pub mod geometry;
+pub mod height;
 mod viewport;
 
 use std::collections::HashMap;
@@ -40,9 +41,9 @@ pub type WindowId = isize;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tile {
         pub id: WindowId,
-        /// Height hint: proportional weight for auto height distribution.
-        /// 1.0 = equal share. Fixed heights arrive later with sizing actions.
+        /// Weight used only while this tile is auto-height.
         pub height_weight: f64,
+        pub height: Option<height::WindowHeight>,
         /// Minimum size the real window enforces (WM_GETMINMAXINFO),
         /// physical px. The layout must never compute a smaller tile:
         /// apps like Windows Terminal silently clamp SetWindowPos to
@@ -56,6 +57,7 @@ impl Tile {
                 Tile {
                         id,
                         height_weight: 1.0,
+                        height: None,
                         min_w: 0.0,
                         min_h: 0.0,
                 }
@@ -829,37 +831,6 @@ impl Workspace {
                 };
                 col.is_maximized = !col.is_maximized;
                 col.is_full_width = col.is_maximized;
-                true
-        }
-
-        /// Niri's set-window-height on the focused tile: adjusts the tile's
-        /// height weight or fixed height relative to the column.
-        pub fn set_window_height(
-                &mut self,
-                spec: &SizeChange,
-        ) -> bool {
-                let Some(col) = self.columns.get_mut(self.active_column_idx) else {
-                        return false;
-                };
-                let ti = col.active_tile_idx.min(col.tiles.len().saturating_sub(1));
-                let Some(tile) = col.tiles.get_mut(ti) else {
-                        return false;
-                };
-                match spec {
-                        SizeChange::Delta(d) => {
-                                tile.height_weight = (tile.height_weight + d / 100.0).max(0.1);
-                        },
-                        SizeChange::Fixed(px) => {
-                                // Store as weight relative to a ~800px reference column.
-                                tile.height_weight = (px / 400.0).max(0.05);
-                        },
-                        SizeChange::Proportion(p) => {
-                                tile.height_weight = p.max(0.05);
-                        },
-                        SizeChange::ProportionDelta(dp) => {
-                                tile.height_weight = (tile.height_weight + dp).max(0.05);
-                        },
-                }
                 true
         }
 

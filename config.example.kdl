@@ -37,6 +37,13 @@ layout {
         fixed 1280
     }
 
+    // Height presets; empty block keeps Niri's default thirds/half/two-thirds.
+    preset-window-heights {
+        proportion 0.33333
+        proportion 0.5
+        proportion 0.66667
+    }
+
     focus-ring {
         width 4
         active-color "#7daea3"
@@ -127,6 +134,8 @@ binds {
     Mod+Equal { set-column-width "+100"; }
     // Bare set-column-width cycles the preset-column-widths.
     Mod+W     { set-column-width; }
+    Mod+Ctrl+Shift+R { switch-preset-window-height; }
+    Mod+Ctrl+R { reset-window-height; }
     Mod+Shift+W { set-window-height "+100"; }
     Mod+F     { maximize-column; }
     Mod+Ctrl+C { center-visible-columns; }
