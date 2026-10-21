@@ -15,9 +15,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, HWND_TOPMOST, LWA_ALPHA, RegisterClassW, SW_HIDE,
-        SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetLayeredWindowAttributes,
-        SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_EX_LAYERED,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        SWP_NOACTIVATE, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::w;
 
@@ -44,6 +44,9 @@ impl ColorCell {
 
 pub struct FocusBorder {
         hwnd: HWND,
+        shape: std::cell::Cell<Option<(i32, i32, i32, i32)>>,
+        last_rect: std::cell::Cell<Option<(i32, i32, i32, i32)>>,
+        visible: std::cell::Cell<bool>,
 }
 
 impl FocusBorder {
@@ -86,7 +89,12 @@ impl FocusBorder {
                         // alpha/color key is set — without this the ring exists
                         // but never shows.
                         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-                        Some(FocusBorder { hwnd })
+                        Some(FocusBorder {
+                                hwnd,
+                                shape: std::cell::Cell::new(None),
+                                last_rect: std::cell::Cell::new(None),
+                                visible: std::cell::Cell::new(false),
+                        })
                 }
         }
 
@@ -110,43 +118,74 @@ impl FocusBorder {
                 let r = radius.max(0);
                 let (ow, oh) = (w + 2 * t, h + 2 * t);
                 unsafe {
+                        let color_changed = COLOR.get() != color;
                         COLOR.set(color);
-                        // Shape the window into the ring: full client minus the
-                        // inner rect. SetWindowRgn takes ownership of `ring`.
-                        // CreateRoundRectRgn's ellipse params are the diameter, so
-                        // pass 2*radius for a corner of that radius.
-                        let full = if r > 0 {
-                                CreateRoundRectRgn(0, 0, ow, oh, 2 * (r + t), 2 * (r + t))
-                        } else {
-                                CreateRectRgn(0, 0, ow, oh)
-                        };
-                        let inner = if r > 0 {
-                                CreateRoundRectRgn(t, t, t + w, t + h, 2 * r, 2 * r)
-                        } else {
-                                CreateRectRgn(t, t, t + w, t + h)
-                        };
-                        let ring = CreateRectRgn(0, 0, 0, 0);
-                        CombineRgn(Some(ring), Some(full), Some(inner), RGN_DIFF);
-                        let _ = DeleteObject(full.into());
-                        let _ = DeleteObject(inner.into());
-                        let _ = SetWindowRgn(self.hwnd, Some(ring), true);
+                        let shape = (w, h, t, r);
+                        let shape_changed = self.shape.get() != Some(shape);
+                        if shape_changed {
+                                // Shape the window into the ring: full client minus the
+                                // inner rect. SetWindowRgn takes ownership of `ring`.
+                                // CreateRoundRectRgn's ellipse params are the diameter, so
+                                // pass 2*radius for a corner of that radius.
+                                let full = if r > 0 {
+                                        CreateRoundRectRgn(0, 0, ow, oh, 2 * (r + t), 2 * (r + t))
+                                } else {
+                                        CreateRectRgn(0, 0, ow, oh)
+                                };
+                                let inner = if r > 0 {
+                                        CreateRoundRectRgn(t, t, t + w, t + h, 2 * r, 2 * r)
+                                } else {
+                                        CreateRectRgn(t, t, t + w, t + h)
+                                };
+                                let ring = CreateRectRgn(0, 0, 0, 0);
+                                CombineRgn(Some(ring), Some(full), Some(inner), RGN_DIFF);
+                                let _ = DeleteObject(full.into());
+                                let _ = DeleteObject(inner.into());
+                                if SetWindowRgn(self.hwnd, Some(ring), false) != 0 {
+                                        self.shape.set(Some(shape));
+                                } else {
+                                        // Ownership transfers only on success.
+                                        let _ = DeleteObject(ring.into());
+                                }
+                        }
+                        let rect = (x - t, y - t, ow, oh);
+                        if self.last_rect.get() != Some(rect) || !self.visible.get() {
+                                let _ = SetWindowPos(
+                                        self.hwnd,
+                                        Some(HWND_TOPMOST),
+                                        x - t,
+                                        y - t,
+                                        ow,
+                                        oh,
+                                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                                );
+                                self.last_rect.set(Some(rect));
+                                self.visible.set(true);
+                                let _ = InvalidateRect(Some(self.hwnd), None, false);
+                        } else if color_changed || shape_changed {
+                                let _ = InvalidateRect(Some(self.hwnd), None, false);
+                        }
+                        // Keep above an overview host without rebuilding the
+                        // region or moving/resizing an unchanged border.
                         let _ = SetWindowPos(
                                 self.hwnd,
                                 Some(HWND_TOPMOST),
-                                x - t,
-                                y - t,
-                                ow,
-                                oh,
-                                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_NOACTIVATE
+                                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE,
                         );
-                        let _ = InvalidateRect(Some(self.hwnd), None, false);
-                        let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
                 }
         }
 
         pub fn hide(&self) {
-                unsafe {
-                        let _ = ShowWindow(self.hwnd, SW_HIDE);
+                if self.visible.replace(false) {
+                        unsafe {
+                                let _ = ShowWindow(self.hwnd, SW_HIDE);
+                        }
                 }
         }
 }

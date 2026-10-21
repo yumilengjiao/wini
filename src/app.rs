@@ -2125,22 +2125,24 @@ impl AppState {
                         return;
                 };
                 let id = hwnd.0 as isize;
-                // In an overview the focused window is scaled down; the ring
-                // must outline the scaled rect (the real HWND rect also lags
-                // the zoom animation by a frame).
-                if let Some(r) = self
-                        .overviews
-                        .values()
-                        .find_map(|ov| ov.current_rects().into_iter().find(|r| r.id == id))
-                {
-                        // Config stores 0xRRGGBB; COLORREF wants 0x00BBGGRR.
+                // Use the source window's visible-frame margins in both
+                // modes, scaled with the thumbnail. At zoom=1 the ring has
+                // exactly the same inner edge before and after the handoff.
+                if let Some((r, zoom)) = self.overviews.values().find_map(|ov| {
+                        ov.current_rects()
+                                .into_iter()
+                                .find(|r| r.id == id)
+                                .map(|r| (r, ov.zoom()))
+                }) {
+                        let (x, y, w, h) = crate::win::api::frame_insets(hwnd)
+                                .apply((r.x as f64, r.y as f64, r.w as f64, r.h as f64), zoom);
                         let rgb = ring.active_color;
                         let bgr = ((rgb & 0xFF) << 16) | (rgb & 0x00_FF_00) | ((rgb >> 16) & 0xFF);
                         fb.update(
-                                r.x,
-                                r.y,
-                                r.w,
-                                r.h,
+                                x,
+                                y,
+                                w,
+                                h,
                                 ring.width,
                                 ring.radius,
                                 windows::Win32::Foundation::COLORREF(bgr),
@@ -2176,35 +2178,31 @@ impl AppState {
                 // in-flight rect (what we just sent) plus the visible-edge
                 // insets measured from the live rects (insets don't change
                 // mid-motion; both rects are stale by the same amount).
-                let rect = if let Some((ax, ay, aw, ah)) =
-                        self.transport.window_rect(&self.layout, &self.monitors, id)
-                        && self.transport.animating()
-                        && let (Some(win), Some(frame)) = (
-                                crate::win::api::window_rect(hwnd),
-                                crate::win::api::frame_rect(hwnd),
-                        ) {
-                        let in_l = frame.0 - win.0;
-                        let in_t = frame.1 - win.1;
-                        let in_r = (win.0 + win.2) - (frame.0 + frame.2);
-                        let in_b = (win.1 + win.3) - (frame.1 + frame.3);
-                        Some((
-                                ax as f64 + in_l,
-                                ay as f64 + in_t,
-                                aw as f64 - in_l - in_r,
-                                ah as f64 - in_t - in_b,
-                        ))
+                let rect = if self.transport.animating()
+                        && let Some((ax, ay, aw, ah)) =
+                                self.transport.window_rect(&self.layout, &self.monitors, id)
+                {
+                        Some(crate::win::api::frame_insets(hwnd)
+                                .apply((ax as f64, ay as f64, aw as f64, ah as f64), 1.0))
                 } else {
-                        crate::win::api::frame_rect(hwnd)
+                        crate::win::api::frame_rect(hwnd).map(|(x, y, w, h)| {
+                                (
+                                        x.round() as i32,
+                                        y.round() as i32,
+                                        w.round() as i32,
+                                        h.round() as i32,
+                                )
+                        })
                 };
                 if let Some((x, y, w, h)) = rect {
                         // Config stores 0xRRGGBB; COLORREF wants 0x00BBGGRR.
                         let rgb = ring.active_color;
                         let bgr = ((rgb & 0xFF) << 16) | (rgb & 0x00_FF_00) | ((rgb >> 16) & 0xFF);
                         fb.update(
-                                x as i32,
-                                y as i32,
-                                w as i32,
-                                h as i32,
+                                x,
+                                y,
+                                w,
+                                h,
                                 ring.width,
                                 ring.radius,
                                 windows::Win32::Foundation::COLORREF(bgr),

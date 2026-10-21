@@ -50,6 +50,86 @@ pub fn frame_rect(hwnd: HWND) -> Option<(f64, f64, f64, f64)> {
         }
 }
 
+/// Visible-frame margins measured per window, rather than a fixed border
+/// thickness which varies with DPI, decorations and Windows versions.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FrameInsets {
+        left: f64,
+        top: f64,
+        right: f64,
+        bottom: f64,
+}
+
+impl FrameInsets {
+        fn between(
+                win: (f64, f64, f64, f64),
+                frame: (f64, f64, f64, f64),
+        ) -> Self {
+                let clamp = |v: f64, size: f64| v.clamp(0.0, (size / 2.0 - 0.5).max(0.0));
+                Self {
+                        left: clamp(frame.0 - win.0, win.2),
+                        top: clamp(frame.1 - win.1, win.3),
+                        right: clamp(win.0 + win.2 - frame.0 - frame.2, win.2),
+                        bottom: clamp(win.1 + win.3 - frame.1 - frame.3, win.3),
+                }
+        }
+
+        /// Convert an outer HWND/thumbnail rectangle to its visible edge.
+        /// Overview margins scale with zoom; HWND margins stay physical.
+        pub fn apply(
+                self,
+                rect: (f64, f64, f64, f64),
+                scale: f64,
+        ) -> (i32, i32, i32, i32) {
+                let (x, y, w, h) = rect;
+                let (l, t, r, b) = (
+                        (x + self.left * scale).round() as i32,
+                        (y + self.top * scale).round() as i32,
+                        (x + w - self.right * scale).round() as i32,
+                        (y + h - self.bottom * scale).round() as i32,
+                );
+                (l, t, (r - l).max(1), (b - t).max(1))
+        }
+}
+
+pub fn frame_insets(hwnd: HWND) -> FrameInsets {
+        match (window_rect(hwnd), frame_rect(hwnd)) {
+                (Some(win), Some(frame)) => FrameInsets::between(win, frame),
+                _ => FrameInsets::default(),
+        }
+}
+
+#[cfg(test)]
+mod frame_tests {
+        use super::*;
+        #[test]
+        fn visible_bounds_agree_at_thumbnail_handoff() {
+                let margins = FrameInsets::between(
+                        (-1000.0, 48.0, 1000.0, 752.0),
+                        (-993.0, 48.0, 986.0, 745.0),
+                );
+                assert_eq!(
+                        margins.apply((-1000.0, 48.0, 1000.0, 752.0), 1.0),
+                        (-993, 48, 986, 745)
+                );
+                assert_eq!(
+                        margins.apply((100.0, 100.0, 500.0, 376.0), 0.5),
+                        (104, 100, 493, 373)
+                );
+        }
+        #[test]
+        fn custom_decorations_do_not_expand_the_ring() {
+                let margins = FrameInsets::between(
+                        (0.0, 0.0, 800.0, 600.0),
+                        (-10.0, -10.0, 820.0, 620.0),
+                );
+                assert_eq!(
+                        margins.apply((0.0, 0.0, 800.0, 600.0), 1.0),
+                        (0, 0, 800, 600)
+                );
+        }
+}
+
 /// Current cursor position in screen coordinates.
 pub fn cursor_pos() -> Option<(f64, f64)> {
         let mut pt = POINT::default();
