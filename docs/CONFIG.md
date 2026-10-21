@@ -113,6 +113,32 @@ area. Gradients and urgent-color are not implemented yet. Tabs share one
 height (full available height by default); preset/fixed height applies to
 the group, and reset returns the group to full height. This is a Windows
 management layer: tab switches use show/hide, not compositor crossfades.
+Structural merges (for example `Mod+Comma`) retain the incoming window's own
+movement animation rather than reusing the previous selected tab's position.
+
+For a thicker indicator separated from the window, with a dark green
+inactive color instead of gray, use:
+
+```kdl
+layout {
+    tab-indicator {
+        position "left"
+        place-within-column
+        width 10
+        gap 12
+        length total-proportion=0.6
+        gaps-between-tabs 5
+        corner-radius 5
+        active-color "#7daea3"
+        inactive-color "#355f55"
+    }
+}
+```
+
+`width` is segment thickness; `gap` is distance from the visible window
+edge; `gaps-between-tabs` separates segments. Segment order follows window
+order in the column. The active segment is light green, inactive segments
+are dark green; this is an indicator, not a title-text tab bar.
 
 ## `animations`
 

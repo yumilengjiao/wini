@@ -94,6 +94,34 @@ pub(super) fn parse(
 mod tests {
         use super::*;
         #[test]
+        fn recommended_green_indicator_config_parses_without_changing_layout_gaps() {
+                let cfg = super::super::parse(
+                        r##"
+                        layout {
+                            gaps 1
+                            tab-indicator {
+                                position "left"
+                                place-within-column
+                                width 10
+                                gap 12
+                                length total-proportion=0.6
+                                gaps-between-tabs 5
+                                corner-radius 5
+                                active-color "#7daea3"
+                                inactive-color "#355f55"
+                            }
+                        }
+                "##,
+                )
+                .unwrap();
+                let t = &cfg.layout.tab_indicator;
+                assert_eq!(cfg.layout.gaps, 1.0);
+                assert!(t.place_within_column);
+                assert_eq!((t.width, t.gap, t.gaps_between_tabs), (10.0, 12.0, 5.0));
+                assert_eq!((t.active_color, t.inactive_color), (0x7daea3, 0x355f55));
+        }
+
+        #[test]
         fn tabbed_action_and_indicator_options_parse() {
                 let source = r##"
                         layout {
