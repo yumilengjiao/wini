@@ -60,27 +60,9 @@ struct FloatState {
         h: f64,
 }
 
-/// An in-flight horizontal shift of one workspace's view inside an
-/// open overview: when the overview's internal focus moves (niri's
-/// hardcoded Left/Right binds) the workspace view scrolls to keep
-/// the newly focused column visible. Rebuilding the thumbnail
-/// finals at the new view position would make every thumbnail JUMP
-/// sideways instantly; instead the finals are rebuilt at the new
-/// position and this animated offset (starting at the pre-scroll
-/// delta, gliding to 0) is applied on top, reproducing niri's
-/// view-offset animation.
-#[derive(Debug, Clone)]
-struct ViewShift {
-        /// The workspace whose view scrolled.
-        ws_idx: usize,
-        /// Animated x offset in UNSCALED monitor px (scaled by the
-        /// current zoom when applied).
-        offset: crate::anim::Val,
-}
-
-/// An open (or opening/closing) overview on one monitor — niri's
-/// `toggle-overview`. Like the slide, everything derives from TWO
-/// animated values instead of per-window springs:
+/// An open (or opening/closing) overview on one monitor. Zoom and
+/// workspace camera are composed on top of transport's live tile/view
+/// springs, so layout changes stay animated during either zoom direction.
 /// - `progress`: 0 = closed, 1 = fully open. The zoom is niri's
 ///   `compute_overview_zoom`: `zoom = 1 - progress * (1 - 0.35)` —
 ///   at progress 0 the derived rects are EXACTLY the settled tiles,
@@ -109,17 +91,14 @@ struct Overview {
         progress: crate::anim::Val,
         /// Camera position (workspace index on the strip).
         camera: crate::anim::Val,
-        /// Settled (zoom-1) tile rects per participating (non-empty)
-        /// workspace, exactly like the slide's finals. Refreshed by
-        /// `refresh_overview` whenever the layout changes while open.
+        /// Zoom-1 samples of the transport's tile/view springs per workspace.
+        /// The overview adds only its zoom and workspace camera on top.
         finals: Vec<(usize, Vec<crate::layout::geometry::TileRect>)>,
         /// The monitor's WORK-AREA rect (left, top, w, h) — the overview
         /// canvas. The native taskbar/sidebar stays outside it.
         full: (f64, f64, f64, f64),
         /// Zoom at progress = 1 (niri's overview.zoom, default 0.35).
         zoom_target: f64,
-        /// In-flight view scroll of one workspace (see [`ViewShift`]).
-        view_shift: Option<ViewShift>,
         /// `Some(from_progress)` when the camera and progress springs
         /// were retargeted together with identical params (overview
         /// close/toggle-close, niri's `activate_workspace_with_anim_config`).
@@ -166,18 +145,10 @@ impl Overview {
                 let mut out = Vec::new();
                 for (k, rects) in &self.finals {
                         let dy = (*k as f64 - cam) * stride;
-                        // The in-flight view shift (overview focus moves): the
-                        // finals are at the NEW view position, the shift starts
-                        // at the pre-scroll delta and glides to 0.
-                        let shift = match &self.view_shift {
-                                Some(s) if s.ws_idx == *k => s.offset.value() * zoom,
-                                _ => 0.0,
-                        };
                         for r in rects {
                                 out.push(crate::layout::geometry::TileRect {
                                         id: r.id,
-                                        x: (off_x + (r.x as f64 - fx) * zoom + shift).round()
-                                                as i32,
+                                        x: (off_x + (r.x as f64 - fx) * zoom).round() as i32,
                                         y: (off_y + dy + (r.y as f64 - fy) * zoom).round() as i32,
                                         w: ((r.w as f64) * zoom).round().max(1.0) as i32,
                                         h: ((r.h as f64) * zoom).round().max(1.0) as i32,
@@ -229,7 +200,6 @@ impl Overview {
                 self.handoff_ready = false;
                 self.progress.retarget(0.0, anim);
                 self.camera.retarget(target, anim);
-                self.view_shift = None;
                 self.sync_from_progress = Some(self.progress.from());
         }
 
@@ -244,28 +214,8 @@ impl Overview {
 
         /// Both springs at rest?
         fn settled(&self) -> bool {
-                self.progress.finished()
-                        && self.camera.finished()
-                        && self.view_shift.as_ref().is_none_or(|s| s.offset.finished())
+                self.progress.finished() && self.camera.finished()
         }
-}
-
-/// Current view position (column-space x at the content-area's left
-/// edge) of `id`'s workspace on `device` — used to measure how far
-/// an overview focus move scrolled the view (see `ViewShift`).
-fn view_position(
-        layout: &Layout,
-        device: &str,
-        id: isize,
-        params: &LayoutParams,
-        view_width: f64,
-) -> Option<(usize, f64)> {
-        let ml = layout.monitor(device)?;
-        let idx = ml.workspace_of(id)?;
-        let ws = &ml.workspaces[idx];
-        let widths = geometry::column_widths(ws, params, view_width);
-        let xs = geometry::column_xs(&widths, params.gaps);
-        Some((idx, geometry::view_pos(ws, &xs)))
 }
 
 // Rate limiter for the "backdrop covered" diagnostic
@@ -665,6 +615,10 @@ impl AppState {
                 if self.interacting_window.is_some() || self.suspended {
                         return;
                 }
+                // Keep layout springs alive across overview entry. Only the
+                // workspace camera is replaced by the overview's own camera.
+                let params = self.params.clone();
+                self.transport.sync(&self.layout, &self.monitors, &params);
                 let Some(mon) = self.monitors.iter().find(|m| m.device == device) else {
                         return;
                 };
@@ -672,12 +626,6 @@ impl AppState {
                         return;
                 };
 
-                // The transport's workspace-switch camera may still be
-                // animating; the overview reads settled geometry, so nothing
-                // special is needed — opening simply parks the real windows and
-                // draws thumbnails at the current (settled) tiles.
-
-                let params = self.params.clone();
                 // Use the Windows work area as the overview canvas. The
                 // native taskbar/sidebar remains outside the host and is never
                 // covered by the overview animation.
@@ -687,20 +635,7 @@ impl AppState {
                         (mon.work.right - mon.work.left) as f64,
                         (mon.work.bottom - mon.work.top) as f64,
                 );
-                let area = params.tiling_area((
-                        mon.work.left as f64,
-                        mon.work.top as f64,
-                        (mon.work.right - mon.work.left) as f64,
-                        (mon.work.bottom - mon.work.top) as f64,
-                ));
-                let mut finals = Vec::new();
-                for (k, ws) in ml.workspaces.iter().enumerate() {
-                        if ws.is_empty() {
-                                continue;
-                        }
-                        finals.push((k, geometry::compute_workspace_geometry(ws, &params, area)));
-                }
-
+                let finals = self.transport.workspace_rects(&self.layout, device);
                 let anim = self.config.animations.overview_open_close_params();
                 let mut progress = crate::anim::Val::to(0.0, anim);
                 progress.retarget(1.0, anim);
@@ -714,7 +649,6 @@ impl AppState {
                         finals,
                         full,
                         zoom_target,
-                        view_shift: None,
                         sync_from_progress: None,
                         handoff_ready: false,
                 };
@@ -783,13 +717,6 @@ impl AppState {
                 // only appears in the gaps and grows smoothly as the zoom
                 // pulls back, so there is no pop.
                 host.raise();
-                // Source windows remain at their settled geometry. Drop any
-                // stale layout animation; otherwise an old resize could still
-                // land while the host is opening and make the first frames
-                // look like a maximize-then-shrink transition.
-                for r in ov.finals.iter().flat_map(|(_, rs)| rs) {
-                        self.transport.remove_window(r.id);
-                }
                 // All participants can now be visible: the opaque host hides
                 // the real HWNDs while the DWM thumbnails are animated.
                 for (_, rs) in &ov.finals {
@@ -946,12 +873,6 @@ impl AppState {
                 device: &str,
                 action: Action,
         ) {
-                // View position BEFORE the focus move: `view_pos` is relative
-                // to the ACTIVE column, so measuring after the move would mix
-                // the new column with the old offset (the v1 of this code did
-                // exactly that and the shift came out near zero — the
-                // "slides with a hitch, no animation" bug).
-                let vp_before = self.active_view_pos(device);
                 let changed = {
                         let Some(ml) = self.layout.monitor_mut(device) else {
                                 return;
@@ -979,89 +900,9 @@ impl AppState {
                         return;
                 };
                 self.focused = Some(HWND(id as *mut _));
-                // Refresh the workspace view (it is stored relative to the
-                // active column, so the focus move changed its meaning) and
-                // record the scroll as an animated shift so the thumbnails
-                // glide sideways instead of jumping (niri's view-offset
-                // animation inside the overview).
-                self.overview_focus_view(device, id, vp_before);
+                self.update_focus_view(id);
                 self.refresh_overview(device);
                 self.update_focus_border();
-        }
-
-        /// View position (column-space x at the view's left edge) of
-        /// `device`'s ACTIVE workspace — `None` if it has no columns.
-        fn active_view_pos(
-                &self,
-                device: &str,
-        ) -> Option<f64> {
-                let mon = self.monitors.iter().find(|m| m.device == device)?;
-                let view_width = self
-                        .params
-                        .tiling_view_width((mon.work.right - mon.work.left) as f64);
-                let ws = self.layout.monitor(device)?.active_workspace();
-                let widths = geometry::column_widths(ws, &self.params, view_width);
-                let xs = geometry::column_xs(&widths, self.params.gaps);
-                Some(geometry::view_pos(ws, &xs))
-        }
-
-        /// `update_focus_view` for an open overview: refreshes the view
-        /// offset of `id`'s workspace and, given the view position
-        /// measured BEFORE the focus move (`vp_before`), records the
-        /// scroll as an animated [`ViewShift`] on the device's overview
-        /// so the thumbnails glide sideways instead of jumping. A second
-        /// focus move while a shift is still in flight continues from its
-        /// CURRENT offset, so rapid Alt+H/L repeats stay continuous.
-        fn overview_focus_view(
-                &mut self,
-                device: &str,
-                id: isize,
-                vp_before: Option<f64>,
-        ) {
-                let Some(mon) = self.monitors.iter().find(|m| m.device == device) else {
-                        return;
-                };
-                let view_width = self
-                        .params
-                        .tiling_view_width((mon.work.right - mon.work.left) as f64);
-                if let Some(ml) = self.layout.monitor_mut(device)
-                        && let Some(idx) = ml.workspace_of(id)
-                {
-                        let ws = &mut ml.workspaces[idx];
-                        geometry::refresh_view_offset(ws, &self.params, view_width, None);
-                }
-                let Some(vp_before) = vp_before else { return };
-                let Some((ws_idx, vp_after)) =
-                        view_position(&self.layout, device, id, &self.params, view_width)
-                else {
-                        return;
-                };
-                let prev = self
-                        .overviews
-                        .get(device)
-                        .and_then(|ov| ov.view_shift.as_ref().filter(|s| s.ws_idx == ws_idx))
-                        .map(|s| s.offset.value())
-                        .unwrap_or(0.0);
-                // The shift must CANCEL the scroll for the first frame:
-                // rects_at renders x = base(vp_after) + offset*zoom, and the
-                // pre-move frame was base(vp_before), so the offset starts
-                // at (vp_after - vp_before) — how far the view scrolled — and
-                // glides to 0. (vp_before - vp_after was inverted: focusing
-                // right made every thumbnail jump ~2 screens left and glide
-                // back — the "hitch + wrong direction" bug.)
-                let start = prev + vp_after - vp_before;
-                let Some(ov) = self.overviews.get_mut(device) else {
-                        return;
-                };
-                if start.abs() >= 0.5 {
-                        let params = self.config.animations.view_offset_params();
-                        // Val::to parks at `start`; the retarget animates to 0.
-                        let mut offset = crate::anim::Val::to(start, params);
-                        offset.retarget(0.0, params);
-                        ov.view_shift = Some(ViewShift { ws_idx, offset });
-                } else {
-                        ov.view_shift = None;
-                }
         }
 
         /// A click at screen coords while an overview is open (captured
@@ -1109,22 +950,16 @@ impl AppState {
                         "overview[{device}]: selecting window {id} (ws {})",
                         ws_idx + 1
                 );
-                // Switch the workspace first, then measure the view position
-                // BEFORE moving the focus within it (view_pos is relative to
-                // the active column).
+                // The transport retains the pre-click view and animates to
+                // the newly focused column, including while the zoom closes.
                 if let Some(ml) = self.layout.monitor_mut(&device) {
                         ml.active_workspace_idx = ws_idx;
                 }
-                let vp_before = self.active_view_pos(&device);
                 if let Some(ml) = self.layout.monitor_mut(&device) {
                         ml.active_workspace_mut().focus_window(id);
                 }
                 self.focused = Some(hwnd);
-                // Refresh the view at the clicked window and rebuild the
-                // finals (at the new view position) BEFORE closing, so the
-                // close animation starts from a continuous frame instead of
-                // jumping to the new view at settle.
-                self.overview_focus_view(&device, id, vp_before);
+                self.update_focus_view(id);
                 self.refresh_overview(&device);
                 self.close_overview_to(&device, Some(ws_idx));
         }
@@ -1176,37 +1011,16 @@ impl AppState {
                 }
         }
 
-        /// Rebuild an overview's participant set from the current layout
-        /// (windows opened/closed while it is open) and apply one frame.
-        /// Called from reflow(), which skips overview monitors' tiled
-        /// windows entirely. The real windows follow the settled tiles
-        /// behind the backdrop — instantly (it is invisible back there,
-        /// and the close handover stays pixel-exact) — while the
-        /// thumbnails show them scaled at the current zoom/camera.
+        /// Retarget layout motion and reconcile participants without snapping.
+        /// The real windows remain covered; thumbnails sample transport's tile
+        /// and view springs on every tick, composed with overview zoom/camera.
         fn refresh_overview(
                 &mut self,
                 device: &str,
         ) {
-                let Some(mon) = self.monitors.iter().find(|m| m.device == device) else {
-                        return;
-                };
-                let Some(ml) = self.layout.monitor(device) else {
-                        return;
-                };
                 let params = self.params.clone();
-                let area = params.tiling_area((
-                        mon.work.left as f64,
-                        mon.work.top as f64,
-                        (mon.work.right - mon.work.left) as f64,
-                        (mon.work.bottom - mon.work.top) as f64,
-                ));
-                let mut finals = Vec::new();
-                for (k, ws) in ml.workspaces.iter().enumerate() {
-                        if ws.is_empty() {
-                                continue;
-                        }
-                        finals.push((k, geometry::compute_workspace_geometry(ws, &params, area)));
-                }
+                self.transport.sync(&self.layout, &self.monitors, &params);
+                let finals = self.transport.workspace_rects(&self.layout, device);
                 let Some(ov) = self.overviews.get_mut(device) else {
                         return;
                 };
@@ -1226,15 +1040,6 @@ impl AppState {
                                 placement::set_shown(hwnd, true);
                         }
                 }
-                // Keep the transport tracking the overview's current active
-                // workspace / view, SNAPPED (not animating): the frame is
-                // skipped for overview monitors, but this guarantees that when
-                // the overview closes the transport already holds the exact
-                // settled positions — no "slide back" from a stale pre-overview
-                // spring the instant the zoom-in completes.
-                let params = self.params.clone();
-                self.transport.sync(&self.layout, &self.monitors, &params);
-                self.transport.snap(device);
                 // Thumbnails: reconcile the source set, then one frame at
                 // the current zoom/camera.
                 let sources: Vec<isize> = settled.iter().map(|r| r.id).collect();
@@ -2893,9 +2698,12 @@ impl AppState {
                 }
                 let devices: Vec<String> = self.overviews.keys().cloned().collect();
                 for device in devices {
-                        let Some(ov) = self.overviews.get(&device) else {
+                        let layout_moving = self.transport.layout_animating(&device);
+                        let samples = self.transport.workspace_rects(&self.layout, &device);
+                        let Some(ov) = self.overviews.get_mut(&device) else {
                                 continue;
                         };
+                        ov.finals = samples;
                         // While the user drags one of the real windows (a float
                         // on another monitor can still be dragged), stop
                         // applying overview rects for a moment — fighting the
@@ -2904,7 +2712,8 @@ impl AppState {
                         if self.interacting_window.is_some() {
                                 continue;
                         }
-                        if !ov.settled() {
+                        if !ov.settled() || layout_moving {
+                                ov.handoff_ready = false;
                                 let zoom = ov.zoom();
                                 let cam = ov.render_cam();
                                 log::debug!("overview[{device}]: zoom={zoom:.3} cam={cam:.2}");
@@ -2919,6 +2728,12 @@ impl AppState {
                                 continue;
                         }
                         if ov.opening() {
+                                // Submit the exact settled endpoint too; otherwise
+                                // thumbnails keep the last pre-settle sample while
+                                // the focus ring has already reached its target.
+                                if let Some(host) = self.overview_hosts.get_mut(&device) {
+                                        host.update_rects(&ov.current_rects());
+                                }
                                 // Open and settled: maintain z order as a defense in
                                 // depth — windows can raise themselves for reasons we
                                 // don't control. We never force_set_foreground while
@@ -3318,7 +3133,6 @@ mod tests {
                         ],
                         full: (0.0, 0.0, 1000.0, 800.0),
                         zoom_target: 0.35,
-                        view_shift: None,
                         sync_from_progress: None,
                         handoff_ready: false,
                 }
@@ -3328,15 +3142,10 @@ mod tests {
         fn closing_retargets_and_invalidates_prepared_frame() {
                 let mut ov = overview();
                 ov.handoff_ready = true;
-                ov.view_shift = Some(ViewShift {
-                        ws_idx: 0,
-                        offset: crate::anim::Val::to(200.0, instant()),
-                });
                 ov.close_to(1.0, instant());
                 assert!(!ov.handoff_ready);
                 assert!(!ov.opening());
                 assert!(ov.settled());
-                assert!(ov.view_shift.is_none());
                 assert_eq!(ov.camera.target(), 1.0);
                 let target = ov.current_rects().into_iter().find(|r| r.id == 2).unwrap();
                 assert_eq!(target, tile(2, 150, 60, 400, 700));

@@ -24,10 +24,9 @@
 //! targets); the transport only animates toward those targets. `sync`
 //! retargets the springs after any layout change; `frame` samples them.
 //!
-//! The overview (zoomed DWM thumbnails) is layered on top by the app and
-//! is not part of this transport — real windows can't be moved every
-//! frame without app reflow/flicker, so the overview parks them and draws
-//! thumbnails instead.
+//! The overview composes its zoom/workspace camera on top of these same
+//! tile and view springs. It skips applying real-window geometry while
+//! covered, but samples `workspace_rects` for DWM thumbnails each frame.
 
 use std::collections::{HashMap, HashSet};
 
@@ -220,6 +219,60 @@ impl Transport {
                         entry.tiles.retain(|id, _| live_ids.contains(id));
                         entry.view.retain(|k, _| live_ws.contains(k));
                 }
+        }
+
+        /// Sample layout motion without the workspace-switch camera. Overview
+        /// applies its own zoom/camera to these SAME tile and view springs, so
+        /// resizing or scrolling during a zoom never discards an in-flight move.
+        pub fn workspace_rects(
+                &self,
+                layout: &Layout,
+                device: &str,
+        ) -> Vec<(usize, Vec<TileRect>)> {
+                let Some(ml) = layout.monitor(device) else {
+                        return Vec::new();
+                };
+                let Some(m) = self.monitors.get(device) else {
+                        return Vec::new();
+                };
+                ml.workspaces
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, ws)| {
+                                if ws.is_empty() {
+                                        return None;
+                                }
+                                let vp = m.view.get(&k).map(|v| v.value()).unwrap_or(0.0);
+                                let rects = ws
+                                        .window_ids()
+                                        .filter_map(|id| {
+                                                let rect = m.tiles.get(&id)?;
+                                                let (x, y, w, h) = rect.value();
+                                                Some(TileRect {
+                                                        id,
+                                                        x: m.origin.0
+                                                                + (x as f64 - vp).round() as i32,
+                                                        y: m.origin.1 + y,
+                                                        w,
+                                                        h,
+                                                })
+                                        })
+                                        .collect();
+                                Some((k, rects))
+                        })
+                        .collect()
+        }
+
+        /// Motion which must finish before revealing overview's real windows.
+        /// The overview owns the workspace camera; only layout/view matter here.
+        pub fn layout_animating(
+                &self,
+                device: &str,
+        ) -> bool {
+                self.monitors.get(device).is_some_and(|m| {
+                        m.view.values().any(|v| !v.finished())
+                                || m.tiles.values().any(|r| !r.finished())
+                })
         }
 
         /// Any monitor still animating (a spring in flight)?
@@ -478,6 +531,83 @@ mod tests {
                 assert_eq!(frame.moves[0].x, -997);
                 assert_eq!(frame.moves[0].y, 59);
                 assert_eq!(frame.moves[0].h, 728);
+        }
+
+        #[test]
+        fn overview_resize_keeps_shared_motion_until_handoff() {
+                let mut layout = Layout::new();
+                layout.add_window("D", 1);
+                layout.add_window("D", 2);
+                let mons = vec![monitor("D")];
+                let p = params();
+                let slow = AnimParams {
+                        kind: AnimKind::Easing {
+                                duration: std::time::Duration::from_secs(60),
+                                curve: crate::anim::Curve::Linear,
+                        },
+                        slowdown: 1.0,
+                };
+                let mut t = Transport::new(slow, slow, slow, slow);
+                t.sync(&layout, &mons, &p);
+                let before = t.workspace_rects(&layout, "D")[0].1.clone();
+                let ws = layout.monitor_mut("D").unwrap().active_workspace_mut();
+                assert!(ws.set_column_width(&crate::layout::SizeChange::Fixed(800.0), &p, 1000.0));
+                t.sync(&layout, &mons, &p);
+                let during = t.workspace_rects(&layout, "D")[0].1.clone();
+                assert!(t.layout_animating("D"));
+                assert!((during[0].w - before[0].w).abs() <= 1);
+                assert!(during.iter().all(|r| r.w < 800));
+                // Overview skips applying real-window geometry, not sampling
+                // layout motion. Reflow must not snap or restart the springs.
+                let skip = HashSet::from(["D".to_string()]);
+                assert!(t.frame(&layout, &mons, &skip).moves.is_empty());
+                t.sync(&layout, &mons, &p);
+                assert!(t.layout_animating("D"));
+                t.snap("D");
+                assert!(!t.layout_animating("D"));
+                let final_overview = t.workspace_rects(&layout, "D")[0].1.clone();
+                assert_eq!(
+                        final_overview,
+                        t.frame(&layout, &mons, &HashSet::new()).moves
+                );
+                assert_eq!(final_overview.iter().find(|r| r.id == 2).unwrap().w, 800);
+        }
+
+        #[test]
+        fn overview_focus_scroll_uses_same_view_spring_as_normal_mode() {
+                let mut layout = Layout::new();
+                layout.add_window("D", 1);
+                layout.add_window("D", 2);
+                layout.add_window("D", 3);
+                let mons = vec![monitor("D")];
+                let p = params();
+                let slow = AnimParams {
+                        kind: AnimKind::Easing {
+                                duration: std::time::Duration::from_secs(60),
+                                curve: crate::anim::Curve::Linear,
+                        },
+                        slowdown: 1.0,
+                };
+                let mut t = Transport::new(slow, slow, slow, slow);
+                t.sync(&layout, &mons, &p);
+                let before = t.workspace_rects(&layout, "D")[0].1.clone();
+                let ws = layout.monitor_mut("D").unwrap().active_workspace_mut();
+                ws.focus_window(1);
+                geometry::refresh_view_offset(ws, &p, 1000.0, None);
+                t.sync(&layout, &mons, &p);
+                assert!(t.layout_animating("D"));
+                let during = t.workspace_rects(&layout, "D")[0].1.clone();
+                for (a, b) in before.iter().zip(&during) {
+                        assert!(
+                                (a.x - b.x).abs() <= 1,
+                                "focus scroll jumped: {a:?} -> {b:?}"
+                        );
+                }
+                t.snap("D");
+                assert_eq!(
+                        t.workspace_rects(&layout, "D")[0].1,
+                        t.frame(&layout, &mons, &HashSet::new()).moves
+                );
         }
 
         #[test]

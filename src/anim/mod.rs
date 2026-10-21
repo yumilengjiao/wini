@@ -299,9 +299,15 @@ impl Val {
                 value: f64,
                 params: AnimParams,
         ) {
-                self.params = params;
+                // Re-syncing an unchanged target must not restart easing or
+                // replace a spring's params before sampling its old trajectory.
+                // In-flight config changes apply on the next *new* target.
+                if self.to == value {
+                        return;
+                }
                 let cur = self.value();
                 let vel = self.velocity();
+                self.params = params;
                 let snap = match self.params.kind {
                         AnimKind::Spring(p) => {
                                 (cur - value).abs() < p.epsilon.max(0.25) && vel.abs() < 100.0
@@ -338,8 +344,8 @@ impl Val {
                 }
                 let elapsed = self.start.elapsed();
                 match self.params.kind {
-                        AnimKind::Easing { duration, curve } => {
-                                let total = duration.as_secs_f64().max(f64::EPSILON);
+                        AnimKind::Easing { curve, .. } => {
+                                let total = self.duration.as_secs_f64().max(f64::EPSILON);
                                 let progress = (elapsed.as_secs_f64() / total).clamp(0.0, 1.0);
                                 self.from + (self.to - self.from) * curve.apply(progress)
                         },
@@ -503,6 +509,34 @@ mod tests {
                         },
                         slowdown: 1.0,
                 }
+        }
+
+        #[test]
+        fn unchanged_target_keeps_animation_clock_and_params() {
+                let mut v = Val::to(100.0, easing_params());
+                v.retarget(900.0, easing_params());
+                let start = v.start;
+                let duration = v.duration;
+                v.retarget(900.0, spring_params());
+                assert_eq!(v.start, start);
+                assert_eq!(v.duration, duration);
+                assert_eq!(v.params, easing_params());
+                assert_eq!(v.from(), 100.0);
+        }
+
+        #[test]
+        fn easing_slowdown_uses_effective_duration() {
+                let params = AnimParams {
+                        kind: AnimKind::Easing {
+                                duration: Duration::from_secs(10),
+                                curve: Curve::Linear,
+                        },
+                        slowdown: 2.0,
+                };
+                let mut v = Val::to(0.0, params);
+                v.retarget(100.0, params);
+                v.start = Instant::now() - Duration::from_secs(5);
+                assert!((v.value() - 25.0).abs() < 0.1);
         }
 
         #[test]
