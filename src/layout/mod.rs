@@ -30,6 +30,7 @@
 
 pub mod geometry;
 pub mod height;
+pub mod tabbed;
 mod viewport;
 
 use std::collections::HashMap;
@@ -86,6 +87,7 @@ pub struct Column {
         /// Whether the column is maximized (covers the whole monitor, no
         /// padding, like niri's maximize-column).
         pub is_maximized: bool,
+        pub display: tabbed::ColumnDisplay,
 }
 
 impl Column {
@@ -96,6 +98,7 @@ impl Column {
                         width: None,
                         is_full_width: false,
                         is_maximized: false,
+                        display: tabbed::ColumnDisplay::Normal,
                 }
         }
 
@@ -604,6 +607,7 @@ impl Workspace {
                                 width: self.columns[ci].width,
                                 is_full_width: false,
                                 is_maximized: false,
+                                display: tabbed::ColumnDisplay::Normal,
                         };
                         let at = match dir {
                                 DirH::Left => ci,
@@ -662,6 +666,7 @@ impl Workspace {
                         width,
                         is_full_width: false,
                         is_maximized: false,
+                        display: tabbed::ColumnDisplay::Normal,
                 };
                 self.columns.insert(ci + 1, col);
                 // Focus stays on the (still focused) source column, but its
@@ -1163,11 +1168,11 @@ impl MonitorLayout {
                         return None;
                 }
                 self.ensure_workspaces(idx + 1);
+                let col = self.active_workspace_mut().take_active_column()?;
                 for &id in &ids {
-                        self.active_workspace_mut().remove_window(id);
                         self.window_map.insert(id, idx);
                 }
-                self.workspaces[idx].add_column(&ids);
+                self.workspaces[idx].insert_preserved_column(col);
                 if focus {
                         self.previous_workspace_idx = Some(self.active_workspace_idx);
                         self.active_workspace_idx = idx;
@@ -1267,12 +1272,15 @@ impl Layout {
                 if ids.is_empty() {
                         return None;
                 }
+                // Validate destination before detaching the source column.
+                self.monitor(to)?;
                 let src = self.monitor_mut(from)?;
+                let col = src.active_workspace_mut().take_active_column()?;
                 for &id in &ids {
-                        src.remove_window(id);
+                        src.window_map.remove(&id);
                 }
                 let dst = self.monitor_mut(to)?;
-                dst.active_workspace_mut().add_column(&ids);
+                dst.active_workspace_mut().insert_preserved_column(col);
                 for &id in &ids {
                         dst.window_map.insert(id, dst.active_workspace_idx);
                 }

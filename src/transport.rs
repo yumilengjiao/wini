@@ -65,6 +65,9 @@ struct MonitorT {
         /// Screen origin of the tiling area (work area inset by struts).
         /// Column-space rects are composed relative to it.
         origin: (i32, i32),
+        /// Last selected tab keyed by the column's first tile. Seed a newly
+        /// selected tab from the old rendered rect, not its stale stack slot.
+        selected_tabs: HashMap<WindowId, WindowId>,
 }
 
 /// The unified transport for every monitor.
@@ -165,6 +168,7 @@ impl Transport {
                                         stride,
                                         active: ml.active_workspace_idx,
                                         origin,
+                                        selected_tabs: HashMap::new(),
                                 }
                         });
                         entry.stride = stride;
@@ -176,6 +180,7 @@ impl Transport {
                         // Which windows still exist on this monitor (for pruning).
                         let mut live_ids: HashSet<WindowId> = HashSet::new();
                         let mut live_ws: HashSet<usize> = HashSet::new();
+                        let mut next_tabs = HashMap::new();
 
                         for (k, ws) in ml.workspaces.iter().enumerate() {
                                 if ws.is_empty() {
@@ -189,6 +194,29 @@ impl Transport {
                                         .or_insert_with(|| Val::to(target_vp, self.view));
                                 vslot.retarget(target_vp, self.view);
 
+                                for col in &ws.columns {
+                                        if col.display
+                                                != crate::layout::tabbed::ColumnDisplay::Tabbed
+                                        {
+                                                continue;
+                                        }
+                                        let Some(key) = col.tiles.first().map(|t| t.id) else {
+                                                continue;
+                                        };
+                                        let Some(active) = col.focused_id() else {
+                                                continue;
+                                        };
+                                        if let Some(previous) = entry
+                                                .selected_tabs
+                                                .get(&key)
+                                                .filter(|&&id| id != active)
+                                                && let Some(rect) =
+                                                        entry.tiles.get(previous).cloned()
+                                        {
+                                                entry.tiles.insert(active, rect);
+                                        }
+                                        next_tabs.insert(key, active);
+                                }
                                 for r in geometry::workspace_colspace_rects(ws, params, area) {
                                         live_ids.insert(r.id);
                                         match entry.tiles.get_mut(&r.id) {
@@ -216,6 +244,7 @@ impl Transport {
                                         }
                                 }
                         }
+                        entry.selected_tabs = next_tabs;
                         entry.tiles.retain(|id, _| live_ids.contains(id));
                         entry.view.retain(|k, _| live_ws.contains(k));
                 }
@@ -244,7 +273,7 @@ impl Transport {
                                 }
                                 let vp = m.view.get(&k).map(|v| v.value()).unwrap_or(0.0);
                                 let rects = ws
-                                        .window_ids()
+                                        .rendered_ids()
                                         .filter_map(|id| {
                                                 let rect = m.tiles.get(&id)?;
                                                 let (x, y, w, h) = rect.value();
@@ -349,7 +378,11 @@ impl Transport {
                                         continue;
                                 }
                                 let vp = m.view.get(&k).map(|v| v.value()).unwrap_or(0.0);
-                                for id in ws.window_ids() {
+                                let visible_ids: HashSet<_> = ws.rendered_ids().collect();
+                                frame.hide.extend(ws
+                                        .window_ids()
+                                        .filter(|id| !visible_ids.contains(id)));
+                                for id in ws.rendered_ids() {
                                         let Some(rect) = m.tiles.get(&id) else {
                                                 continue;
                                         };
@@ -395,6 +428,7 @@ mod tests {
                         default_column_width: ColumnWidth::Proportion(0.5),
                         preset_column_widths: Vec::new(),
                         preset_window_heights: Vec::new(),
+                        tab_indicator: crate::layout::tabbed::TabIndicatorConfig::default(),
                         center_focused_column: CenterFocused::Never,
                         struts: geometry::Struts::default(),
                 }
@@ -617,6 +651,79 @@ mod tests {
                 let final_rects = t.workspace_rects(&layout, "D")[0].1.clone();
                 assert_eq!(final_rects, t.frame(&layout, &mons, &HashSet::new()).moves);
                 assert_eq!(final_rects.iter().find(|r| r.id == 2).unwrap().h, 600);
+        }
+
+        #[test]
+        fn tabbed_visibility_is_identical_in_normal_and_overview_frames() {
+                let mut layout = Layout::new();
+                layout.add_window("D", 1);
+                layout.add_window("D", 2);
+                let ws = layout.monitor_mut("D").unwrap().active_workspace_mut();
+                ws.consume_or_expel(crate::layout::DirH::Left);
+                ws.toggle_column_tabbed_display();
+                let p = params();
+                let mons = vec![monitor("D")];
+                let mut t = transport();
+                t.sync(&layout, &mons, &p);
+                let frame = t.frame(&layout, &mons, &HashSet::new());
+                assert_eq!(frame.show, vec![2]);
+                assert_eq!(frame.hide, vec![1]);
+                assert_eq!(frame.moves[0].h, 800);
+                assert_eq!(t.workspace_rects(&layout, "D")[0].1, frame.moves);
+                layout.monitor_mut("D")
+                        .unwrap()
+                        .active_workspace_mut()
+                        .focus_tile(crate::layout::DirV::Up);
+                t.sync(&layout, &mons, &p);
+                let frame = t.frame(&layout, &mons, &HashSet::new());
+                assert_eq!(frame.show, vec![1]);
+                assert_eq!(frame.hide, vec![2]);
+                assert_eq!(t.workspace_rects(&layout, "D")[0].1, frame.moves);
+                layout.monitor_mut("D")
+                        .unwrap()
+                        .active_workspace_mut()
+                        .toggle_column_tabbed_display();
+                t.sync(&layout, &mons, &p);
+                let frame = t.frame(&layout, &mons, &HashSet::new());
+                assert_eq!(frame.show.len(), 2);
+                assert!(frame.hide.is_empty());
+        }
+
+        #[test]
+        fn switching_tabs_mid_animation_does_not_jump_to_stale_stack_slot() {
+                let mut layout = Layout::new();
+                layout.add_window("D", 1);
+                layout.add_window("D", 2);
+                layout.monitor_mut("D")
+                        .unwrap()
+                        .active_workspace_mut()
+                        .consume_or_expel(crate::layout::DirH::Left);
+                let p = params();
+                let mons = vec![monitor("D")];
+                let slow = AnimParams {
+                        kind: AnimKind::Easing {
+                                duration: std::time::Duration::from_secs(60),
+                                curve: crate::anim::Curve::Linear,
+                        },
+                        slowdown: 1.0,
+                };
+                let mut t = Transport::new(slow, slow, slow, slow);
+                t.sync(&layout, &mons, &p);
+                layout.monitor_mut("D")
+                        .unwrap()
+                        .active_workspace_mut()
+                        .toggle_column_tabbed_display();
+                t.sync(&layout, &mons, &p);
+                let before = t.workspace_rects(&layout, "D")[0].1[0];
+                layout.monitor_mut("D")
+                        .unwrap()
+                        .active_workspace_mut()
+                        .focus_tile(crate::layout::DirV::Up);
+                t.sync(&layout, &mons, &p);
+                let after = t.workspace_rects(&layout, "D")[0].1[0];
+                assert!((before.y - after.y).abs() <= 1);
+                assert!((before.h - after.h).abs() <= 1);
+                assert_eq!(after.id, 1);
         }
 
         #[test]

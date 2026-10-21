@@ -44,6 +44,21 @@ layout {
         proportion 0.66667
     }
 
+    // Tabbed columns: Mod+W toggles; Mod+J/K or click indicator selects tabs.
+    tab-indicator {
+        // off
+        hide-when-single-tab
+        // place-within-column // reserve space instead of using window gaps
+        position "left"
+        width 4
+        gap 5
+        length total-proportion=0.5
+        gaps-between-tabs 2
+        corner-radius 2
+        active-color "#7daea3"
+        inactive-color "#505050"
+    }
+
     focus-ring {
         width 4
         active-color "#7daea3"
@@ -132,8 +147,8 @@ binds {
     // Sizing
     Mod+Minus { set-column-width "-100"; }
     Mod+Equal { set-column-width "+100"; }
-    // Bare set-column-width cycles the preset-column-widths.
-    Mod+W     { set-column-width; }
+    Mod+R     { switch-preset-column-width; }
+    Mod+W     { toggle-column-tabbed-display; }
     Mod+Ctrl+Shift+R { switch-preset-window-height; }
     Mod+Ctrl+R { reset-window-height; }
     Mod+Shift+W { set-window-height "+100"; }

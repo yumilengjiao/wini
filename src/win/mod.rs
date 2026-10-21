@@ -12,6 +12,7 @@ pub mod monitor;
 pub mod msg_window;
 pub mod overlay;
 pub mod placement;
+pub mod tab_indicator;
 pub mod thumbnail;
 pub mod tray;
 pub mod window;

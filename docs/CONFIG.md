@@ -78,6 +78,42 @@ layout {
 }
 ```
 
+## Tabbed columns
+
+`Mod+W` (`toggle-column-tabbed-display`) switches the focused column between
+vertical stacking and tabs. Only its selected tab is visible; `Mod+J/K`
+selects down/up, including in overview. Click the indicator segments to
+select a tab; selection in overview keeps overview open. Window sizes,
+height requests and tab mode are preserved when moving an entire column to
+another workspace/monitor. Turning tabs off restores the stack.
+
+```kdl
+layout {
+    tab-indicator {
+        // off
+        hide-when-single-tab
+        // place-within-column // reserve indicator space within column
+        position "left"       // left / right / top / bottom
+        width 4
+        gap 5
+        length total-proportion=0.5
+        gaps-between-tabs 2
+        corner-radius 2
+        active-color "#7daea3"
+        inactive-color "#505050"
+    }
+}
+```
+
+Sizes are physical pixels, scaled with overview zoom. Default indicator is
+left, width 4, gap 5, length 50%, solid colors. Outside indicators may overlap
+neighbor windows when column gaps are small; `place-within-column` reserves
+space. The overlay and click regions are clipped to each monitor's work
+area. Gradients and urgent-color are not implemented yet. Tabs share one
+height (full available height by default); preset/fixed height applies to
+the group, and reset returns the group to full height. This is a Windows
+management layer: tab switches use show/hide, not compositor crossfades.
+
 ## `animations`
 
 Follows niri's animation syntax. Each animation kind is configured
@@ -179,6 +215,7 @@ A config-provided `binds` section **replaces** the default binds.
 | `center-column` | center the focused column in the view (Mod+C) |
 | `center-visible-columns` | center the fully visible column group, keeping focus and gaps (Mod+Ctrl+C) |
 | `expand-column-to-available-width` | expand the active column into free space without displacing other fully visible columns (Mod+Ctrl+F); lone column uses reversible full-width mode |
+| `toggle-column-tabbed-display` | switch the column between stacking and tabs (Mod+W); select via Mod+J/K or indicator clicks |
 | `toggle-windowed-fullscreen` | borderless fullscreen for one window |
 | `toggle-window-floating` | float / unfloat the focused window |
 | `switch-focus-between-floating-and-tiling` | switch focus layers on the current workspace, remembering the last float (Mod+Shift+V); empty destination layer / overview is a no-op |

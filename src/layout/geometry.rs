@@ -77,6 +77,7 @@ pub struct LayoutParams {
         /// (niri's preset-column-widths).
         pub preset_column_widths: Vec<ColumnWidth>,
         pub preset_window_heights: Vec<super::height::HeightPreset>,
+        pub tab_indicator: super::tabbed::TabIndicatorConfig,
         pub center_focused_column: CenterFocused,
         /// Independent outer spacing in physical pixels. Fullscreen ignores it.
         pub struts: Struts,
@@ -100,6 +101,7 @@ impl Default for LayoutParams {
                                 ColumnWidth::Proportion(0.66667),
                         ],
                         preset_window_heights: super::height::default_presets(),
+                        tab_indicator: super::tabbed::TabIndicatorConfig::default(),
                         center_focused_column: CenterFocused::Never,
                         struts: Struts::default(),
                 }
@@ -165,10 +167,20 @@ pub fn column_widths(
         ws.columns
                 .iter()
                 .map(|c| {
+                        let reserve = if c.display == super::tabbed::ColumnDisplay::Tabbed
+                                && !c.is_maximized
+                        {
+                                let content = params
+                                        .tab_indicator
+                                        .content_rect(c.tiles.len(), (0.0, 0.0, view_width, 1.0));
+                                (view_width - content.2).max(0.0)
+                        } else {
+                                0.0
+                        };
                         // Never narrower than the largest minimum of the column's
                         // windows: apps clamp SetWindowPos to their minimum track
                         // size, which would visually overlap the next column.
-                        let min_w = c.tiles.iter().map(|t| t.min_w).fold(0.0, f64::max);
+                        let min_w = c.tiles.iter().map(|t| t.min_w).fold(0.0, f64::max) + reserve;
                         if c.is_maximized {
                                 // A maximized column occupies a full-view slot in scroll
                                 // space, so the view can scroll to and away from it like
@@ -359,7 +371,14 @@ pub fn tile_heights(
         params: &LayoutParams,
         area_h: f64,
 ) -> Vec<(f64, f64)> {
-        super::height::allocate(&ws.columns[ci], params, area_h)
+        if ws.columns[ci].display == super::tabbed::ColumnDisplay::Tabbed {
+                let content = params
+                        .tab_indicator
+                        .content_rect(ws.columns[ci].tiles.len(), (0.0, 0.0, 1.0, area_h));
+                super::height::allocate(&ws.columns[ci], params, content.3)
+        } else {
+                super::height::allocate(&ws.columns[ci], params, area_h)
+        }
 }
 
 /// Recompute and store the workspace's view offset so the active
@@ -415,49 +434,22 @@ pub fn compute_workspace_geometry(
         params: &LayoutParams,
         area: (f64, f64, f64, f64),
 ) -> Vec<TileRect> {
-        let (ax, ay, aw, ah) = area;
+        let (ax, ay, aw, _) = area;
         // Niri model: the view IS the full work area. There is no separate
         // content inset — the `gaps` breathing room at the screen edges
         // comes from the view-offset alignment logic (see
         // `view_offset_to_show`), and columns fill the full height.
-        let view_width = aw.max(1.0);
-        let view_height = ah.max(1.0);
+        let vp = target_view_pos(ws, params, aw.max(1.0));
 
-        let widths = column_widths(ws, params, view_width);
-        let xs = column_xs(&widths, params.gaps);
-        let vp = target_view_pos(ws, params, view_width);
-
-        let mut out = Vec::new();
-        for (ci, col) in ws.columns.iter().enumerate() {
-                let (col_x_off, col_w, col_h) = if col.is_maximized {
-                        // Maximized column: the whole work area, no gaps. It keeps
-                        // its scroll-space position — focusing another column
-                        // scrolls it out of view instead of pinning it over the
-                        // viewport.
-                        (xs[ci] - vp, aw, ah)
-                } else {
-                        (xs[ci] - vp, widths[ci], view_height)
-                };
-                let screen_x = ax + col_x_off;
-                let base_y = ay;
-                let heights = if col.is_maximized {
-                        // Only the first tile is visible; extra tiles render below
-                        // the monitor like niri (each maximized tile is full-size).
-                        vec![(0.0, col_h)]
-                } else {
-                        tile_heights(ws, ci, params, col_h)
-                };
-                for (tile, &(y, h)) in col.tiles.iter().zip(heights.iter()) {
-                        out.push(TileRect {
-                                id: tile.id,
-                                x: screen_x.round() as i32,
-                                y: (base_y + y).round() as i32,
-                                w: col_w.round().max(1.0) as i32,
-                                h: h.round().max(1.0) as i32,
-                        });
-                }
-        }
-        out
+        workspace_colspace_rects(ws, params, area)
+                .into_iter()
+                .filter(|r| ws.rendered_ids().any(|id| id == r.id))
+                .map(|mut r| {
+                        r.x = (ax + r.x as f64 - vp).round() as i32;
+                        r.y = (ay + r.y as f64).round() as i32;
+                        r
+                })
+                .collect()
 }
 
 /// The settled (clamped) view position for a workspace: the column-space
@@ -503,17 +495,29 @@ pub fn workspace_colspace_rects(
                 } else {
                         (widths[ci], view_height)
                 };
+                // Match the outer->content transform even when the indicator
+                // is top/bottom within the column. Width stays in column space.
                 let heights = if col.is_maximized {
-                        vec![(0.0, col_h)]
+                        vec![(0.0, col_h); col.tiles.len()]
                 } else {
                         tile_heights(ws, ci, params, col_h)
                 };
+                let tabbed =
+                        col.display == super::tabbed::ColumnDisplay::Tabbed && !col.is_maximized;
                 for (tile, &(y, h)) in col.tiles.iter().zip(heights.iter()) {
+                        let (x, y, w, h) = if tabbed {
+                                let content = params
+                                        .tab_indicator
+                                        .content_rect(col.tiles.len(), (xs[ci], 0.0, col_w, col_h));
+                                (content.0, content.1 + y, content.2, h)
+                        } else {
+                                (xs[ci], y, col_w, h)
+                        };
                         out.push(TileRect {
                                 id: tile.id,
-                                x: xs[ci].round() as i32,
+                                x: x.round() as i32,
                                 y: y.round() as i32,
-                                w: col_w.round().max(1.0) as i32,
+                                w: w.round().max(1.0) as i32,
                                 h: h.round().max(1.0) as i32,
                         });
                 }
@@ -535,6 +539,7 @@ mod tests {
                         default_column_width: ColumnWidth::Proportion(0.25),
                         preset_column_widths: Vec::new(),
                         preset_window_heights: Vec::new(),
+                        tab_indicator: crate::layout::tabbed::TabIndicatorConfig::default(),
                         center_focused_column: CenterFocused::OnOverflow,
                         struts: Struts::default(),
                 }
@@ -607,6 +612,7 @@ mod tests {
                         default_column_width: ColumnWidth::Proportion(0.5),
                         preset_column_widths: Vec::new(),
                         preset_window_heights: Vec::new(),
+                        tab_indicator: crate::layout::tabbed::TabIndicatorConfig::default(),
                         center_focused_column: CenterFocused::OnOverflow,
                         struts: Struts::default(),
                 };

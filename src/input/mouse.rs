@@ -94,6 +94,12 @@ static LAST_MOVE_POS: AtomicI64 = AtomicI64::new(i64::MIN);
 /// the host window. Intercepted presses are forwarded to the main
 /// thread and SWALLOWED (the desktop and the parked real windows
 /// below must not see them).
+static TAB_RECTS: Mutex<Vec<(i32, i32, i32, i32)>> = Mutex::new(Vec::new());
+
+pub fn set_tab_regions(rects: Vec<(i32, i32, i32, i32)>) {
+        *TAB_RECTS.lock().unwrap() = rects;
+}
+
 static OVERVIEW_RECTS: Mutex<Vec<(i32, i32, i32, i32)>> = Mutex::new(Vec::new());
 
 /// Replace the button-interception regions (called on overview
@@ -172,9 +178,14 @@ unsafe extern "system" fn hook_proc(
         // Overview backdrop regions: button presses are overview UI —
         // forward and swallow them (see OVERVIEW_RECTS).
         if matches!(kind, MouseKind::LButtonDown | MouseKind::RButtonDown) {
-                let inside = OVERVIEW_RECTS.lock().unwrap().iter().any(|&(l, t, r, b)| {
-                        ms.pt.x >= l && ms.pt.x < r && ms.pt.y >= t && ms.pt.y < b
-                });
+                let inside = OVERVIEW_RECTS
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .chain(TAB_RECTS.lock().unwrap().iter())
+                        .any(|&(l, t, r, b)| {
+                                ms.pt.x >= l && ms.pt.x < r && ms.pt.y >= t && ms.pt.y < b
+                        });
                 if !inside {
                         return call_next(lparam, code, wparam);
                 }

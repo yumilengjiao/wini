@@ -47,6 +47,7 @@ impl From<String> for AppError {
 }
 
 mod floating;
+mod tabs;
 use floating::{FloatState, FloatingFocus};
 
 mod overview;
@@ -122,6 +123,7 @@ struct AppState {
         transport: crate::transport::Transport,
         /// Windows currently shown by the transport (tiled). Diffed each
         /// frame so `set_shown` only fires on an actual visibility change.
+        tab_overlay: Option<crate::win::tab_indicator::TabOverlay>,
         shown: std::collections::HashSet<isize>,
         /// Whether the transport was animating on the previous tick, so the
         /// frame that lands exactly on settle is still applied once before
@@ -177,6 +179,12 @@ impl AppState {
                                         self.floating_focus.remove(id);
                                         self.original_rects.remove(&id);
                                         if let Some(d) = device {
+                                                if self.focused == Some(hwnd) {
+                                                        self.focused = self
+                                                                .layout
+                                                                .focused_id(&d)
+                                                                .map(|id| HWND(id as *mut _));
+                                                }
                                                 self.reclaim_workspaces(&d);
                                         }
                                         self.reflow();
@@ -195,6 +203,12 @@ impl AppState {
                                         self.floating_focus.remove(id);
                                         self.original_rects.remove(&id);
                                         if let Some(d) = device {
+                                                if self.focused == Some(hwnd) {
+                                                        self.focused = self
+                                                                .layout
+                                                                .focused_id(&d)
+                                                                .map(|id| HWND(id as *mut _));
+                                                }
                                                 self.reclaim_workspaces(&d);
                                         }
                                         self.reflow();
@@ -579,6 +593,7 @@ impl AppState {
                 );
                 self.overviews.insert(device.to_string(), ov);
                 self.overview_hosts.insert(device.to_string(), host);
+                self.refresh_overview(device);
                 self.sync_overview_regions();
                 self.update_focus_border();
         }
@@ -710,6 +725,8 @@ impl AppState {
                         match action {
                                 Action::FocusColumnLeft => ws.focus_column(DirH::Left),
                                 Action::FocusColumnRight => ws.focus_column(DirH::Right),
+                                Action::FocusWindowUp => ws.focus_tile(DirV::Up),
+                                Action::FocusWindowDown => ws.focus_tile(DirV::Down),
                                 Action::FocusColumnFirst => ws.focus_column_edge(Edge::First),
                                 Action::FocusColumnLast => ws.focus_column_edge(Edge::Last),
                                 Action::FocusColumnIndex(n) => {
@@ -862,6 +879,26 @@ impl AppState {
                         .iter()
                         .flat_map(|(_, rs)| rs.iter().cloned())
                         .collect();
+                let visible: std::collections::HashSet<_> = settled.iter().map(|r| r.id).collect();
+                let hidden_tabs: Vec<_> = self
+                        .layout
+                        .monitor(device)
+                        .into_iter()
+                        .flat_map(|ml| ml.workspaces.iter())
+                        .flat_map(|ws| ws.window_ids())
+                        .filter(|id| !visible.contains(id))
+                        .collect();
+                for id in hidden_tabs {
+                        self.hidden_by_us.insert(id);
+                        self.shown.remove(&id);
+                        placement::set_shown(HWND(id as *mut _), false);
+                }
+                let appearing: Vec<_> = settled
+                        .iter()
+                        .copied()
+                        .filter(|r| self.hidden_by_us.contains(&r.id))
+                        .collect();
+                placement::apply_geometry_sync(&appearing);
                 for r in &settled {
                         let hwnd = HWND(r.id as *mut _);
                         self.hidden_by_us.remove(&r.id);
@@ -943,6 +980,10 @@ impl AppState {
                         placement::apply_geometry_sync(&back);
                         log::debug!("overview[{device}]: snapped closed on suspend");
                 }
+                if let Some(overlay) = self.tab_overlay.as_mut() {
+                        overlay.update(Vec::new());
+                }
+                crate::input::mouse::set_tab_regions(Vec::new());
                 if let Some(fb) = self.focus_border.as_ref() {
                         fb.hide();
                 }
@@ -1012,7 +1053,9 @@ impl AppState {
                         MouseKind::LButtonDown | MouseKind::RButtonDown => {
                                 // Only fires inside an overview region (the hook
                                 // intercepts and swallows those presses).
-                                self.overview_click_at(ev.x, ev.y);
+                                if !self.click_tab(ev.x, ev.y) {
+                                        self.overview_click_at(ev.x, ev.y);
+                                }
                         },
                 }
         }
@@ -1046,8 +1089,12 @@ impl AppState {
                         return;
                 }
                 let visible_tiled = self.layout.monitors.iter().any(|m| {
-                        m.workspace_of(id)
-                                .is_some_and(|ws| ws == m.active_workspace_idx)
+                        m.workspace_of(id).is_some_and(|ws| {
+                                ws == m.active_workspace_idx
+                                        && m.workspaces[ws]
+                                                .rendered_ids()
+                                                .any(|visible| visible == id)
+                        })
                 });
                 let visible_float = self
                         .floating
@@ -1111,7 +1158,7 @@ impl AppState {
                         1 => self
                                 .layout
                                 .move_focused_column_to_monitor(device, &target_device)
-                                .and_then(|ids| ids.first().copied()),
+                                .and_then(|_| self.layout.focused_id(&target_device)),
                         2 => self
                                 .layout
                                 .move_focused_window_to_monitor(device, &target_device),
@@ -1225,6 +1272,12 @@ impl AppState {
                                 return;
                         },
                         Action::FocusWindowDown if self.overviews.contains_key(&device) => {
+                                if self.layout.monitor(&device).is_some_and(|ml| {
+                                        ml.active_workspace().active_column_is_tabbed()
+                                }) {
+                                        self.overview_focus(&device, action);
+                                        return;
+                                }
                                 let cur = self
                                         .layout
                                         .monitor(&device)
@@ -1234,6 +1287,12 @@ impl AppState {
                                 return;
                         },
                         Action::FocusWindowUp if self.overviews.contains_key(&device) => {
+                                if self.layout.monitor(&device).is_some_and(|ml| {
+                                        ml.active_workspace().active_column_is_tabbed()
+                                }) {
+                                        self.overview_focus(&device, action);
+                                        return;
+                                }
                                 let cur = self
                                         .layout
                                         .monitor(&device)
@@ -1588,6 +1647,11 @@ impl AppState {
                                         skip_view_refresh = layout_params.center_focused_column
                                                 != geometry::CenterFocused::Always;
                                 },
+                                ToggleColumnTabbedDisplay => {
+                                        fullscreen_prev = ws.fullscreen_id;
+                                        changed = ws.toggle_column_tabbed_display();
+                                        fullscreen_now = ws.fullscreen_id;
+                                },
                                 ToggleWindowedFullscreen => {
                                         fullscreen_prev = ws.fullscreen_id;
                                         changed = ws.toggle_fullscreen();
@@ -1862,8 +1926,12 @@ impl AppState {
                         })
                         .unwrap_or(false);
                 let visible_tiled = self.layout.monitors.iter().any(|m| {
-                        m.workspace_of(id)
-                                .is_some_and(|ws| ws == m.active_workspace_idx)
+                        m.workspace_of(id).is_some_and(|ws| {
+                                ws == m.active_workspace_idx
+                                        && m.workspaces[ws]
+                                                .rendered_ids()
+                                                .any(|visible| visible == id)
+                        })
                 });
                 if !crate::win::api::is_alive(hwnd) || (!visible_float && !visible_tiled) {
                         fb.hide();
@@ -1920,6 +1988,10 @@ impl AppState {
                 log::info!("display topology changed; re-enumerating monitors");
                 // The bar cache was computed against the old topology.
                 placement::invalidate_bar_cache();
+                if let Some(overlay) = self.tab_overlay.as_mut() {
+                        overlay.update(Vec::new());
+                }
+                crate::input::mouse::set_tab_regions(Vec::new());
                 let new_monitors = monitor::enumerate();
                 let new_devices: Vec<String> =
                         new_monitors.iter().map(|m| m.device.clone()).collect();
@@ -2398,6 +2470,7 @@ impl AppState {
                 // Sample + apply the transport frame (also kicks the first
                 // frame so first paint isn't delayed).
                 self.apply_transport_frame();
+                self.update_tab_indicators();
                 self.update_focus_border();
         }
 
@@ -2448,17 +2521,6 @@ impl AppState {
                         }
                         self.shown.remove(&id);
                 }
-                for &id in &frame.show {
-                        if !self.shown.contains(&id) {
-                                self.hidden_by_us.remove(&id);
-                                let hwnd = HWND(id as *mut _);
-                                if crate::win::api::is_alive(hwnd) {
-                                        placement::set_shown(hwnd, true);
-                                }
-                                self.shown.insert(id);
-                        }
-                }
-
                 // Apply moves, overriding fullscreen windows to cover the
                 // whole monitor.
                 let mut moves: Vec<geometry::TileRect> = Vec::with_capacity(frame.moves.len());
@@ -2473,6 +2535,24 @@ impl AppState {
                                 });
                         } else {
                                 moves.push(r);
+                        }
+                }
+                // Newly selected tabs must be placed while still hidden.
+                // Showing first exposes the old stacked/off-screen rectangle
+                // before the asynchronous SetWindowPos lands.
+                let appearing: Vec<_> = moves
+                        .iter()
+                        .copied()
+                        .filter(|r| !self.shown.contains(&r.id))
+                        .collect();
+                placement::apply_geometry_sync(&appearing);
+                for &id in &frame.show {
+                        if self.shown.insert(id) {
+                                self.hidden_by_us.remove(&id);
+                                let hwnd = HWND(id as *mut _);
+                                if crate::win::api::is_alive(hwnd) {
+                                        placement::set_shown(hwnd, true);
+                                }
                         }
                 }
                 placement::apply_geometry(&moves);
@@ -2510,6 +2590,7 @@ impl AppState {
                         self.was_animating = anim;
                 }
                 self.tick_overviews();
+                self.update_tab_indicators();
                 // The ring follows the focused window's live rect, so it must
                 // move with every animation frame.
                 self.update_focus_border();
@@ -2792,6 +2873,7 @@ impl App {
                                 t
                         },
                         transport,
+                        tab_overlay: crate::win::tab_indicator::TabOverlay::new(),
                         shown: std::collections::HashSet::new(),
                         was_animating: false,
                 }));
@@ -2957,6 +3039,8 @@ impl App {
                         if let Some(fb) = s.focus_border.take() {
                                 drop(fb);
                         }
+                        s.tab_overlay.take();
+                        crate::input::mouse::set_tab_regions(Vec::new());
                         s.overviews.clear();
                         s.overview_hosts.clear();
                 }

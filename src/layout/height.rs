@@ -47,6 +47,25 @@ pub fn allocate(
         area_height: f64,
 ) -> Vec<(f64, f64)> {
         let n = col.tiles.len();
+        if n > 0 && col.display == super::tabbed::ColumnDisplay::Tabbed {
+                let minimum = col
+                        .tiles
+                        .iter()
+                        .map(|t| t.min_h.max(1.0))
+                        .fold(1.0, f64::max);
+                let request = col.tiles.iter().find_map(|t| match t.height {
+                        Some(WindowHeight::Fixed(px)) => Some(px),
+                        Some(WindowHeight::Preset(idx)) => params
+                                .preset_window_heights
+                                .get(idx)
+                                .map(|&p| resolve(p, area_height)),
+                        None => None,
+                });
+                let h = request
+                        .unwrap_or(area_height)
+                        .clamp(minimum, area_height.max(minimum));
+                return vec![(0.0, h); n];
+        }
         if n == 0 {
                 return Vec::new();
         }
@@ -168,17 +187,32 @@ impl Workspace {
                         SizeChange::ProportionDelta(p) => current + area_height * p,
                 };
                 let col = &mut self.columns[ci];
-                let min_others: f64 = col
-                        .tiles
-                        .iter()
-                        .enumerate()
-                        .filter(|&(i, _)| i != ti)
-                        .map(|(_, t)| t.min_h.max(1.0) + params.gaps)
-                        .sum();
-                let max = (area_height - min_others).max(col.tiles[ti].min_h.max(1.0));
+                let min_others: f64 = if col.display == super::tabbed::ColumnDisplay::Tabbed {
+                        0.0
+                } else {
+                        col.tiles
+                                .iter()
+                                .enumerate()
+                                .filter(|&(i, _)| i != ti)
+                                .map(|(_, t)| t.min_h.max(1.0) + params.gaps)
+                                .sum()
+                };
+                let content_h = if col.display == super::tabbed::ColumnDisplay::Tabbed {
+                        params.tab_indicator
+                                .content_rect(col.tiles.len(), (0.0, 0.0, 1.0, area_height))
+                                .3
+                } else {
+                        area_height
+                };
+                let max = (content_h - min_others).max(col.tiles[ti].min_h.max(1.0));
                 let height = requested
                         .clamp(col.tiles[ti].min_h.max(1.0), max)
                         .min(100_000.0);
+                if col.display == super::tabbed::ColumnDisplay::Tabbed {
+                        for t in &mut col.tiles {
+                                t.height = None;
+                        }
+                }
                 col.tiles[ti].height = Some(WindowHeight::Fixed(height));
                 col.is_maximized = false;
                 true
@@ -214,6 +248,11 @@ impl Workspace {
                                 .rposition(|&p| resolve(p, area_height) < current - 1.0)
                                 .unwrap_or(presets.len() - 1),
                 };
+                if col.display == super::tabbed::ColumnDisplay::Tabbed {
+                        for t in &mut col.tiles {
+                                t.height = None;
+                        }
+                }
                 col.tiles[ti].height = Some(WindowHeight::Preset(next));
                 col.is_maximized = false;
                 true
@@ -223,6 +262,17 @@ impl Workspace {
                 let Some(col) = self.columns.get_mut(self.active_column_idx) else {
                         return false;
                 };
+                if col.display == super::tabbed::ColumnDisplay::Tabbed {
+                        let changed = col
+                                .tiles
+                                .iter()
+                                .any(|t| t.height.is_some() || t.height_weight != 1.0);
+                        for t in &mut col.tiles {
+                                t.height = None;
+                                t.height_weight = 1.0;
+                        }
+                        return changed;
+                }
                 let Some(tile) = col.tiles.get_mut(col.active_tile_idx) else {
                         return false;
                 };

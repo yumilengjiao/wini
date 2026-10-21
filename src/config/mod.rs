@@ -65,6 +65,7 @@ pub struct Bind {
 }
 
 mod sizing;
+mod tabbed;
 
 /// Everything the WM can do from a key press. Mirrors the niri action
 /// names we intend to support (a growing subset).
@@ -107,6 +108,7 @@ pub enum Action {
         CenterColumn,
         CenterVisibleColumns,
         ExpandColumnToAvailableWidth,
+        ToggleColumnTabbedDisplay,
         ToggleWindowedFullscreen,
         SetWindowHeight(String),
         SwitchPresetWindowHeight,
@@ -435,6 +437,7 @@ impl Default for Config {
                                 // would collide with Mod+Ctrl+Shift move-to-column
                                 // and only matter with multiple monitors) — bind
                                 // them in your config if you use several outputs.
+                                bind("Mod+W", Action::ToggleColumnTabbedDisplay),
                                 bind("Mod+F", Action::MaximizeColumn),
                                 bind("Mod+C", Action::CenterColumn),
                                 bind("Mod+Ctrl+C", Action::CenterVisibleColumns),
@@ -675,6 +678,7 @@ fn parse_layout(
                                 config.layout.preset_window_heights =
                                         sizing::parse_height_presets(n);
                         },
+                        "tab-indicator" => tabbed::parse(n, &mut config.layout.tab_indicator),
                         "focus-ring" => parse_focus_ring(n, config),
                         other => log::debug!("ignoring layout node {other:?}"),
                 }
@@ -1144,6 +1148,7 @@ fn parse_action(node: &KdlNode) -> Option<Action> {
                 "center-column" => Action::CenterColumn,
                 "center-visible-columns" => Action::CenterVisibleColumns,
                 "expand-column-to-available-width" => Action::ExpandColumnToAvailableWidth,
+                "toggle-column-tabbed-display" => Action::ToggleColumnTabbedDisplay,
                 "toggle-windowed-fullscreen" => Action::ToggleWindowedFullscreen,
                 "toggle-window-floating" => Action::ToggleWindowFloating,
                 "switch-focus-between-floating-and-tiling" => {
