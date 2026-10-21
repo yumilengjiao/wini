@@ -28,6 +28,9 @@
 //! tile and view springs. It skips applying real-window geometry while
 //! covered, but samples `workspace_rects` for DWM thumbnails each frame.
 
+mod tab_state;
+use tab_state::TabSelection;
+
 use std::collections::{HashMap, HashSet};
 
 use crate::anim::{AnimParams, AnimatedRect, Val};
@@ -69,7 +72,9 @@ struct MonitorT {
         /// selected tab from the old rendered rect, not its stale stack slot.
         /// Stable invisible resize margins, measured on entry to edge mode.
         edge_insets: HashMap<WindowId, crate::win::frame::FrameInsets>,
-        selected_tabs: HashMap<WindowId, WindowId>,
+        /// Snapshot of each tab group, including its membership. Structural
+        /// merges must not be mistaken for an ordinary tab focus switch.
+        selected_tabs: HashMap<WindowId, TabSelection>,
 }
 
 /// The unified transport for every monitor.
@@ -208,19 +213,22 @@ impl Transport {
                                         let Some(key) = col.tiles.first().map(|t| t.id) else {
                                                 continue;
                                         };
+                                        let Some(selection) = TabSelection::capture(col) else {
+                                                continue;
+                                        };
                                         let Some(active) = col.focused_id() else {
                                                 continue;
                                         };
-                                        if let Some(previous) = entry
-                                                .selected_tabs
-                                                .get(&key)
-                                                .filter(|&&id| id != active)
+                                        if let Some(previous) =
+                                                entry.selected_tabs.get(&key).and_then(|old| {
+                                                        old.previous_for_focus_change(&selection)
+                                                })
                                                 && let Some(rect) =
-                                                        entry.tiles.get(previous).cloned()
+                                                        entry.tiles.get(&previous).cloned()
                                         {
                                                 entry.tiles.insert(active, rect);
                                         }
-                                        next_tabs.insert(key, active);
+                                        next_tabs.insert(key, selection);
                                 }
                                 for mut r in geometry::workspace_colspace_rects_in_work_area(
                                         ws, params, work,
@@ -718,6 +726,90 @@ mod tests {
                 let frame = t.frame(&layout, &mons, &HashSet::new());
                 assert_eq!(frame.show.len(), 2);
                 assert!(frame.hide.is_empty());
+        }
+
+        #[test]
+        fn consuming_into_tabbed_column_keeps_incoming_horizontal_animation() {
+                let mut layout = Layout::new();
+                layout.add_window("D", 1);
+                layout.add_window("D", 2);
+                let p = params();
+                let mons = vec![monitor("D")];
+                let ws = layout.monitor_mut("D").unwrap().active_workspace_mut();
+                ws.focus_column_edge(crate::layout::Edge::First);
+                geometry::refresh_view_offset(ws, &p, 1000.0, None);
+                ws.toggle_column_tabbed_display();
+                let slow = AnimParams {
+                        kind: AnimKind::Easing {
+                                duration: std::time::Duration::from_secs(60),
+                                curve: crate::anim::Curve::Linear,
+                        },
+                        slowdown: 1.0,
+                };
+                let mut t = Transport::new(slow, slow, slow, slow);
+                t.sync(&layout, &mons, &p);
+                let before = t.workspace_rects(&layout, "D")[0]
+                        .1
+                        .iter()
+                        .copied()
+                        .find(|r| r.id == 2)
+                        .unwrap();
+                assert!(layout
+                        .monitor_mut("D")
+                        .unwrap()
+                        .active_workspace_mut()
+                        .consume_window_into_column());
+                t.sync(&layout, &mons, &p);
+                let during = t.workspace_rects(&layout, "D")[0].1[0];
+                assert_eq!(during.id, 2);
+                assert!(
+                        (during.x - before.x).abs() <= 1,
+                        "merge snapped: {before:?} -> {during:?}"
+                );
+                assert!(during.x > 400);
+                assert!(t.layout_animating("D"));
+                t.snap("D");
+                let final_rect = t.workspace_rects(&layout, "D")[0].1[0];
+                assert_eq!(final_rect.x, 0);
+                assert_eq!(t.frame(&layout, &mons, &HashSet::new()).hide, vec![1]);
+        }
+
+        #[test]
+        fn consuming_into_normal_stack_keeps_position_and_resize_animation() {
+                let mut layout = Layout::new();
+                layout.add_window("D", 1);
+                layout.add_window("D", 2);
+                let p = params();
+                let mons = vec![monitor("D")];
+                let ws = layout.monitor_mut("D").unwrap().active_workspace_mut();
+                ws.focus_column_edge(crate::layout::Edge::First);
+                geometry::refresh_view_offset(ws, &p, 1000.0, None);
+                let slow = AnimParams {
+                        kind: AnimKind::Easing {
+                                duration: std::time::Duration::from_secs(60),
+                                curve: crate::anim::Curve::Linear,
+                        },
+                        slowdown: 1.0,
+                };
+                let mut t = Transport::new(slow, slow, slow, slow);
+                t.sync(&layout, &mons, &p);
+                layout.monitor_mut("D")
+                        .unwrap()
+                        .active_workspace_mut()
+                        .consume_window_into_column();
+                t.sync(&layout, &mons, &p);
+                let during = t.workspace_rects(&layout, "D")[0].1.clone();
+                let incoming = during.iter().find(|r| r.id == 2).unwrap();
+                assert!(incoming.x > 400 && incoming.h > 700);
+                t.snap("D");
+                let final_rects = t.workspace_rects(&layout, "D")[0].1.clone();
+                assert_eq!(
+                        final_rects
+                                .iter()
+                                .map(|r| (r.x, r.y, r.h))
+                                .collect::<Vec<_>>(),
+                        vec![(0, 0, 400), (0, 400, 400)]
+                );
         }
 
         #[test]
