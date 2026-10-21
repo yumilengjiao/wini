@@ -891,6 +891,9 @@ impl AppState {
                         (cur - 1.0).max(0.0)
                 };
                 if (to - cur).abs() > f64::EPSILON {
+                        // A wheel event may arrive between prepare and reveal.
+                        // Keep the cover until a new final frame is prepared.
+                        ov.handoff_ready = false;
                         let switch = self.config.animations.workspace_switch_params();
                         ov.camera.retarget(to, switch);
                         ov.sync_from_progress = None;
