@@ -34,20 +34,20 @@
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-        DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
-        DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE, DwmRegisterThumbnail,
-        DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
+        DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE,
+        DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE, DwmQueryThumbnailSourceSize,
+        DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
 };
 use windows::Win32::Graphics::Gdi::{CreateSolidBrush, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GW_HWNDPREV, GWL_EXSTYLE,
-        GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowThreadProcessId, HWND_TOPMOST,
-        LWA_ALPHA, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOOWNERZORDER, SWP_NOSIZE, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, EnumWindows, FindWindowW, GW_HWNDPREV,
+        GWL_EXSTYLE, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+        GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, LWA_ALPHA, RegisterClassW,
+        SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+        SetLayeredWindowAttributes, SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::w;
 
@@ -67,8 +67,11 @@ pub struct OverviewHost {
         /// Host window origin in screen coords (thumbnail destination
         /// rects are client-relative).
         origin: (i32, i32),
-        /// Host client size (w, h) for the desktop backdrop thumbnail.
-        size: (i32, i32),
+        /// Desktop source crop and destination in host-client coordinates.
+        /// The desktop can span multiple monitors; never stretch it into
+        /// the work area (which excludes taskbars).
+        desktop_source: RECT,
+        desktop_dest: RECT,
         /// DWM thumbnail of the desktop shell (Progman): wallpaper + icons,
         /// NOT the app windows (they aren't Progman's content). Drawn to
         /// fill the host BEHIND the window thumbnails so the overview
@@ -79,11 +82,12 @@ pub struct OverviewHost {
 }
 
 impl OverviewHost {
-        /// Create the backdrop window covering `full` (left, top, right,
-        /// bottom in screen px), shown immediately.
-        pub fn new(full: (i32, i32, i32, i32)) -> Option<Self> {
+        /// Create the overview host over the work area, leaving the native
+        /// taskbar uncovered. Desktop cropping uses the actual source window
+        /// bounds, including negative virtual-screen coordinates.
+        pub fn new(host: (i32, i32, i32, i32)) -> Option<Self> {
                 let class_name = w!("yumi_wini_ov_host");
-                let (l, t, r, b) = full;
+                let (l, t, r, b) = host;
                 unsafe {
                         let hinstance = GetModuleHandleW(None).ok()?;
                         let wc = WNDCLASSW {
@@ -125,21 +129,29 @@ impl OverviewHost {
                                 255,
                                 LWA_ALPHA,
                         );
-                        // Register the desktop-shell (Progman) thumbnail FIRST so
-                        // it composites BEHIND the window thumbnails registered
-                        // later: the overview background becomes the real
-                        // wallpaper (+ icons), so closing dissolves wallpaper into
-                        // wallpaper without the dark backdrop popping to wallpaper.
-                        let desktop_thumb = FindWindowW(w!("Progman"), None)
-                                .ok()
-                                .filter(|h| !h.0.is_null())
-                                .and_then(|progman| DwmRegisterThumbnail(hwnd, progman).ok());
+                        let host_bounds = RECT {
+                                left: l,
+                                top: t,
+                                right: r,
+                                bottom: b,
+                        };
+                        let desktop = register_desktop(hwnd, host_bounds);
+                        let (desktop_thumb, desktop_source, desktop_dest) = match desktop {
+                                Some((thumb, crop)) => (Some(thumb), crop.source, crop.destination),
+                                None => {
+                                        log::warn!(
+                                                "overview: no usable desktop surface; using opaque fallback"
+                                        );
+                                        (None, RECT::default(), RECT::default())
+                                },
+                        };
                         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                         let host = OverviewHost {
                                 hwnd,
                                 thumbs: Vec::new(),
                                 origin: (l, t),
-                                size: (r - l, b - t),
+                                desktop_source,
+                                desktop_dest,
                                 desktop_thumb,
                         };
                         host.update_desktop_rect();
@@ -147,29 +159,29 @@ impl OverviewHost {
                 }
         }
 
-        /// Fill the whole host with the desktop backdrop thumbnail
-        /// (wallpaper and icons). Called once at creation; the source is the
-        /// desktop shell, so it never shows the app windows.
+        /// Crop the desktop at the host's screen location; its visible
+        /// portion has the same position/scale before and after overview.
         fn update_desktop_rect(&self) {
                 let Some(thumb) = self.desktop_thumb else {
                         return;
                 };
                 let props = DWM_THUMBNAIL_PROPERTIES {
-                        dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE,
-                        rcDestination: RECT {
-                                left: 0,
-                                top: 0,
-                                right: self.size.0,
-                                bottom: self.size.1,
-                        },
+                        dwFlags: DWM_TNP_RECTDESTINATION
+                                | DWM_TNP_RECTSOURCE
+                                | DWM_TNP_OPACITY
+                                | DWM_TNP_VISIBLE
+                                | DWM_TNP_SOURCECLIENTAREAONLY,
+                        rcSource: self.desktop_source,
+                        rcDestination: self.desktop_dest,
                         opacity: 255,
                         fVisible: windows::core::BOOL(1),
                         fSourceClientAreaOnly: windows::core::BOOL(0),
-                        ..Default::default()
                 };
                 // Safety: handle owned by us.
                 unsafe {
-                        let _ = DwmUpdateThumbnailProperties(thumb, &props);
+                        if let Err(e) = DwmUpdateThumbnailProperties(thumb, &props) {
+                                log::warn!("overview: desktop thumbnail update failed: {e}");
+                        }
                 }
         }
 
@@ -366,10 +378,165 @@ impl Drop for OverviewHost {
         }
 }
 
+#[derive(Debug)]
+struct DesktopCrop {
+        source: RECT,
+        destination: RECT,
+}
+
+/// Translate the work-area rectangle to source-surface pixels. DWM can
+/// report a source size different from GetWindowRect on mixed-DPI desktops.
+/// Keep scale conversion at this boundary, not in layout coordinates.
+fn desktop_crop(
+        bounds: RECT,
+        size: (i32, i32),
+        host: RECT,
+) -> Option<DesktopCrop> {
+        let bw = bounds.right as f64 - bounds.left as f64;
+        let bh = bounds.bottom as f64 - bounds.top as f64;
+        if bw <= 0.0
+                || bh <= 0.0
+                || size.0 <= 0
+                || size.1 <= 0
+                || host.right <= host.left
+                || host.bottom <= host.top
+                || host.left < bounds.left
+                || host.top < bounds.top
+                || host.right > bounds.right
+                || host.bottom > bounds.bottom
+        {
+                return None;
+        }
+        let sx = size.0 as f64 / bw;
+        let sy = size.1 as f64 / bh;
+        Some(DesktopCrop {
+                source: RECT {
+                        left: ((host.left as f64 - bounds.left as f64) * sx).round() as i32,
+                        top: ((host.top as f64 - bounds.top as f64) * sy).round() as i32,
+                        right: ((host.right as f64 - bounds.left as f64) * sx).round() as i32,
+                        bottom: ((host.bottom as f64 - bounds.top as f64) * sy).round() as i32,
+                },
+                destination: RECT {
+                        left: 0,
+                        top: 0,
+                        right: host.right - host.left,
+                        bottom: host.bottom - host.top,
+                },
+        })
+}
+
+/// Try existing Explorer desktop surfaces only. Never send undocumented
+/// messages to Explorer or create/reparent WorkerW windows on a user's PC.
+fn register_desktop(
+        host: HWND,
+        area: RECT,
+) -> Option<(isize, DesktopCrop)> {
+        unsafe extern "system" fn collect(
+                hwnd: HWND,
+                data: LPARAM,
+        ) -> windows::core::BOOL {
+                let class = crate::win::api::window_class(hwnd);
+                if (class == "Progman" || class == "WorkerW")
+                        && unsafe { IsWindowVisible(hwnd).as_bool() }
+                {
+                        unsafe { &mut *(data.0 as *mut Vec<HWND>) }.push(hwnd);
+                }
+                windows::core::BOOL(1)
+        }
+        let mut sources = Vec::new();
+        unsafe {
+                if let Ok(progman) = FindWindowW(w!("Progman"), None)
+                        && !progman.0.is_null()
+                {
+                        sources.push(progman);
+                }
+                let _ = EnumWindows(
+                        Some(collect),
+                        LPARAM(&mut sources as *mut Vec<HWND> as isize),
+                );
+                sources.dedup();
+                for source in sources {
+                        let mut bounds = RECT::default();
+                        if GetWindowRect(source, &mut bounds).is_err() {
+                                continue;
+                        }
+                        let Ok(thumb) = DwmRegisterThumbnail(host, source) else {
+                                continue;
+                        };
+                        let crop = DwmQueryThumbnailSourceSize(thumb)
+                                .ok()
+                                .and_then(|size| desktop_crop(bounds, (size.cx, size.cy), area));
+                        if let Some(crop) = crop {
+                                log::debug!(
+                                        "overview: desktop source {:?}, crop {:?}",
+                                        source,
+                                        crop
+                                );
+                                return Some((thumb, crop));
+                        }
+                        let _ = DwmUnregisterThumbnail(thumb);
+                }
+        }
+        None
+}
+
 /// Backdrop brush for the window class (leaked: one per process).
 /// Paints the opaque dark overview backdrop.
 fn backdrop_brush() -> HBRUSH {
         unsafe { CreateSolidBrush(windows::Win32::Foundation::COLORREF(BACKDROP)) }
+}
+
+#[cfg(test)]
+mod tests {
+        use super::*;
+        fn rect(
+                l: i32,
+                t: i32,
+                r: i32,
+                b: i32,
+        ) -> RECT {
+                RECT {
+                        left: l,
+                        top: t,
+                        right: r,
+                        bottom: b,
+                }
+        }
+        #[test]
+        fn desktop_crop_preserves_taskbar_edges() {
+                let bounds = rect(0, 0, 2560, 1600);
+                for host in [
+                        rect(0, 0, 2476, 1600),
+                        rect(84, 0, 2560, 1600),
+                        rect(0, 48, 2560, 1600),
+                        rect(0, 0, 2560, 1552),
+                ] {
+                        let crop = desktop_crop(bounds, (2560, 1600), host).unwrap();
+                        assert_eq!(crop.source, host);
+                        assert_eq!(
+                                crop.destination,
+                                rect(0, 0, host.right - host.left, host.bottom - host.top)
+                        );
+                }
+        }
+        #[test]
+        fn desktop_crop_handles_negative_monitors_and_scaled_source() {
+                let bounds = rect(-1920, -200, 2560, 1600);
+                let host = rect(-1920, -152, 0, 880);
+                let crop = desktop_crop(bounds, (4480, 1800), host).unwrap();
+                assert_eq!(crop.source, rect(0, 48, 1920, 1080));
+                let crop = desktop_crop(bounds, (2240, 900), host).unwrap();
+                assert_eq!(crop.source, rect(0, 24, 960, 540));
+                assert_eq!(crop.destination, rect(0, 0, 1920, 1032));
+        }
+        #[test]
+        fn desktop_crop_rejects_invalid_or_noncovering_surface() {
+                assert!(desktop_crop(rect(0, 0, 0, 0), (0, 0), rect(0, 0, 10, 10)).is_none());
+                assert!(
+                        desktop_crop(rect(0, 0, 100, 100), (100, 100), rect(-10, 0, 10, 10))
+                                .is_none()
+                );
+        }
 }
 
 extern "system" fn wnd_proc(
