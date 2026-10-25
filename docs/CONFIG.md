@@ -317,8 +317,38 @@ A fixed/preset-height window reserves its requested height; auto-height
 siblings share the rest, honoring minimum heights. If minimums cannot fit,
 the column extends below the work area rather than overlapping. Reset
 returns the focused window to auto weight 1; a sole fixed-height window may
-leave unused space below it. Floating `set-window-height` keeps its existing
-behavior; preset/reset height actions currently apply to tiled windows only.
+leave unused space below it. For floating windows, see the sizing behavior below.
+
+## Floating window sizing
+
+After `Mod+V` makes a window floating, the existing sizing actions work on that
+window without changing focus, its workspace, or the tiled selection:
+
+- `Mod+R` / `Mod+Shift+R`: cycle `preset-column-widths` forward / backward.
+  A bare `set-column-width` also cycles forward.
+- `Mod+Ctrl+Shift+R`: cycle `preset-window-heights` forward. The
+  `switch-preset-window-height-back` action is available without a default bind.
+- `set-column-width` / `set-window-height`: fixed pixels, pixel deltas, absolute
+  percentages and percentage deltas. `"50%"` means half of the window's monitor
+  work area **after struts**, not half its current size. `"+10%"` adds a tenth of
+  that area's width/height. Floating sizes do not subtract tiled gaps.
+
+Width and height remember their preset positions independently for each float.
+The first cycle finds a larger/smaller preset (allowing 1px for rounding); later
+cycles follow configuration order and wrap. A manual resize or explicit size
+request clears the affected axis's preset position. Moving alone preserves it.
+Changing a preset list on config reload clears that axis's position without
+resizing the window. Returning to tiling discards this floating-only state.
+
+Requested sizes use physical outer-HWND pixels and respect the tracked window's
+minimum size; applications can still impose additional native restrictions.
+Placement keeps a grab area on the monitor, including tiny work areas and
+negative-coordinate displays. As in niri, `reset-window-height` is a **no-op for
+floats** because automatic height sharing is a tiled-column operation.
+
+This uses the existing native floating move/resize path. It does not add new
+floating resize animations, floating overview previews or floating edge
+maximization.
 
 ## Window sizing modes on Windows
 

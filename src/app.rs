@@ -239,10 +239,7 @@ impl AppState {
                                                 if let Some((x, y, w, h)) =
                                                         crate::win::api::window_rect(hwnd)
                                                 {
-                                                        fs.x = x;
-                                                        fs.y = y;
-                                                        fs.w = w;
-                                                        fs.h = h;
+                                                        fs.adopt_interactive_rect((x, y, w, h));
                                                 }
                                         } else {
                                                 // Tiled window: interpret the drag as a niri-style
@@ -344,17 +341,8 @@ impl AppState {
                                 .monitor(&device)
                                 .map(|m| m.active_workspace_idx)
                                 .unwrap_or(0);
-                        self.floating.insert(
-                                id,
-                                FloatState {
-                                        device,
-                                        workspace_idx: ws_idx,
-                                        x,
-                                        y,
-                                        w,
-                                        h,
-                                },
-                        );
+                        self.floating
+                                .insert(id, FloatState::new(device, ws_idx, (x, y, w, h)));
                         self.floating_focus.record(id);
                         log::debug!("window-rule: {id} opens floating");
                         return;
@@ -1392,92 +1380,34 @@ impl AppState {
                                 self.close_window(id);
                                 return;
                         }
-                        // Map a few tiling actions to float move/resize.
-                        let mut touched = false;
-                        if let Some(fs) = self.floating.get_mut(&id) {
-                                const STEP: f64 = 50.0;
-                                match action {
-                                        Action::MoveColumnLeft => {
-                                                fs.x -= STEP;
-                                                touched = true;
-                                        },
-                                        Action::MoveColumnRight => {
-                                                fs.x += STEP;
-                                                touched = true;
-                                        },
-                                        Action::MoveWindowUp => {
-                                                fs.y -= STEP;
-                                                touched = true;
-                                        },
-                                        Action::MoveWindowDown => {
-                                                fs.y += STEP;
-                                                touched = true;
-                                        },
-                                        Action::SetColumnWidth(spec) => {
-                                                if let Some(change) = SizeChange::parse(&spec) {
-                                                        match change {
-                                                                SizeChange::Delta(d) => {
-                                                                        fs.w = (fs.w + d).max(100.0)
-                                                                },
-                                                                SizeChange::Fixed(f) => {
-                                                                        fs.w = f.max(100.0)
-                                                                },
-                                                                SizeChange::Proportion(p) => {
-                                                                        fs.w = (fs.w * p
-                                                                                .clamp(0.05, 20.0))
-                                                                        .max(100.0)
-                                                                },
-                                                                SizeChange::ProportionDelta(dp) => {
-                                                                        fs.w = (fs.w * (1.0 + dp))
-                                                                                .max(100.0)
-                                                                },
-                                                        }
-                                                        touched = true;
-                                                }
-                                        },
-                                        Action::SetWindowHeight(spec) => {
-                                                if let Some(change) = SizeChange::parse(&spec) {
-                                                        match change {
-                                                                SizeChange::Delta(d) => {
-                                                                        fs.h = (fs.h + d).max(100.0)
-                                                                },
-                                                                SizeChange::Fixed(f) => {
-                                                                        fs.h = f.max(100.0)
-                                                                },
-                                                                SizeChange::Proportion(p) => {
-                                                                        fs.h = (fs.h * p
-                                                                                .clamp(0.05, 20.0))
-                                                                        .max(100.0)
-                                                                },
-                                                                SizeChange::ProportionDelta(dp) => {
-                                                                        fs.h = (fs.h * (1.0 + dp))
-                                                                                .max(100.0)
-                                                                },
-                                                        }
-                                                        touched = true;
-                                                }
-                                        },
-                                        _ => {},
-                                }
-                                // Keep at least 100 px of the float on its monitor.
-                                if touched
-                                        && let Some(m) =
-                                                self.monitors.iter().find(|m| m.device == fs.device)
-                                {
-                                        fs.x = fs.x.clamp(
-                                                m.work.left as f64 - fs.w + 100.0,
-                                                m.work.right as f64 - 100.0,
-                                        );
-                                        fs.y = fs.y.clamp(
-                                                m.work.top as f64 - fs.h + 100.0,
-                                                m.work.bottom as f64 - 100.0,
-                                        );
-                                }
-                        }
+                        let minimum = self
+                                .windows
+                                .get(HWND(id as *mut _))
+                                .map(|info| info.min_size)
+                                .unwrap_or((0.0, 0.0));
+                        let touched = if let Some(fs) = self.floating.get_mut(&id)
+                                && let Some(m) =
+                                        self.monitors.iter().find(|m| m.device == fs.device)
+                        {
+                                fs.apply_geometry_action(
+                                        &action,
+                                        &self.params,
+                                        (
+                                                m.work.left as f64,
+                                                m.work.top as f64,
+                                                (m.work.right - m.work.left) as f64,
+                                                (m.work.bottom - m.work.top) as f64,
+                                        ),
+                                        minimum,
+                                )
+                        } else {
+                                false
+                        };
                         if touched {
                                 self.reflow();
                         }
-                        // Other tiling actions fall through to the tiling below.
+                        // Unsupported tiled-only actions are no-ops for a float;
+                        // never resize the remembered tiled selection underneath it.
                         return;
                 }
                 // Tiling -> float happens before the layout lookup too (the
@@ -1866,6 +1796,9 @@ impl AppState {
                         cfg.animations.view_offset_params(),
                         cfg.animations.workspace_switch_params(),
                 );
+                for fs in self.floating.values_mut() {
+                        fs.update_sizing_config(&self.params, &cfg.layout);
+                }
                 self.params = cfg.layout.clone();
                 if mod_changed {
                         input::set_mod_key(cfg.mod_key.clone());
@@ -2296,17 +2229,8 @@ impl AppState {
                                 None => (100.0, 100.0, 800.0, 600.0),
                         }
                 });
-                self.floating.insert(
-                        id,
-                        FloatState {
-                                device: device.clone(),
-                                workspace_idx: ws_idx,
-                                x: rect.0,
-                                y: rect.1,
-                                w: rect.2,
-                                h: rect.3,
-                        },
-                );
+                self.floating
+                        .insert(id, FloatState::new(device.clone(), ws_idx, rect));
                 self.floating_focus.record(id);
                 // Close the gap in the tiling (reflow positions the float too).
                 self.reflow();

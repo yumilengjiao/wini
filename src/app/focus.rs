@@ -186,14 +186,7 @@ mod tests {
                 layout.add_window("E", 2);
                 let floats = HashMap::from([(
                         10,
-                        FloatState {
-                                device: "D".into(),
-                                workspace_idx: 0,
-                                x: 0.0,
-                                y: 0.0,
-                                w: 400.0,
-                                h: 600.0,
-                        },
+                        FloatState::new("D".into(), 0, (0.0, 0.0, 400.0, 600.0)),
                 )]);
                 let overviews = HashMap::from([("D".into(), overview())]);
                 assert!(!accept_foreground(

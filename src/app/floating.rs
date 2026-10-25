@@ -6,6 +6,10 @@
 use crate::layout::WindowId;
 use std::collections::HashMap;
 
+mod sizing;
+#[cfg(test)]
+mod sizing_tests;
+
 #[derive(Debug, Clone)]
 pub(super) struct FloatState {
         pub(super) device: String,
@@ -14,6 +18,27 @@ pub(super) struct FloatState {
         pub(super) y: f64,
         pub(super) w: f64,
         pub(super) h: f64,
+        preset_width: Option<usize>,
+        preset_height: Option<usize>,
+}
+
+impl FloatState {
+        pub(super) fn new(
+                device: String,
+                workspace_idx: usize,
+                rect: (f64, f64, f64, f64),
+        ) -> Self {
+                Self {
+                        device,
+                        workspace_idx,
+                        x: rect.0,
+                        y: rect.1,
+                        w: rect.2,
+                        h: rect.3,
+                        preset_width: None,
+                        preset_height: None,
+                }
+        }
 }
 
 #[derive(Debug, Default)]
@@ -80,14 +105,7 @@ mod tests {
                 device: &str,
                 workspace: usize,
         ) -> FloatState {
-                FloatState {
-                        device: device.into(),
-                        workspace_idx: workspace,
-                        x: 0.0,
-                        y: 0.0,
-                        w: 500.0,
-                        h: 500.0,
-                }
+                FloatState::new(device.into(), workspace, (0.0, 0.0, 500.0, 500.0))
         }
 
         #[test]
