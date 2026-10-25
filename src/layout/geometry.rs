@@ -153,7 +153,12 @@ pub fn resolve_width(
         view_width: f64,
 ) -> f64 {
         match width.unwrap_or(params.default_column_width) {
-                ColumnWidth::Proportion(p) => (p * view_width).max(1.0),
+                // A proportional slot includes its share of the inter-column
+                // gaps and the two outer gaps. Two 50% columns must fit without
+                // scrolling: 2 * ((view - gap) / 2 - gap) + 3 * gap == view.
+                ColumnWidth::Proportion(p) => {
+                        ((view_width - params.gaps) * p - params.gaps).max(1.0)
+                },
                 ColumnWidth::Fixed(f) => f.max(1.0),
         }
 }
@@ -609,6 +614,44 @@ mod tests {
         }
 
         #[test]
+        fn two_half_width_columns_fit_without_scrolling_on_focus_changes() {
+                for gaps in [1.0, 8.0, 16.0] {
+                        for width in [993.0, 994.0, 1920.0] {
+                                let p = LayoutParams {
+                                        gaps,
+                                        ..LayoutParams::default()
+                                };
+                                let mut ws = Workspace::new();
+                                ws.add_window(1);
+                                ws.add_window(2);
+                                ws.focus_column_index(0);
+                                refresh_view_offset(&mut ws, &p, width, None);
+                                let before = compute_workspace_geometry(
+                                        &ws,
+                                        &p,
+                                        (-1000.0, 12.0, width, 782.0),
+                                );
+                                let view = target_view_pos(&ws, &p, width);
+                                for index in [1, 0, 1, 0] {
+                                        ws.focus_column_index(index);
+                                        refresh_view_offset(&mut ws, &p, width, None);
+                                        let after = compute_workspace_geometry(
+                                                &ws,
+                                                &p,
+                                                (-1000.0, 12.0, width, 782.0),
+                                        );
+                                        assert_eq!(
+                                                target_view_pos(&ws, &p, width),
+                                                view,
+                                                "gaps={gaps}, width={width}, focus={index}"
+                                        );
+                                        assert_eq!(after, before);
+                                }
+                        }
+                }
+        }
+
+        #[test]
         fn struts_preserve_usable_area_and_width_agreement() {
                 let mut p = params();
                 p.struts = Struts {
@@ -637,9 +680,9 @@ mod tests {
                 let p = params();
                 let ws_w = W;
                 let widths = column_widths(&ws, &p, ws_w);
-                assert_eq!(widths, vec![0.25 * ws_w, 300.0]);
+                assert_eq!(widths, vec![240.0, 300.0]); // (1000 - 8) * 0.25 - 8
                 let xs = column_xs(&widths, 8.0);
-                assert_eq!(xs, vec![0.0, 0.25 * ws_w + 8.0]);
+                assert_eq!(xs, vec![0.0, 248.0]);
         }
 
         #[test]
@@ -680,12 +723,13 @@ mod tests {
                 // default-column-width 0.5).
                 let widths = column_widths(&ws, &p, W);
                 let xs = column_xs(&widths, p.gaps);
-                // active=col1, offset 0: view = xs[1]..xs[1]+W. add_window
-                // focuses each new column, so reset active to col 1.
+                // Leave 100px of the previous column visible on the left,
+                // so the third column genuinely overflows. Two half-width
+                // columns alone now fit including all gaps.
                 ws.active_column_idx = 1;
-                ws.view_offset = 0.0;
+                ws.view_offset = -100.0;
                 assert!(
-                        xs[2] + widths[2] > xs[1] + W,
+                        xs[2] + widths[2] > xs[1] + ws.view_offset + W,
                         "col 3 must partially overflow the view"
                 );
 
@@ -695,11 +739,8 @@ mod tests {
                 ws.active_column_idx = 2;
                 refresh_view_offset(&mut ws, &p, W, None);
                 let vp = view_pos(&ws, &xs);
-                // After the refresh col 2 (idx 2) must be fully visible:
-                // its right edge within the view. (Niri's OnOverflow centers
-                // here — the 2<->3 span doesn't fit — either way it must be
-                // fully visible; the pre-fix behavior was NO scroll at all,
-                // leaving the column cut off.)
+                // The target must become fully visible by minimal scrolling;
+                // the two gap-aware half-width columns fit together.
                 assert!(
                         xs[2] + widths[2] <= vp + W + 0.5,
                         "col 3 right edge {:.0} must be <= vp+W = {:.0}",
@@ -807,7 +848,7 @@ mod tests {
                 let p = params();
                 let rects = compute_workspace_geometry(&ws, &p, area());
                 assert_eq!(rects.len(), 3);
-                let col_w = 0.25 * W;
+                let col_w = 240.0; // (1000 - 8) * 0.25 - 8
                 // Content (3 cols + gaps) fits: niri parks the row at the left
                 // edge with a `gaps` margin (the view offset's padding), no
                 // centering, and columns fill the full height.
@@ -849,7 +890,7 @@ mod tests {
                 // Column 2 widened to the window's enforced minimum; column 1
                 // keeps its proportion width.
                 assert_eq!(widths[1], 500.0);
-                assert_eq!(widths[0], 250.0);
+                assert_eq!(widths[0], 240.0);
                 // Heights honor the minimum too.
                 let rects = compute_workspace_geometry(&ws, &p, area());
                 let second = rects.iter().find(|r| r.id == 2).unwrap();
@@ -925,19 +966,19 @@ mod tests {
                 // the first ones, focus on the first. Focusing right (to the
                 // second, already-visible column) must NOT scroll the view.
                 let mut ws = Workspace::new();
-                for i in 1..=4 {
+                for i in 1..=5 {
                         ws.add_window(i);
                 }
                 let p = params();
                 let view_w = W;
                 let widths = column_widths(&ws, &p, view_w);
-                // Three columns fit, four don't (so the view can scroll).
-                assert!(widths[0] * 3.0 + p.gaps * 2.0 <= view_w);
-                assert!(widths[0] * 4.0 + p.gaps * 3.0 > view_w);
+                // Four quarters fit including all gaps; a fifth still scrolls.
+                assert!(widths[0] * 4.0 + p.gaps * 5.0 <= view_w);
+                assert!(widths[0] * 5.0 + p.gaps * 6.0 > view_w);
                 // Settle the view on the newest (focused) column.
                 refresh_view_offset(&mut ws, &p, view_w, None);
                 let before = geometry_xs(&ws, &p);
-                // Focus the third column (already visible in the settled view).
+                // Focus the fourth column (already visible in the settled view).
                 assert!(ws.focus_column(DirH::Left));
                 refresh_view_offset(&mut ws, &p, view_w, None);
                 let after = geometry_xs(&ws, &p);

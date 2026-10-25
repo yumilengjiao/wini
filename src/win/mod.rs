@@ -5,10 +5,12 @@
 #![allow(dead_code)]
 
 pub mod api;
+mod bar_geometry;
 pub mod decorations;
 pub mod events;
 pub mod focus_border;
 pub mod frame;
+pub mod layering;
 pub mod monitor;
 pub mod msg_window;
 pub mod overlay;

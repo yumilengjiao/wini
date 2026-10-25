@@ -28,15 +28,17 @@
 //! tile and view springs. It skips applying real-window geometry while
 //! covered, but samples `workspace_rects` for DWM thumbnails each frame.
 
+mod tab_departure;
 mod tab_state;
+mod workspaces;
+use tab_departure::TabDepartures;
 use tab_state::TabSelection;
 
 use std::collections::{HashMap, HashSet};
 
 use crate::anim::{AnimParams, AnimatedRect, Val};
-use crate::layout::Layout;
-use crate::layout::WindowId;
 use crate::layout::geometry::{self, LayoutParams, TileRect};
+use crate::layout::{ColumnId, Layout, WindowId};
 use crate::win::monitor::Monitor;
 
 /// One frame of work for the app to apply to real windows.
@@ -48,6 +50,9 @@ pub struct Frame {
         pub show: Vec<WindowId>,
         /// Windows that must be hidden this frame (inactive workspaces).
         pub hide: Vec<WindowId>,
+        /// Structural merge/split participants drawn above siblings while
+        /// their rectangles move. Does not change OS keyboard focus.
+        pub raise: Vec<WindowId>,
 }
 
 /// Per-monitor animated transport state.
@@ -68,13 +73,32 @@ struct MonitorT {
         /// Screen origin of the tiling area (work area inset by struts).
         /// Column-space rects are composed relative to it.
         origin: (i32, i32),
-        /// Last selected tab keyed by the column's first tile. Seed a newly
-        /// selected tab from the old rendered rect, not its stale stack slot.
         /// Stable invisible resize margins, measured on entry to edge mode.
         edge_insets: HashMap<WindowId, crate::win::frame::FrameInsets>,
-        /// Snapshot of each tab group, including its membership. Structural
-        /// merges must not be mistaken for an ordinary tab focus switch.
-        selected_tabs: HashMap<WindowId, TabSelection>,
+        /// Last selected tab keyed by stable column identity, including its
+        /// membership. Seed pure selection changes from the rendered rect;
+        /// structural merges must preserve the incoming window's own motion.
+        selected_tabs: HashMap<ColumnId, TabSelection>,
+        /// Structural participants still moving above their tiled siblings.
+        moving_above: HashSet<WindowId>,
+        /// The last submitted frame also covers instant/settled motion when
+        /// the action restores OS focus immediately after applying geometry.
+        focus_raise: HashSet<WindowId>,
+        /// Previous column identity for each tile. Removing its first window
+        /// does not turn the remaining siblings into moving participants.
+        tile_columns: HashMap<WindowId, ColumnId>,
+        /// During a Normal -> Tabbed toggle, retain outgoing native surfaces
+        /// behind the selected tile until its expansion finishes.
+        collapsing_tabs: HashMap<WindowId, WindowId>,
+        /// Existing tab surface -> incoming merge participant. Both HWNDs
+        /// remain independent until the incoming window arrives, even when
+        /// tab selection changes while the structural animation is running.
+        merging_tabs: HashSet<(WindowId, WindowId)>,
+        /// Hidden tabs extracted into new columns stay below their source face.
+        departing_tabs: TabDepartures,
+        /// Display-mode toggles keep the selected surface above its siblings;
+        /// merge/split animations retain their separate departing-tile order.
+        display_focus: HashSet<WindowId>,
 }
 
 /// The unified transport for every monitor.
@@ -137,6 +161,15 @@ impl Transport {
         ) {
                 for m in self.monitors.values_mut() {
                         m.tiles.remove(&id);
+                        m.moving_above.remove(&id);
+                        m.focus_raise.remove(&id);
+                        m.tile_columns.remove(&id);
+                        m.collapsing_tabs
+                                .retain(|tile, active| *tile != id && *active != id);
+                        m.merging_tabs
+                                .retain(|(base, incoming)| *base != id && *incoming != id);
+                        m.departing_tabs.remove_window(id);
+                        m.display_focus.remove(&id);
                 }
         }
 
@@ -178,8 +211,29 @@ impl Transport {
                                         origin,
                                         edge_insets: HashMap::new(),
                                         selected_tabs: HashMap::new(),
+                                        moving_above: HashSet::new(),
+                                        focus_raise: HashSet::new(),
+                                        tile_columns: HashMap::new(),
+                                        collapsing_tabs: HashMap::new(),
+                                        merging_tabs: HashSet::new(),
+                                        departing_tabs: TabDepartures::default(),
+                                        display_focus: HashSet::new(),
                                 }
                         });
+                        entry.focus_raise.clear();
+                        entry.departing_tabs.sync(
+                                ml,
+                                &entry.selected_tabs,
+                                &entry.tile_columns,
+                                &entry.tiles,
+                        );
+                        // Retire completed merges before retargeting unrelated
+                        // resize/focus motion, or old surfaces could reappear.
+                        entry.merging_tabs.retain(|&(base, incoming)| {
+                                tab_state::merge_in_flight(&entry.tiles, base, incoming)
+                        });
+                        entry.display_focus
+                                .retain(|id| entry.moving_above.contains(id));
                         entry.stride = stride;
                         entry.origin = origin;
                         entry.active = ml.active_workspace_idx;
@@ -191,6 +245,46 @@ impl Transport {
                         let mut live_ws: HashSet<usize> = HashSet::new();
                         let mut next_tabs = HashMap::new();
                         let mut edge_ids = HashSet::new();
+                        let mut next_columns = HashMap::new();
+                        let old_collapsing: HashSet<_> = entry
+                                .collapsing_tabs
+                                .iter()
+                                .filter(|(_, active)| {
+                                        entry.tiles.get(active).is_some_and(|rect| !rect.finished())
+                                })
+                                .map(|(id, _)| *id)
+                                .collect();
+                        let old_merging: HashSet<_> = entry
+                                .merging_tabs
+                                .iter()
+                                .filter(|&&(base, incoming)| {
+                                        tab_state::merge_in_flight(&entry.tiles, base, incoming)
+                                })
+                                .copied()
+                                .collect();
+                        let independent_surfaces: HashSet<_> = old_merging
+                                .iter()
+                                .flat_map(|&(base, incoming)| [base, incoming])
+                                .collect();
+                        // Snapshot old tab-group anchors before seeding new
+                        // selections. Splits and display toggles can reveal a
+                        // hidden sibling while the selected tab is an incoming
+                        // traveler; that sibling belongs at the destination,
+                        // not on the traveler's independent trajectory.
+                        let old_tab_rects: HashMap<_, _> = entry
+                                .selected_tabs
+                                .values()
+                                .filter_map(|group| {
+                                        let anchor = tab_state::merge_anchor(
+                                                group.active(),
+                                                &old_merging,
+                                        );
+                                        entry.tiles
+                                                .get(&anchor)
+                                                .cloned()
+                                                .map(|rect| (group.active(), rect))
+                                })
+                                .collect();
 
                         for (k, ws) in ml.workspaces.iter().enumerate() {
                                 if ws.is_empty() {
@@ -205,28 +299,92 @@ impl Transport {
                                 vslot.retarget(target_vp, self.view);
 
                                 for col in &ws.columns {
+                                        let key = col.id;
+                                        let Some(active) = col.focused_id() else {
+                                                continue;
+                                        };
+                                        let selection = TabSelection::capture(col).unwrap();
+                                        // Membership/focus can change together. The retained
+                                        // Column is the destination even when a traveler is
+                                        // prepended or both source and destination are tabbed.
+                                        let was_tabbed = entry.selected_tabs.get(&key);
+                                        let entering = col.display
+                                                == crate::layout::tabbed::ColumnDisplay::Tabbed
+                                                && was_tabbed.is_none()
+                                                && col.tiles.len() > 1
+                                                && col.tiles.iter().all(|tile| {
+                                                        entry.tile_columns.get(&tile.id)
+                                                                == Some(&key)
+                                                });
+                                        let leaving = col.display
+                                                == crate::layout::tabbed::ColumnDisplay::Normal
+                                                && was_tabbed.is_some_and(|old| {
+                                                        !old.membership_changed(&selection)
+                                                });
+                                        if entering || leaving {
+                                                entry.display_focus.retain(|id| {
+                                                        !col.tiles.iter().any(|t| t.id == *id)
+                                                });
+                                                entry.moving_above
+                                                        .extend(col.tiles.iter().map(|t| t.id));
+                                                entry.display_focus.insert(active);
+                                        }
+                                        if entering {
+                                                entry.collapsing_tabs.extend(col
+                                                        .tiles
+                                                        .iter()
+                                                        .filter(|t| t.id != active)
+                                                        .map(|t| (t.id, active)));
+                                        }
                                         if col.display
                                                 != crate::layout::tabbed::ColumnDisplay::Tabbed
                                         {
                                                 continue;
                                         }
-                                        let Some(key) = col.tiles.first().map(|t| t.id) else {
-                                                continue;
-                                        };
-                                        let Some(selection) = TabSelection::capture(col) else {
-                                                continue;
-                                        };
-                                        let Some(active) = col.focused_id() else {
-                                                continue;
-                                        };
-                                        if let Some(previous) =
-                                                entry.selected_tabs.get(&key).and_then(|old| {
-                                                        old.previous_for_focus_change(&selection)
-                                                })
-                                                && let Some(rect) =
-                                                        entry.tiles.get(&previous).cloned()
+                                        if let Some(previous) = was_tabbed.and_then(|old| {
+                                                old.previous_for_focus_change(&selection)
+                                        }) && !independent_surfaces.contains(&active)
                                         {
-                                                entry.tiles.insert(active, rect);
+                                                // A moving incoming tab is NOT the group's
+                                                // shared surface. Existing visible members keep
+                                                // their own springs; a new hidden selection uses
+                                                // the base left behind in the target column.
+                                                let anchor = tab_state::merge_anchor(
+                                                        previous,
+                                                        &old_merging,
+                                                );
+                                                if let Some(rect) =
+                                                        entry.tiles.get(&anchor).cloned()
+                                                {
+                                                        entry.tiles.insert(active, rect);
+                                                        if old_merging.iter().any(|&(base, _)| {
+                                                                selection.contains(base)
+                                                        }) {
+                                                                entry.moving_above.insert(active);
+                                                        }
+                                                }
+                                        }
+                                        if let Some(old) = was_tabbed
+                                                && old.membership_changed(&selection)
+                                        {
+                                                for incoming in selection.added_to(old) {
+                                                        if entry.tiles.contains_key(&incoming) {
+                                                                entry.merging_tabs.insert((
+                                                                        old.active(),
+                                                                        incoming,
+                                                                ));
+                                                                log::debug!(
+                                                                        "tab merge: base={} incoming={incoming}; keeping independent surfaces",
+                                                                        old.active()
+                                                                );
+                                                                entry.moving_above.insert(incoming);
+                                                                // Incoming tabs slide UNDER the existing
+                                                                // destination, not across its front face.
+                                                                entry.moving_above
+                                                                        .insert(old.active());
+                                                        }
+                                                }
+                                                entry.moving_above.insert(active);
                                         }
                                         next_tabs.insert(key, selection);
                                 }
@@ -256,6 +414,45 @@ impl Transport {
                                                 r.w = mon.full.right - mon.full.left;
                                                 r.h = mon.full.bottom - mon.full.top;
                                         }
+                                        let (ci, _) = ws
+                                                .find(r.id)
+                                                .expect("geometry belongs to workspace");
+                                        let col = &ws.columns[ci];
+                                        let key = col.id;
+                                        if entry.tile_columns
+                                                .get(&r.id)
+                                                .is_some_and(|&old| old != key)
+                                        {
+                                                entry.moving_above.insert(r.id);
+                                        }
+                                        next_columns.insert(r.id, key);
+                                        // A newly consumed background tab is visible
+                                        // during its merge even though not selected.
+                                        // Seed it from the old source's displayed face,
+                                        // never an unsent hidden-window spring.
+                                        if (col.rendered_ids().any(|id| id == r.id)
+                                                || entry.merging_tabs.iter().any(
+                                                        |&(base, incoming)| {
+                                                                base == r.id || incoming == r.id
+                                                        },
+                                                ))
+                                                && !old_collapsing.contains(&r.id)
+                                                && !independent_surfaces.contains(&r.id)
+                                                && let Some(old) = entry
+                                                        .selected_tabs
+                                                        .values()
+                                                        .find(|group| group.hidden_member(r.id))
+                                        {
+                                                let unchanged_group = col.display == crate::layout::tabbed::ColumnDisplay::Tabbed
+                                                        && TabSelection::capture(col).is_some_and(|next| !old.membership_changed(&next));
+                                                if !unchanged_group
+                                                        && let Some(rect) =
+                                                                old_tab_rects.get(&old.active())
+                                                {
+                                                        entry.tiles.insert(r.id, rect.clone());
+                                                        entry.moving_above.insert(r.id);
+                                                }
+                                        }
                                         live_ids.insert(r.id);
                                         match entry.tiles.get_mut(&r.id) {
                                                 Some(rect) => rect.retarget(
@@ -282,6 +479,42 @@ impl Transport {
                                         }
                                 }
                         }
+                        entry.merging_tabs.retain(|(base, incoming)| {
+                                next_tabs.values().any(|group| {
+                                        group.contains(*base) && group.contains(*incoming)
+                                }) && tab_state::merge_in_flight(&entry.tiles, *base, *incoming)
+                        });
+                        entry.collapsing_tabs.retain(|id, active| {
+                                next_tabs.values().any(|group| {
+                                        group.active() == *active && group.hidden_member(*id)
+                                }) && entry.tiles.get(active).is_some_and(|rect| !rect.finished())
+                        });
+                        entry.display_focus.retain(|id| {
+                                let (Some(old_key), Some(new_key)) =
+                                        (entry.tile_columns.get(id), next_columns.get(id))
+                                else {
+                                        return false;
+                                };
+                                let old_members: HashSet<_> = entry
+                                        .tile_columns
+                                        .iter()
+                                        .filter(|(_, key)| *key == old_key)
+                                        .map(|(id, _)| *id)
+                                        .collect();
+                                let new_members: HashSet<_> = next_columns
+                                        .iter()
+                                        .filter(|(_, key)| *key == new_key)
+                                        .map(|(id, _)| *id)
+                                        .collect();
+                                // A subsequent merge/split owns the layer now,
+                                // even when it interrupts the display toggle.
+                                old_members == new_members
+                        });
+                        for ws in &ml.workspaces {
+                                entry.moving_above.extend(entry.departing_tabs.fronts(ws));
+                        }
+                        entry.tile_columns = next_columns;
+                        entry.moving_above.retain(|id| live_ids.contains(id));
                         entry.edge_insets.retain(|id, _| edge_ids.contains(id));
                         entry.selected_tabs = next_tabs;
                         entry.tiles.retain(|id, _| live_ids.contains(id));
@@ -311,8 +544,8 @@ impl Transport {
                                         return None;
                                 }
                                 let vp = m.view.get(&k).map(|v| v.value()).unwrap_or(0.0);
-                                let rects = ws
-                                        .rendered_ids()
+                                let rects = render_ids(ws, m)
+                                        .into_iter()
                                         .filter_map(|id| {
                                                 let rect = m.tiles.get(&id)?;
                                                 let (x, y, w, h) = rect.value();
@@ -329,6 +562,50 @@ impl Transport {
                                 Some((k, rects))
                         })
                         .collect()
+        }
+
+        /// Participants that need to stay above tiled siblings after an OS
+        /// focus activation. Read without advancing any animation state.
+        pub fn raised_windows(
+                &self,
+                layout: &Layout,
+                device: &str,
+        ) -> Vec<WindowId> {
+                let Some(m) = self.monitors.get(device) else {
+                        return Vec::new();
+                };
+                let Some(ml) = layout.monitor(device) else {
+                        return Vec::new();
+                };
+                let mut raised: Vec<_> = render_ids(ml.active_workspace(), m)
+                        .into_iter()
+                        .filter(|id| m.moving_above.contains(id))
+                        .collect();
+                raised.sort_by_key(|id| m.display_focus.contains(id));
+                raised
+        }
+
+        /// Consume the last submitted frame's layering requests for the
+        /// action's immediate focus handoff. Even instant motion gets this
+        /// repair, but later user activations must not re-raise settled tiles.
+        pub fn take_focus_raises(
+                &mut self,
+                layout: &Layout,
+                device: &str,
+        ) -> Vec<WindowId> {
+                let Some(m) = self.monitors.get_mut(device) else {
+                        return Vec::new();
+                };
+                let Some(ml) = layout.monitor(device) else {
+                        return Vec::new();
+                };
+                let submitted = std::mem::take(&mut m.focus_raise);
+                let mut raised: Vec<_> = render_ids(ml.active_workspace(), m)
+                        .into_iter()
+                        .filter(|id| m.moving_above.contains(id) || submitted.contains(id))
+                        .collect();
+                raised.sort_by_key(|id| m.display_focus.contains(id));
+                raised
         }
 
         /// Motion which must finish before revealing overview's real windows.
@@ -398,9 +675,10 @@ impl Transport {
                         let Some(ml) = layout.monitor(&mon.device) else {
                                 continue;
                         };
-                        let Some(m) = self.monitors.get(&mon.device) else {
+                        let Some(m) = self.monitors.get_mut(&mon.device) else {
                                 continue;
                         };
+                        m.focus_raise.clear();
                         let wsp = m.wsp.value();
                         let (ax, ay) = m.origin;
 
@@ -417,11 +695,12 @@ impl Transport {
                                         continue;
                                 }
                                 let vp = m.view.get(&k).map(|v| v.value()).unwrap_or(0.0);
-                                let visible_ids: HashSet<_> = ws.rendered_ids().collect();
+                                let visible_ids: HashSet<_> =
+                                        render_ids(ws, m).into_iter().collect();
                                 frame.hide.extend(ws
                                         .window_ids()
                                         .filter(|id| !visible_ids.contains(id)));
-                                for id in ws.rendered_ids() {
+                                for id in render_ids(ws, m) {
                                         let Some(rect) = m.tiles.get(&id) else {
                                                 continue;
                                         };
@@ -433,13 +712,108 @@ impl Transport {
                                                 w: cw,
                                                 h: ch,
                                         });
+                                        if m.moving_above.contains(&id) {
+                                                frame.raise.push(id);
+                                                m.focus_raise.insert(id);
+                                        }
                                         frame.show.push(id);
                                 }
                         }
+                        // Keep display selections on top at both the live and
+                        // final frame. Do not reorder structural merge/split requests.
+                        let start = frame.raise.len() - m.focus_raise.len();
+                        frame.raise[start..].sort_by_key(|id| m.display_focus.contains(id));
+                        let selected_merge_faces: HashSet<_> = m
+                                .selected_tabs
+                                .values()
+                                .filter(|group| {
+                                        m.merging_tabs.iter().any(|&(base, incoming)| {
+                                                group.contains(base)
+                                                        && group.contains(incoming)
+                                                        && tab_state::merge_in_flight(
+                                                                &m.tiles, base, incoming,
+                                                        )
+                                        })
+                                })
+                                .map(TabSelection::active)
+                                .collect();
+                        let departure_fronts = m.departing_tabs.moving_fronts(ml, &m.tiles);
+                        m.moving_above.retain(|id| {
+                                departure_fronts.contains(id)
+                                        || selected_merge_faces.contains(id)
+                                        || m.tiles.get(id).is_some_and(|rect| !rect.finished())
+                                        || m.merging_tabs.iter().any(|&(base, incoming)| {
+                                                (base == *id || incoming == *id)
+                                                        && tab_state::merge_in_flight(
+                                                                &m.tiles, base, incoming,
+                                                        )
+                                        })
+                        });
                 }
                 frame
         }
 }
+
+/// Use one participant set for real frames and overview thumbnails. Expired
+/// collapse surfaces disappear on the exact settle frame, without a reflow.
+fn render_ids(
+        ws: &crate::layout::Workspace,
+        m: &MonitorT,
+) -> Vec<WindowId> {
+        let rendered: HashSet<_> = ws.rendered_ids().collect();
+        let merging: HashSet<_> = m
+                .merging_tabs
+                .iter()
+                .filter(|&&(base, incoming)| tab_state::merge_in_flight(&m.tiles, base, incoming))
+                .flat_map(|&(base, incoming)| [base, incoming])
+                .collect();
+        let incoming: HashSet<_> = m
+                .merging_tabs
+                .iter()
+                .filter(|&&(base, incoming)| tab_state::merge_in_flight(&m.tiles, base, incoming))
+                .map(|&(_, incoming)| incoming)
+                .collect();
+        let mut fronts: HashSet<_> = merging.difference(&incoming).copied().collect();
+        fronts.extend(m.departing_tabs.fronts(ws));
+        // An explicitly selected old hidden tab replaces the destination
+        // face, but must never borrow an incoming tile's trajectory.
+        for col in &ws.columns {
+                if col.tiles.iter().any(|t| merging.contains(&t.id))
+                        && let Some(active) = col.focused_id()
+                        && !incoming.contains(&active)
+                {
+                        fronts.insert(active);
+                }
+        }
+        let mut ids: Vec<_> = ws
+                .window_ids()
+                .filter(|id| {
+                        rendered.contains(id)
+                                || merging.contains(id)
+                                || m.collapsing_tabs.get(id).is_some_and(|active| {
+                                        rendered.contains(active)
+                                                && m.tiles
+                                                        .get(active)
+                                                        .is_some_and(|rect| !rect.finished())
+                                })
+                })
+                .collect();
+        // DWM registers thumbnails in this same bottom-to-top order. Keep
+        // selected display surfaces above outgoing siblings in overview too.
+        ids.sort_by_key(|id| {
+                if m.display_focus.contains(id) {
+                        3
+                } else if fronts.contains(id) {
+                        2
+                } else {
+                        u8::from(m.moving_above.contains(id))
+                }
+        });
+        ids
+}
+
+#[cfg(test)]
+mod column_motion_tests;
 
 #[cfg(test)]
 mod tests {
@@ -760,8 +1134,12 @@ mod tests {
                         .active_workspace_mut()
                         .consume_window_into_column());
                 t.sync(&layout, &mons, &p);
-                let during = t.workspace_rects(&layout, "D")[0].1[0];
-                assert_eq!(during.id, 2);
+                let during_rects = t.workspace_rects(&layout, "D")[0].1.clone();
+                assert_eq!(
+                        during_rects.iter().map(|r| r.id).collect::<Vec<_>>(),
+                        vec![2, 1]
+                );
+                let during = *during_rects.iter().find(|r| r.id == 2).unwrap();
                 assert!(
                         (during.x - before.x).abs() <= 1,
                         "merge snapped: {before:?} -> {during:?}"
@@ -771,7 +1149,8 @@ mod tests {
                 t.snap("D");
                 let final_rect = t.workspace_rects(&layout, "D")[0].1[0];
                 assert_eq!(final_rect.x, 0);
-                assert_eq!(t.frame(&layout, &mons, &HashSet::new()).hide, vec![1]);
+                assert_eq!(final_rect.id, 1);
+                assert_eq!(t.frame(&layout, &mons, &HashSet::new()).hide, vec![2]);
         }
 
         #[test]
@@ -837,7 +1216,15 @@ mod tests {
                         .active_workspace_mut()
                         .toggle_column_tabbed_display();
                 t.sync(&layout, &mons, &p);
-                let before = t.workspace_rects(&layout, "D")[0].1[0];
+                // Mode-collapse tails now participate too; compare the
+                // selected surface, not the first outgoing sibling.
+                let selected = layout.focused_id("D").unwrap();
+                let before = t.workspace_rects(&layout, "D")[0]
+                        .1
+                        .iter()
+                        .find(|r| r.id == selected)
+                        .copied()
+                        .unwrap();
                 layout.monitor_mut("D")
                         .unwrap()
                         .active_workspace_mut()

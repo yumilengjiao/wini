@@ -277,8 +277,10 @@ impl OverviewHost {
                 sources: &[isize],
         ) {
                 self.source_insets.retain(|id, _| sources.contains(id));
+                let existing: Vec<_> = self.thumbs.iter().map(|(id, _)| *id).collect();
+                let keep = retained_source_prefix(&existing, sources);
                 self.thumbs.retain(|(id, thumb)| {
-                        if sources.contains(id) {
+                        if sources[..keep].contains(id) {
                                 true
                         } else {
                                 // Safety: thumbnail handle is valid (we own it).
@@ -300,7 +302,11 @@ impl OverviewHost {
                         // thread.
                         match unsafe { DwmRegisterThumbnail(self.hwnd, hwnd) } {
                                 Ok(thumb) => {
-                                        let insets = crate::win::frame::frame_insets(hwnd);
+                                        // Reordering DWM thumbnails must not
+                                        // remeasure asynchronous source frames.
+                                        let insets = *self.source_insets.entry(id).or_insert_with(
+                                                || crate::win::frame::frame_insets(hwnd),
+                                        );
                                         log::debug!(
                                                 "overview source {id}: outer={:?}, frame={:?}, native={:?}, insets={insets:?}",
                                                 crate::win::api::window_rect(hwnd),
@@ -347,6 +353,11 @@ impl OverviewHost {
                 rects: &[TileRect],
                 zoom: f64,
         ) {
+                // Registration order is DWM's thumbnail stacking order.
+                // Reconcile mode-toggle tails on every submitted scene: once
+                // absent, a thumbnail must not linger at its last rectangle.
+                let sources: Vec<_> = rects.iter().map(|r| r.id).collect();
+                self.sync_sources(&sources);
                 self.visible_rects.clear();
                 for r in rects {
                         let Some((_, thumb)) = self.thumbs.iter().find(|(id, _)| *id == r.id)
@@ -376,6 +387,20 @@ impl OverviewHost {
                         }
                 }
         }
+}
+
+/// Preserve the longest desired prefix already in registration order after
+/// removing dead sources. Re-register only the remaining suffix, since DWM
+/// exposes no thumbnail Z-order setter. Stable scenes do no handle churn.
+fn retained_source_prefix(
+        existing: &[isize],
+        desired: &[isize],
+) -> usize {
+        existing.iter()
+                .filter(|id| desired.contains(id))
+                .zip(desired)
+                .take_while(|(old, new)| old == new)
+                .count()
 }
 
 /// Use the native whole application surface. Unlike wallpaper, app sources
@@ -570,6 +595,28 @@ mod tests {
                         bottom: b,
                 }
         }
+        #[test]
+        fn source_order_reconciliation_preserves_stable_prefix_and_removes_tails() {
+                assert_eq!(retained_source_prefix(&[1, 2, 3], &[1, 2, 3]), 3);
+                assert_eq!(retained_source_prefix(&[1, 2, 3], &[2, 3]), 2);
+                assert_eq!(retained_source_prefix(&[1, 2], &[1, 2, 3]), 2);
+                assert_eq!(retained_source_prefix(&[1, 2, 3], &[1, 3, 2]), 1);
+                assert_eq!(retained_source_prefix(&[1, 2], &[2, 1]), 0);
+                assert_eq!(retained_source_prefix(&[2, 1], &[1]), 1);
+                assert_eq!(retained_source_prefix(&[1, 2], &[]), 0);
+                assert_eq!(retained_source_prefix(&[], &[1]), 0);
+                // Simulate the suffix rebuild for reversal, pure selection,
+                // removal and steady frames. Never leave stale overlapping
+                // thumbnails in the host after their collapse has finished.
+                let mut registered = vec![1, 2, 3];
+                for desired in [vec![2, 3, 1], vec![1], vec![3], vec![3, 1, 2], vec![]] {
+                        let keep = retained_source_prefix(&registered, &desired);
+                        registered.retain(|id| desired[..keep].contains(id));
+                        registered.extend_from_slice(&desired[keep..]);
+                        assert_eq!(registered, desired);
+                }
+        }
+
         #[test]
         fn application_surface_uses_native_source_and_exact_visible_destination() {
                 let visible = (-993, 48, 986, 745);

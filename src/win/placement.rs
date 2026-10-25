@@ -1,15 +1,14 @@
 //! Applying computed layout geometry to real windows.
 //!
 //! The layout engine computes pixel rectangles; this module pushes them
-//! to the actual HWNDs with `SetWindowPos`. We never touch Z-order or
-//! activation from here — focus is the OS's (and later the focus
-//! module's) business.
+//! to the actual HWNDs with `SetWindowPos`. Geometry does not change Z-order
+//! or activation; explicit layering helpers never change keyboard focus.
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GWL_EXSTYLE, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-        HWND_TOP, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, ShowWindow,
+        HWND_TOP, IsWindowVisible, SW_HIDE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos, ShowWindow,
         WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows::core::BOOL;
@@ -40,12 +39,27 @@ pub fn set_shown(
         shown: bool,
 ) {
         unsafe {
-                // SW_SHOWNOACTIVATE, not SW_SHOW: SW_SHOW ACTIVATES the
-                // window, and the newly-activated window raises itself above
-                // everything asynchronously (WM_ACTIVATE) — above an open
-                // overview's backdrop too, which we cannot reliably outrun.
-                // Activation is our job (sync_focus_to_os), not ShowWindow's.
-                let _ = ShowWindow(hwnd, if shown { SW_SHOWNOACTIVATE } else { SW_HIDE });
+                if shown {
+                        // ShowWindow(SW_SHOWNOACTIVATE) can reorder the revealed
+                        // HWND. Its geometry AND tiled band have already been
+                        // staged while hidden; preserve both when exposing it.
+                        let _ = SetWindowPos(
+                                hwnd,
+                                None,
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_SHOWWINDOW
+                                        | SWP_NOMOVE
+                                        | SWP_NOSIZE
+                                        | SWP_NOZORDER
+                                        | SWP_NOOWNERZORDER
+                                        | SWP_NOACTIVATE,
+                        );
+                } else {
+                        let _ = ShowWindow(hwnd, SW_HIDE);
+                }
         }
 }
 
@@ -60,7 +74,8 @@ pub fn set_shown(
 // A "bar" is a visible window of another process carrying both
 // WS_EX_TOOLWINDOW and WS_EX_NOACTIVATE (yasb's recipe; zebar is
 // built the same way) whose rect intersects a monitor's strip
-// outside the work area (top or bottom taskbar zone).
+// outside the work area on any of the four edges. Native Explorer taskbars
+// are recognized by class, without requiring third-party tool-window styles.
 
 // HWNDs found by the `EnumWindows` callback (it takes a raw fn
 // pointer, so results go through a module-level thread-local).
@@ -83,9 +98,9 @@ pub fn invalidate_bar_cache() {
         BARS_CACHE.with(|c| *c.borrow_mut() = (None, Vec::new()));
 }
 
-pub fn raise_bars(monitors: &[crate::win::monitor::Monitor]) {
+pub fn desktop_bars(monitors: &[crate::win::monitor::Monitor]) -> Vec<HWND> {
         const CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(1000);
-        let bars: Vec<HWND> = BARS_CACHE.with(|cell| {
+        BARS_CACHE.with(|cell| {
                 let mut cache = cell.borrow_mut();
                 if cache.0.is_some_and(|t| t.elapsed() < CACHE_TTL) && !cache.1.is_empty() {
                         return cache.1.clone();
@@ -93,7 +108,11 @@ pub fn raise_bars(monitors: &[crate::win::monitor::Monitor]) {
                 let found = enumerate_bars(monitors);
                 *cache = (Some(std::time::Instant::now()), found.clone());
                 found
-        });
+        })
+}
+
+pub fn raise_bars(monitors: &[crate::win::monitor::Monitor]) {
+        let bars = desktop_bars(monitors);
         log::debug!("raise_bars: re-raising {} bar(s)", bars.len());
         for bar in bars {
                 log::debug!(
@@ -109,11 +128,7 @@ pub fn raise_bars(monitors: &[crate::win::monitor::Monitor]) {
                                 0,
                                 0,
                                 0,
-                                SWP_NOMOVE
-                                        | SWP_NOSIZE
-                                        | SWP_NOACTIVATE
-                                        | SWP_NOOWNERZORDER
-                                        | SWP_ASYNCWINDOWPOS,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
                         ) {
                                 Ok(()) => {},
                                 Err(e) => {
@@ -158,6 +173,11 @@ unsafe extern "system" fn enum_bar(
                         if win_pid == std::process::id() {
                                 return false;
                         }
+                        // Explorer's native taskbar need not have the
+                        // TOOLWINDOW|NOACTIVATE pair used by yasb/zebar.
+                        if super::bar_geometry::native_taskbar(&super::api::window_class(hwnd)) {
+                                return true;
+                        }
                         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
                         if ex & (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0)
                                 != (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0)
@@ -168,25 +188,12 @@ unsafe extern "system" fn enum_bar(
                         if GetWindowRect(hwnd, &mut rc).is_err() {
                                 return false;
                         }
-                        // Does it live in a taskbar strip of some monitor — and
-                        // look like a bar there? A bar spans most of the monitor's
-                        // width and is short; this filters out tray helpers,
-                        // tooltips and similar small tool windows in the strip.
+                        // Include vertical bars, but not small tooltips or
+                        // windows in a reserved strip on a different monitor.
                         let mons: &[crate::win::monitor::Monitor] =
                                 &*(lparam.0 as *const &[crate::win::monitor::Monitor]);
                         mons.iter().any(|m| {
-                                let top_strip = (m.full.top, m.work.top);
-                                let bottom_strip = (m.work.bottom, m.full.bottom);
-                                let overlaps = |strip: (i32, i32)| {
-                                        rc.bottom > strip.0 && rc.top < strip.1 && strip.0 < strip.1
-                                };
-                                let mon_w = (m.full.right - m.full.left).max(1) as f64;
-                                let mon_h = (m.full.bottom - m.full.top).max(1) as f64;
-                                let w = (rc.right - rc.left).max(1) as f64;
-                                let h = (rc.bottom - rc.top).max(1) as f64;
-                                (overlaps(top_strip) || overlaps(bottom_strip))
-                                        && w >= mon_w * 0.5
-                                        && h <= mon_h * 0.25
+                                super::bar_geometry::in_reserved_strip(rc, m.full, m.work)
                         })
                 }
         }

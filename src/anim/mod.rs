@@ -305,15 +305,27 @@ impl Val {
                 if self.to == value {
                         return;
                 }
-                let cur = self.value();
-                let vel = self.velocity();
+                self.retarget_from(self.value(), self.velocity(), value, params);
+        }
+
+        /// Change coordinate systems at a scene handoff, then animate from
+        /// the rendered position/velocity rather than a stale internal value.
+        pub fn retarget_from(
+                &mut self,
+                cur: f64,
+                vel: f64,
+                value: f64,
+                params: AnimParams,
+        ) {
                 self.params = params;
-                let snap = match self.params.kind {
-                        AnimKind::Spring(p) => {
-                                (cur - value).abs() < p.epsilon.max(0.25) && vel.abs() < 100.0
-                        },
-                        AnimKind::Easing { .. } => (cur - value).abs() < 0.5,
+                // Val also represents normalized zoom and workspace indices.
+                // A 0.25/0.5 "pixel" threshold here snaps hundreds of screen
+                // pixels when a close/switch is interrupted near its endpoint.
+                let epsilon = match self.params.kind {
+                        AnimKind::Spring(p) => p.epsilon.max(f64::EPSILON),
+                        AnimKind::Easing { .. } => f64::EPSILON,
                 };
+                let snap = (cur - value).abs() <= epsilon && vel.abs() <= epsilon;
                 if snap {
                         self.from = value;
                         self.to = value;
@@ -362,6 +374,9 @@ impl Val {
         /// Computed in animation time (post-slowdown scaling) so that
         /// retargets carry the visually-current velocity.
         pub fn velocity(&self) -> f64 {
+                if self.finished() {
+                        return 0.0;
+                }
                 let dt = 1.0 / 120.0; // half a frame; fine for carry-over
                 let now = self.start.elapsed().as_secs_f64() / self.params.slowdown.max(0.001);
                 if now <= dt {
@@ -397,14 +412,17 @@ impl Val {
                 self.duration = Duration::ZERO;
         }
 
-        pub fn target(&self) -> f64 {
-                self.to
+        /// Deterministic animation sampling in geometry/state regressions.
+        #[cfg(test)]
+        pub(crate) fn advance_for_test(
+                &mut self,
+                elapsed: Duration,
+        ) {
+                self.start -= elapsed;
         }
 
-        /// The value the current flight started from (the value at the
-        /// last retarget).
-        pub fn from(&self) -> f64 {
-                self.from
+        pub fn target(&self) -> f64 {
+                self.to
         }
 }
 
@@ -521,7 +539,23 @@ mod tests {
                 assert_eq!(v.start, start);
                 assert_eq!(v.duration, duration);
                 assert_eq!(v.params, easing_params());
-                assert_eq!(v.from(), 100.0);
+                assert_eq!(v.from, 100.0);
+        }
+
+        #[test]
+        fn fractional_camera_retargets_do_not_use_pixel_snap_thresholds() {
+                for params in [spring_params(), easing_params()] {
+                        let mut value = Val::to(0.8, params);
+                        value.settle();
+                        value.retarget(1.0, params);
+                        assert!(!value.finished());
+                        assert!((value.value() - 0.8).abs() < 0.01);
+                        // A rendered-coordinate handoff must preserve velocity too.
+                        value.retarget_from(0.9, 0.1, 1.0, spring_params());
+                        assert!(!value.finished());
+                        assert!((value.value() - 0.9).abs() < 0.01);
+                        assert!((value.velocity() - 0.1).abs() < 0.01);
+                }
         }
 
         #[test]

@@ -14,6 +14,31 @@ example.
 
 ---
 
+## Window discovery and workspaces
+
+New windows are checked on show/restore, title changes and foreground events.
+A once-per-second scan retries previously unready or missed windows, without
+resnapshotting/retiling already managed windows. Minimized, cloaked, owned
+popup, tool/no-activate and manager-owned windows are excluded. A custom
+borderless window without a caption is still excluded; this is not a
+Zen-specific filter.
+
+Workspaces are dynamic per monitor: occupied workspaces (including floating-only
+ones), the active workspace, and one trailing empty slot are retained. Using the
+last slot creates another empty one. An active interior empty workspace survives
+until you leave it. Cleanup is deferred during workspace slides and overview,
+then retried automatically; indices can change after empty workspaces disappear.
+`Mod+1..9` are navigation bindings, **not** a fixed workspace-count configuration.
+Fixed/named workspace declarations are not supported yet.
+
+The focus ring is clipped to its monitor's Windows work area, including left or
+right taskbars. Its bitmap, size and position are published together to avoid
+intermediate reshape/repaint frames; pure translations reuse the existing image.
+Both native Explorer taskbars and horizontal/vertical third-party
+bars reserving work area are protected during tiled motion. This does not add
+compositor-style clipping to application HWNDs or guarantee behavior for custom
+bars that neither reserve work area nor use recognizable tool-window styles.
+
 ## `input`
 
 ```kdl
@@ -81,11 +106,36 @@ layout {
 ## Tabbed columns
 
 `Mod+W` (`toggle-column-tabbed-display`) switches the focused column between
-vertical stacking and tabs. Only its selected tab is visible; `Mod+J/K`
+vertical stacking and tabs. At rest only its selected tab is visible; `Mod+J/K`
 selects down/up, including in overview. Click the indicator segments to
 select a tab; selection in overview keeps overview open. Window sizes,
 height requests and tab mode are preserved when moving an entire column to
-another workspace/monitor. Turning tabs off restores the stack.
+another workspace/monitor. Turning tabs off restores the stack. During the
+stack/tab transition the selected surface stays above its siblings; outgoing
+stack surfaces remain until the selected tab has expanded, rather than leaving
+an immediate blank area. Reversing `Mod+W` mid-animation preserves the visible
+surfaces' positions. Native application repaint timing still depends on Windows.
+
+Merging into a tabbed column temporarily keeps the destination and incoming
+windows as separate visible surfaces. `Mod+Comma` appends after the destination's
+existing tabs without changing its selected tab; the incoming surface slides
+**under** the destination until it arrives. `Mod+Period` extracts the bottom tab:
+a background tab emerges **under** the source, while an already selected tab
+keeps its front layer as it departs. Both paths preserve their own animation
+trajectories, including when a merge is interrupted by a split.
+Changing tabs before the merge finishes must not transfer the incoming window's
+movement to the destination window.
+Hidden tabs revealed by selection, splitting or switching back to a stack start
+from the destination surface, not a traveler; unselected participants are hidden
+only after the merge has settled.
+
+In overview, workspace wheel navigation and numbered shortcuts update the same
+selection. Navigation/moves during closing retarget the close camera from its
+currently rendered position and velocity, including at the final reveal turn.
+Reopening also preserves this position instead of dropping the zoom correction.
+Covered source windows and stale foreground notifications cannot replace that
+selection. Empty workspaces retain the selected monitor instead of following the
+mouse to another output. Overlapping previews are hit-tested topmost first.
 
 ```kdl
 layout {

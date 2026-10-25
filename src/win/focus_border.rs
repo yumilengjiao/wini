@@ -1,50 +1,102 @@
 //! Active-window focus border (niri's focus-ring): a topless, topmost,
 //! click-through frame that outlines the focused window.
 //!
-//! The window itself is shaped into a ring (outer rect minus inner rect
-//! via `SetWindowRgn`) and painted a solid color, which keeps the frame
-//! path cheap — no per-pixel alpha needed. The app repositions it
-//! whenever the focused window's geometry changes (including during
-//! animations, driven from the animation tick).
+//! Pixels, size and position are submitted atomically through a layered
+//! bitmap. Pure translations reuse the compositor's existing image instead
+//! of reshaping and invalidating a visible window on every animation tick.
+
+mod bitmap;
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-        BeginPaint, CombineRgn, CreateRectRgn, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
-        EndPaint, FillRect, InvalidateRect, PAINTSTRUCT, RGN_DIFF, SetWindowRgn,
+        CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, HRGN, RGN_AND, RGN_DIFF,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, HWND_TOPMOST, LWA_ALPHA, RegisterClassW, SW_HIDE,
-        SWP_NOACTIVATE, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        CreateWindowExW, DefWindowProcW, GW_HWNDPREV, GetWindow, HWND_TOPMOST, RegisterClassW,
+        SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+        SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::w;
 
-/// Current ring color, reached from wnd_proc (main thread only).
-struct ColorCell(std::cell::UnsafeCell<COLORREF>);
-unsafe impl Sync for ColorCell {}
+/// Ring geometry keeps the original window edge. Intersect the RING with
+/// work area, not the window rect: clipping must never invent an edge along
+/// the taskbar when the actual window edge has scrolled out of view.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RingShape {
+        w: i32,
+        h: i32,
+        t: i32,
+        r: i32,
+        clip: RECT,
+}
 
-static COLOR: ColorCell = ColorCell(std::cell::UnsafeCell::new(COLORREF(0x00A3_AE7D)));
-
-impl ColorCell {
-        /// Safety: main thread only.
-        unsafe fn set(
-                &self,
-                c: COLORREF,
-        ) {
-                unsafe { *self.0.get() = c }
+impl RingShape {
+        fn clipped(
+                rect: (i32, i32, i32, i32),
+                t: i32,
+                r: i32,
+                work: RECT,
+        ) -> Option<Self> {
+                let (x, y, w, h) = rect;
+                let (ox, oy) = (x - t, y - t);
+                let clip = RECT {
+                        left: (work.left - ox).max(0),
+                        top: (work.top - oy).max(0),
+                        right: (work.right - ox).min(w + 2 * t),
+                        bottom: (work.bottom - oy).min(h + 2 * t),
+                };
+                (w > 0 && h > 0 && clip.left < clip.right && clip.top < clip.bottom)
+                        .then_some(Self { w, h, t, r, clip })
         }
 
-        /// Safety: main thread only.
-        unsafe fn get(&self) -> COLORREF {
-                unsafe { *self.0.get() }
+        /// Caller owns the returned GDI region.
+        unsafe fn region(self) -> Option<HRGN> {
+                let Self { w, h, t, r, clip } = self;
+                unsafe {
+                        let full = if r > 0 {
+                                CreateRoundRectRgn(
+                                        0,
+                                        0,
+                                        w + 2 * t,
+                                        h + 2 * t,
+                                        2 * (r + t),
+                                        2 * (r + t),
+                                )
+                        } else {
+                                CreateRectRgn(0, 0, w + 2 * t, h + 2 * t)
+                        };
+                        let inner = if r > 0 {
+                                CreateRoundRectRgn(t, t, t + w, t + h, 2 * r, 2 * r)
+                        } else {
+                                CreateRectRgn(t, t, t + w, t + h)
+                        };
+                        let bounds = CreateRectRgn(clip.left, clip.top, clip.right, clip.bottom);
+                        let ring = CreateRectRgn(0, 0, 0, 0);
+                        let ok = !full.is_invalid()
+                                && !inner.is_invalid()
+                                && !bounds.is_invalid()
+                                && !ring.is_invalid()
+                                && CombineRgn(Some(ring), Some(full), Some(inner), RGN_DIFF).0 != 0
+                                && CombineRgn(Some(ring), Some(ring), Some(bounds), RGN_AND).0 != 0;
+                        for region in [full, inner, bounds] {
+                                let _ = DeleteObject(region.into());
+                        }
+                        if ok {
+                                Some(ring)
+                        } else {
+                                let _ = DeleteObject(ring.into());
+                                None
+                        }
+                }
         }
 }
 
 pub struct FocusBorder {
         hwnd: HWND,
-        shape: std::cell::Cell<Option<(i32, i32, i32, i32)>>,
+        shape: std::cell::Cell<Option<RingShape>>,
+        color: std::cell::Cell<Option<COLORREF>>,
         last_rect: std::cell::Cell<Option<(i32, i32, i32, i32)>>,
         visible: std::cell::Cell<bool>,
 }
@@ -85,13 +137,12 @@ impl FocusBorder {
                                 None,
                         )
                         .ok()?;
-                        // A WS_EX_LAYERED window is not displayed until its
-                        // alpha/color key is set — without this the ring exists
-                        // but never shows.
-                        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+                        // Do not call SetLayeredWindowAttributes: it disables
+                        // UpdateLayeredWindow until WS_EX_LAYERED is reset.
                         Some(FocusBorder {
                                 hwnd,
                                 shape: std::cell::Cell::new(None),
+                                color: std::cell::Cell::new(None),
                                 last_rect: std::cell::Cell::new(None),
                                 visible: std::cell::Cell::new(false),
                         })
@@ -113,71 +164,70 @@ impl FocusBorder {
                 thickness: i32,
                 radius: i32,
                 color: COLORREF,
+                work: RECT,
         ) {
                 let t = thickness.max(1);
                 let r = radius.max(0);
                 let (ow, oh) = (w + 2 * t, h + 2 * t);
-                unsafe {
-                        let color_changed = COLOR.get() != color;
-                        COLOR.set(color);
-                        let shape = (w, h, t, r);
-                        let shape_changed = self.shape.get() != Some(shape);
-                        if shape_changed {
-                                // Shape the window into the ring: full client minus the
-                                // inner rect. SetWindowRgn takes ownership of `ring`.
-                                // CreateRoundRectRgn's ellipse params are the diameter, so
-                                // pass 2*radius for a corner of that radius.
-                                let full = if r > 0 {
-                                        CreateRoundRectRgn(0, 0, ow, oh, 2 * (r + t), 2 * (r + t))
-                                } else {
-                                        CreateRectRgn(0, 0, ow, oh)
-                                };
-                                let inner = if r > 0 {
-                                        CreateRoundRectRgn(t, t, t + w, t + h, 2 * r, 2 * r)
-                                } else {
-                                        CreateRectRgn(t, t, t + w, t + h)
-                                };
-                                let ring = CreateRectRgn(0, 0, 0, 0);
-                                CombineRgn(Some(ring), Some(full), Some(inner), RGN_DIFF);
-                                let _ = DeleteObject(full.into());
-                                let _ = DeleteObject(inner.into());
-                                if SetWindowRgn(self.hwnd, Some(ring), false) != 0 {
-                                        self.shape.set(Some(shape));
-                                } else {
-                                        // Ownership transfers only on success.
-                                        let _ = DeleteObject(ring.into());
-                                }
+                let Some(shape) = RingShape::clipped((x, y, w, h), t, r, work) else {
+                        self.hide();
+                        return;
+                };
+                let rect = (x - t, y - t, ow, oh);
+                let redraw = self.shape.get() != Some(shape) || self.color.get() != Some(color);
+                if redraw {
+                        let Some(image) = bitmap::RingBitmap::new(shape, color) else {
+                                self.hide();
+                                return;
+                        };
+                        if !image.present(self.hwnd, rect.0, rect.1) {
+                                self.hide();
+                                return;
                         }
-                        let rect = (x - t, y - t, ow, oh);
-                        if self.last_rect.get() != Some(rect) || !self.visible.get() {
-                                let _ = SetWindowPos(
+                        self.shape.set(Some(shape));
+                        self.color.set(Some(color));
+                        self.last_rect.set(Some(rect));
+                } else if self.last_rect.get() != Some(rect) {
+                        // Same shape: translate its existing bitmap without
+                        // repaint or a separate resize of the hollow frame.
+                        if unsafe {
+                                SetWindowPos(
+                                        self.hwnd,
+                                        None,
+                                        rect.0,
+                                        rect.1,
+                                        0,
+                                        0,
+                                        SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+                                )
+                        }
+                        .is_err()
+                        {
+                                self.hide();
+                                return;
+                        }
+                        self.last_rect.set(Some(rect));
+                }
+                // No unconditional second SetWindowPos per update. Only
+                // reveal or repair Z-order when another overlay is above us.
+                if !self.visible.get() || unsafe { GetWindow(self.hwnd, GW_HWNDPREV) }.is_ok() {
+                        if unsafe {
+                                SetWindowPos(
                                         self.hwnd,
                                         Some(HWND_TOPMOST),
-                                        x - t,
-                                        y - t,
-                                        ow,
-                                        oh,
-                                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                                );
-                                self.last_rect.set(Some(rect));
-                                self.visible.set(true);
-                                let _ = InvalidateRect(Some(self.hwnd), None, false);
-                        } else if color_changed || shape_changed {
-                                let _ = InvalidateRect(Some(self.hwnd), None, false);
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                                )
                         }
-                        // Keep above an overview host without rebuilding the
-                        // region or moving/resizing an unchanged border.
-                        let _ = SetWindowPos(
-                                self.hwnd,
-                                Some(HWND_TOPMOST),
-                                0,
-                                0,
-                                0,
-                                0,
-                                SWP_NOACTIVATE
-                                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE,
-                        );
+                        .is_err()
+                        {
+                                self.hide();
+                                return;
+                        }
+                        self.visible.set(true);
                 }
         }
 
@@ -201,28 +251,90 @@ impl Drop for FocusBorder {
 extern "system" fn wnd_proc(
         hwnd: HWND,
         msg: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
+        wp: WPARAM,
+        lp: LPARAM,
 ) -> LRESULT {
-        if msg == windows::Win32::UI::WindowsAndMessaging::WM_PAINT {
-                unsafe { paint(hwnd) };
-                return LRESULT(0);
-        }
-        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
-unsafe fn paint(hwnd: HWND) {
-        unsafe {
-                let mut ps = PAINTSTRUCT::default();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                if hdc.is_invalid() {
-                        return;
+#[cfg(test)]
+mod tests {
+        use super::*;
+        use windows::Win32::Graphics::Gdi::PtInRegion;
+
+        #[test]
+        fn rounded_ring_pixels_never_cover_taskbar_on_any_edge_or_negative_monitor() {
+                for work in [
+                        RECT {
+                                left: -920,
+                                top: 0,
+                                right: 0,
+                                bottom: 800,
+                        },
+                        RECT {
+                                left: -1000,
+                                top: 0,
+                                right: -80,
+                                bottom: 800,
+                        },
+                        RECT {
+                                left: -1000,
+                                top: 48,
+                                right: 0,
+                                bottom: 800,
+                        },
+                        RECT {
+                                left: -1000,
+                                top: 0,
+                                right: 0,
+                                bottom: 752,
+                        },
+                ] {
+                        // Window crosses every border during a slide. Test the
+                        // actual shaped region, including round corners.
+                        let (x, y, w, h) = (-960, 20, 960, 700);
+                        let shape = RingShape::clipped((x, y, w, h), 4, 12, work).unwrap();
+                        let region = unsafe { shape.region().unwrap() };
+                        let mut pixels = 0;
+                        for sy in -40..840 {
+                                for sx in -1050..50 {
+                                        if unsafe {
+                                                PtInRegion(region, sx - (x - 4), sy - (y - 4))
+                                                        .as_bool()
+                                        } {
+                                                pixels += 1;
+                                                assert!(sx >= work.left && sx < work.right);
+                                                assert!(sy >= work.top && sy < work.bottom);
+                                        }
+                                }
+                        }
+                        assert!(pixels > 0, "test must contain visible border pixels");
+                        // Work-area clipping must not draw a fake vertical
+                        // focus edge through the middle of the actual window.
+                        assert!(!unsafe {
+                                PtInRegion(region, work.left - (x - 4), 400 - (y - 4)).as_bool()
+                        });
+                        let _ = unsafe { DeleteObject(region.into()) };
                 }
-                let mut rc = RECT::default();
-                let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rc);
-                let brush = CreateSolidBrush(COLOR.get());
-                FillRect(hdc, &rc, brush);
-                let _ = DeleteObject(brush.into());
-                let _ = EndPaint(hwnd, &ps);
+        }
+
+        #[test]
+        fn movement_updates_clip_even_when_size_is_unchanged() {
+                let work = RECT {
+                        left: 80,
+                        top: 0,
+                        right: 1000,
+                        bottom: 800,
+                };
+                let a = RingShape::clipped((70, 30, 400, 600), 4, 12, work).unwrap();
+                let b = RingShape::clipped((90, 30, 400, 600), 4, 12, work).unwrap();
+                assert_ne!(a, b);
+                assert_eq!(a.clip.left, 14);
+                assert_eq!(b.clip.left, 0);
+                assert!(RingShape::clipped((-500, 30, 400, 600), 4, 12, work).is_none());
+                let region = unsafe { b.region().unwrap() };
+                assert!(unsafe { PtInRegion(region, 1, 200).as_bool() });
+                assert!(!unsafe { PtInRegion(region, 200, 200).as_bool() });
+                let _ = unsafe { DeleteObject(region.into()) };
         }
 }

@@ -33,11 +33,25 @@ pub mod height;
 pub mod tabbed;
 mod viewport;
 mod window_mode;
+pub mod workspaces;
 
 use std::collections::HashMap;
 
 /// Identity of a tracked window (the HWND pointer value).
 pub type WindowId = isize;
+
+/// Stable column identity, independent of its first/selected window. Moving
+/// a whole column preserves it; extracting tiles creates a new column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ColumnId(u64);
+
+impl ColumnId {
+        fn new() -> Self {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                Self(NEXT.fetch_add(1, Ordering::Relaxed))
+        }
+}
 
 /// A single window inside a column.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,7 +83,8 @@ impl Tile {
 /// How wide a column wants to be.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ColumnWidth {
-        /// Proportion of the view width, e.g. 0.5 = half the screen.
+        /// Proportion of the view after accounting for gaps, e.g. two 0.5
+        /// columns fit together with their inter-column and outer spacing.
         Proportion(f64),
         /// Fixed width in logical pixels.
         Fixed(f64),
@@ -78,6 +93,7 @@ pub enum ColumnWidth {
 /// A vertical stack of tiles; one element of the horizontal scroll axis.
 #[derive(Debug, Clone)]
 pub struct Column {
+        pub id: ColumnId,
         pub tiles: Vec<Tile>,
         /// Index of the focused tile in this column.
         pub active_tile_idx: usize,
@@ -94,8 +110,9 @@ pub struct Column {
 }
 
 impl Column {
-        fn new(id: WindowId) -> Self {
+        pub(crate) fn new(id: WindowId) -> Self {
                 Column {
+                        id: ColumnId::new(),
                         tiles: vec![Tile::new(id)],
                         active_tile_idx: 0,
                         width: None,
@@ -509,10 +526,9 @@ impl Workspace {
                 true
         }
 
-        /// Move the focused tile to the neighboring column (niri's
-        /// move-window-to-column-left/right):
-        /// - inside a multi-tile column: change position within the neighbor,
-        /// - otherwise: become a standalone column at the neighbor position.
+        /// Move the focused tile into the neighboring column (niri's
+        /// move-window-to-column-left/right). Remove an emptied source and
+        /// keep focus on the moved tile in the destination.
         pub fn move_tile_across(
                 &mut self,
                 dir: DirH,
@@ -530,28 +546,28 @@ impl Workspace {
                 };
 
                 let tile = self.columns[ci].tiles.remove(ti);
-                if self.columns[ci].tiles.is_empty() {
+                let source_empty = self.columns[ci].tiles.is_empty();
+                if source_empty {
                         self.columns.remove(ci);
                 } else {
                         self.columns[ci].active_tile_idx = self.columns[ci]
                                 .active_tile_idx
                                 .min(self.columns[ci].tiles.len() - 1);
                 }
-
-                if !self.columns[ni].tiles.is_empty() {
-                        // Insert into the neighbor column.
-                        let at = if dir == DirH::Left {
-                                self.columns[ni].tiles.len()
-                        } else {
-                                0
-                        };
-                        self.columns[ni].tiles.insert(at, tile);
-                        self.columns[ni].active_tile_idx = at;
-                }
-                // (The standalone-column branch cannot happen: a neighbor exists,
-                // so we always merge into it.)
+                // Removing a standalone source shifts a right-hand target.
+                // Indexing the old ni could target the following column or
+                // panic after already removing (and thus losing) the tile.
+                let ni = ni - usize::from(source_empty && ni > ci);
+                let at = if dir == DirH::Left {
+                        self.columns[ni].tiles.len()
+                } else {
+                        0
+                };
+                self.columns[ni].tiles.insert(at, tile);
+                self.columns[ni].active_tile_idx = at;
                 self.rebase_view_to_current();
                 self.active_column_idx = ni;
+                self.activate_prev_column_on_removal = None;
                 true
         }
 
@@ -607,6 +623,7 @@ impl Workspace {
                                 .active_tile_idx
                                 .min(self.columns[ci].tiles.len() - 1);
                         let col = Column {
+                                id: ColumnId::new(),
                                 tiles: vec![tile],
                                 active_tile_idx: 0,
                                 width: self.columns[ci].width,
@@ -629,7 +646,7 @@ impl Workspace {
 
         /// Niri's consume-window-into-column (Mod+Comma): take the top
         /// window of the column to the RIGHT of the focused one and append
-        /// it to the bottom of the focused column.
+        /// it to the bottom without changing the destination's selected tile.
         pub fn consume_window_into_column(&mut self) -> bool {
                 if self.active_column_idx >= self.columns.len() {
                         return false;
@@ -643,9 +660,16 @@ impl Workspace {
                 let tile = self.columns[si].tiles.remove(0);
                 if self.columns[si].tiles.is_empty() {
                         self.columns.remove(si);
+                } else {
+                        // The first tile was removed, so every surviving index
+                        // shifts left. Preserve a selected survivor; if the
+                        // removed tile was selected, select its successor.
+                        self.columns[si].active_tile_idx =
+                                self.columns[si].active_tile_idx.saturating_sub(1);
                 }
                 self.columns[ci].tiles.push(tile);
-                self.columns[ci].active_tile_idx = self.columns[ci].tiles.len() - 1;
+                // Mod+Comma pulls a neighbor into the background. Unlike
+                // moving the focused window across columns, it never activates it.
                 self.active_column_idx = ci;
                 self.activate_prev_column_on_removal = None;
                 true
@@ -667,6 +691,7 @@ impl Workspace {
                 let tile = self.columns[ci].tiles.remove(ti);
                 let width = self.columns[ci].width;
                 let col = Column {
+                        id: ColumnId::new(),
                         tiles: vec![tile],
                         active_tile_idx: 0,
                         width,
@@ -723,11 +748,14 @@ impl Workspace {
                                 col.width = Some(ColumnWidth::Proportion(p.clamp(0.01, 1.0)));
                         },
                         SizeChange::ProportionDelta(dp) => {
-                                // Current proportion of the view, plus the delta.
-                                let cur_p = if view_width > 0.0 {
-                                        cur_w / view_width
-                                } else {
-                                        0.5
+                                // Invert the same gap-aware sizing formula used
+                                // by geometry; otherwise +/-10% drifts on each use.
+                                let cur_p = match col.width.unwrap_or(params.default_column_width) {
+                                        ColumnWidth::Proportion(p) => p,
+                                        ColumnWidth::Fixed(_) => {
+                                                (cur_w + params.gaps)
+                                                        / (view_width - params.gaps).max(1.0)
+                                        },
                                 };
                                 col.width = Some(ColumnWidth::Proportion(
                                         (cur_p + dp).clamp(0.01, 1.0),
@@ -1070,56 +1098,6 @@ impl MonitorLayout {
                 }
         }
 
-        /// niri's dynamic-workspace invariant: keep every non-empty
-        /// workspace and the currently active one, drop the rest, and
-        /// ensure exactly one trailing empty workspace at the bottom.
-        /// Reindexes `window_map`, `active_workspace_idx` and
-        /// `previous_workspace_idx` to the compacted list.
-        pub fn normalize_workspaces(&mut self) {
-                let active = self.active_workspace_idx;
-                let prev = self.previous_workspace_idx;
-                // Decide which old indices survive, in order.
-                let keep: Vec<usize> = (0..self.workspaces.len())
-                        .filter(|&i| i == active || !self.workspaces[i].is_empty())
-                        .collect();
-                // old index -> new index
-                let mut remap = std::collections::HashMap::new();
-                for (new_i, &old_i) in keep.iter().enumerate() {
-                        remap.insert(old_i, new_i);
-                }
-                // Rebuild the workspace vec in kept order.
-                let mut old = std::mem::take(&mut self.workspaces);
-                // Take by draining in kept order (indices are ascending).
-                let mut rebuilt: Vec<Workspace> = Vec::with_capacity(keep.len());
-                // Move out kept workspaces; `Option` dance avoids clone.
-                let mut slots: Vec<Option<Workspace>> = old.drain(..).map(Some).collect();
-                for &old_i in &keep {
-                        rebuilt.push(slots[old_i].take().expect("kept index once"));
-                }
-                self.workspaces = rebuilt;
-                // Remap active / previous.
-                self.active_workspace_idx = *remap.get(&active).unwrap_or(&0);
-                self.previous_workspace_idx = prev
-                        .and_then(|p| remap.get(&p).copied())
-                        .filter(|&p| p != self.active_workspace_idx);
-                // Remap window ownership.
-                for v in self.window_map.values_mut() {
-                        if let Some(&new_i) = remap.get(v) {
-                                *v = new_i;
-                        }
-                }
-                // Ensure at least one workspace and a trailing empty one.
-                if self.workspaces.is_empty() {
-                        self.workspaces.push(Workspace::new());
-                }
-                if !self.workspaces.last().is_none_or(|w| w.is_empty()) {
-                        self.workspaces.push(Workspace::new());
-                }
-                if self.active_workspace_idx >= self.workspaces.len() {
-                        self.active_workspace_idx = self.workspaces.len() - 1;
-                }
-        }
-
         /// Switch the active workspace (niri focus-workspace), growing the
         /// list on demand. False if already active.
         pub fn switch_workspace(
@@ -1329,7 +1307,7 @@ impl Layout {
         ) -> bool {
                 for m in &mut self.monitors {
                         if let Some(ws) = m.workspace_of(id) {
-                                m.active_workspace_idx = ws;
+                                m.switch_workspace(ws);
                                 m.active_workspace_mut().focus_window(id);
                                 return true;
                         }
@@ -1346,6 +1324,23 @@ mod tests {
         const B: WindowId = 2;
         const C: WindowId = 3;
         const D: WindowId = 4;
+
+        #[test]
+        fn window_activation_updates_previous_workspace_without_overwriting_it_on_confirmation() {
+                let mut layout = Layout::new();
+                layout.add_window("D", A);
+                layout.monitor_mut("D")
+                        .unwrap()
+                        .add_window_to_workspace(B, 1);
+                assert!(layout.focus_window(A));
+                let ml = layout.monitor("D").unwrap();
+                assert_eq!(ml.active_workspace_idx, 0);
+                assert_eq!(ml.previous_workspace_idx, Some(1));
+                assert!(layout.focus_window(A));
+                assert_eq!(layout.monitor("D").unwrap().previous_workspace_idx, Some(1));
+                assert!(layout.focus_window(B));
+                assert_eq!(layout.monitor("D").unwrap().previous_workspace_idx, Some(0));
+        }
 
         #[test]
         fn add_and_focus() {
@@ -1520,7 +1515,7 @@ mod tests {
                 ws.columns[0].active_tile_idx = 0;
 
                 // consume: top window of the right column (B) joins our bottom;
-                // C stays behind as the now-focused column 1.
+                // C stays selected within the source column; global focus stays A.
                 assert!(ws.consume_window_into_column());
                 assert_eq!(ws.columns.len(), 2);
                 assert_eq!(
@@ -1531,7 +1526,8 @@ mod tests {
                         ws.columns[1].tiles.iter().map(|t| t.id).collect::<Vec<_>>(),
                         vec![C]
                 );
-                assert_eq!(ws.focused_id(), Some(B));
+                assert_eq!(ws.focused_id(), Some(A));
+                assert_eq!(ws.columns[1].focused_id(), Some(C));
 
                 // consume again: C joins our column; only one column remains.
                 assert!(ws.consume_window_into_column());
@@ -1548,13 +1544,66 @@ mod tests {
                         ws.columns[0].tiles.iter().map(|t| t.id).collect::<Vec<_>>(),
                         vec![A, B]
                 );
-                assert_eq!(ws.focused_id(), Some(B));
+                assert_eq!(ws.focused_id(), Some(A));
 
                 // Single-window column: expel refuses (niri behavior).
                 ws.focus_column(DirH::Right);
                 assert!(!ws.expel_window_from_column());
                 // No right neighbor: consume refuses.
                 assert!(!ws.consume_window_into_column());
+        }
+
+        #[test]
+        fn column_identity_survives_membership_changes_and_whole_column_moves() {
+                let mut ws = Workspace::new();
+                ws.add_window(A);
+                ws.add_window(B);
+                ws.add_window_to_column(C, 1, 1);
+                let destination = ws.columns[0].id;
+                let source = ws.columns[1].id;
+                assert_ne!(destination, source);
+                ws.focus_column_index(0);
+                ws.consume_window_into_column();
+                assert_eq!(ws.columns[0].id, destination);
+                assert_eq!(ws.columns[1].tiles[0].id, C);
+                assert_eq!(ws.columns[1].id, source);
+                ws.expel_window_from_column();
+                let expelled = ws.columns[1].id;
+                assert_ne!(expelled, destination);
+                assert_ne!(expelled, source);
+                ws.focus_column_index(1);
+                ws.move_tile_across(DirH::Right); // prepend B to the retained C column
+                assert_eq!(ws.columns[1].tiles[0].id, B);
+                assert_eq!(ws.columns[1].id, source);
+                let col = ws.take_active_column().unwrap();
+                let mut other = Workspace::new();
+                other.insert_preserved_column(col);
+                assert_eq!(other.columns[0].id, source);
+                assert_eq!(ws.columns[0].id, destination);
+        }
+
+        #[test]
+        fn consuming_keeps_destination_focus_and_valid_source_selection() {
+                for source_active in [0, 1] {
+                        let mut ws = Workspace::new();
+                        ws.add_window(A);
+                        ws.add_window_to_column(D, 0, 1);
+                        ws.add_window(B);
+                        ws.add_window_to_column(C, 1, 1);
+                        ws.columns[0].display = tabbed::ColumnDisplay::Tabbed;
+                        ws.columns[1].display = tabbed::ColumnDisplay::Tabbed;
+                        ws.columns[1].active_tile_idx = source_active;
+                        ws.focus_column_index(0);
+                        assert_eq!(ws.focused_id(), Some(D));
+                        assert!(ws.consume_window_into_column());
+                        assert_eq!(ws.focused_id(), Some(D));
+                        assert_eq!(
+                                ws.columns[0].tiles.iter().map(|t| t.id).collect::<Vec<_>>(),
+                                vec![A, D, B]
+                        );
+                        assert_eq!(ws.columns[1].focused_id(), Some(C));
+                        assert_eq!(ws.columns[1].rendered_ids().collect::<Vec<_>>(), vec![C]);
+                }
         }
 
         #[test]
@@ -1706,6 +1755,44 @@ mod tests {
                         Some(SizeChange::ProportionDelta(-0.1))
                 );
                 assert_eq!(SizeChange::parse("junk"), None);
+        }
+
+        #[test]
+        fn proportional_width_adjustments_round_trip_with_gaps() {
+                let params = crate::layout::geometry::LayoutParams {
+                        gaps: 16.0,
+                        ..Default::default()
+                };
+                let mut ws = Workspace::new();
+                ws.add_window(A);
+                for width in [
+                        None,
+                        Some(ColumnWidth::Proportion(0.5)),
+                        Some(ColumnWidth::Fixed(476.0)),
+                ] {
+                        // (1000 - 16) * 0.5 - 16 = 476.
+                        ws.columns[0].width = width;
+                        assert!(ws.set_column_width(
+                                &SizeChange::ProportionDelta(0.1),
+                                &params,
+                                1000.0
+                        ));
+                        assert_eq!(ws.columns[0].width, Some(ColumnWidth::Proportion(0.6)));
+                        assert!(ws.set_column_width(
+                                &SizeChange::ProportionDelta(-0.1),
+                                &params,
+                                1000.0
+                        ));
+                        assert_eq!(ws.columns[0].width, Some(ColumnWidth::Proportion(0.5)));
+                        assert_eq!(
+                                crate::layout::geometry::resolve_width(
+                                        ws.columns[0].width,
+                                        &params,
+                                        1000.0
+                                ),
+                                476.0
+                        );
+                }
         }
 
         #[test]

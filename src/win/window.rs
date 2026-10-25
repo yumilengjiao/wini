@@ -10,7 +10,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetWindow, GetWindowLongW, GetWindowRect,
-        WS_CAPTION, WS_EX_TOOLWINDOW,
+        GetWindowThreadProcessId, IsIconic, WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW,
 };
 
 use super::api;
@@ -58,21 +59,32 @@ impl WindowInfo {
 /// - must not be a tool window / cloaked (UWP ghost) / system chrome,
 /// - must have a non-empty title (filters transient junk popups).
 pub fn is_manageable(hwnd: HWND) -> bool {
+        rejection_reason(hwnd).is_none()
+}
+
+/// Readiness is rechecked on SHOW, title/foreground changes and periodic
+/// discovery. Rejections are not permanent (title/frame may not exist yet).
+pub fn rejection_reason(hwnd: HWND) -> Option<&'static str> {
         unsafe {
-                if !api::is_visible(hwnd) {
-                        return false;
+                if !api::is_alive(hwnd) || !api::is_visible(hwnd) {
+                        return Some("not visible/alive");
+                }
+                if IsIconic(hwnd).as_bool() {
+                        return Some("minimized");
+                }
+                let mut pid = 0;
+                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                if pid == std::process::id() {
+                        return Some("manager-owned window");
                 }
                 // Reject windows that have an owner (dialogs, popups): we only
                 // manage independent top-level windows. Note GetWindow(GW_OWNER)
                 // returns Ok(null-HWND) for ownerless windows — reject only when
                 // the owner is a real, non-null window.
                 if GetWindow(hwnd, GW_OWNER).is_ok_and(|o| !o.0.is_null()) {
-                        return false;
+                        return Some("owned dialog/popup");
                 }
                 let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-                if ex & WS_EX_TOOLWINDOW.0 != 0 {
-                        return false;
-                }
                 // Cloaked windows (suspended UWP apps, virtual desktops): ignore.
                 let mut cloaked = 0u32;
                 if DwmGetWindowAttribute(
@@ -83,24 +95,40 @@ pub fn is_manageable(hwnd: HWND) -> bool {
                 )
                 .is_ok() && cloaked != 0
                 {
-                        return false;
+                        return Some("cloaked");
                 }
                 let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-                if style & WS_CAPTION.0 == 0 {
-                        // Only manage "normal" app windows with a title bar frame.
-                        // This keeps console borderless popups and splashes out of the
-                        // layout until a window-rule system exists.
-                        return false;
-                }
-                if api::window_title(hwnd).trim().is_empty() {
-                        return false;
-                }
-                let class = api::window_class(hwnd);
-                if IGNORED_CLASSES.contains(&class.to_lowercase().as_str()) {
-                        return false;
-                }
-                true
+                style_rejection(
+                        style,
+                        ex,
+                        &api::window_class(hwnd),
+                        &api::window_title(hwnd),
+                )
         }
+}
+
+fn style_rejection(
+        style: u32,
+        ex: u32,
+        class: &str,
+        title: &str,
+) -> Option<&'static str> {
+        if style & WS_CHILD.0 != 0 {
+                return Some("child control");
+        }
+        if ex & (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) != 0 {
+                return Some("tool/no-activate window");
+        }
+        if IGNORED_CLASSES.contains(&class.to_lowercase().as_str()) {
+                return Some("system chrome");
+        }
+        if style & WS_CAPTION.0 == 0 {
+                return Some("frame not ready or borderless popup");
+        }
+        if title.trim().is_empty() {
+                return Some("title not ready");
+        }
+        None
 }
 
 /// Snapshot a single window's properties.
@@ -122,14 +150,22 @@ pub fn snapshot(hwnd: HWND) -> WindowInfo {
 /// Enumerate all currently manageable top-level windows, in top-down
 /// Z order (topmost first).
 pub fn enumerate_manageable() -> Vec<WindowInfo> {
+        enumerate_top_level()
+                .into_iter()
+                .filter(|&hwnd| is_manageable(hwnd))
+                .map(snapshot)
+                .collect()
+}
+
+/// Cheap handle enumeration; callers can skip known windows BEFORE reading
+/// titles/styles/minimum sizes. Never unhide or activate a window here.
+pub fn enumerate_top_level() -> Vec<HWND> {
         extern "system" fn callback(
                 hwnd: HWND,
                 lparam: LPARAM,
         ) -> BOOL {
                 let list = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
-                if is_manageable(hwnd) {
-                        list.push(hwnd);
-                }
+                list.push(hwnd);
                 BOOL(1)
         }
         use windows::core::BOOL;
@@ -138,7 +174,62 @@ pub fn enumerate_manageable() -> Vec<WindowInfo> {
         unsafe {
                 let _ = EnumWindows(Some(callback), LPARAM(&mut hwnds as *mut _ as isize));
         }
-        hwnds.into_iter().map(snapshot).collect()
+        hwnds
+}
+
+#[cfg(test)]
+mod tests {
+        use super::*;
+
+        #[test]
+        fn zen_live_main_window_is_eligible_without_application_specific_exception() {
+                // Read-only probe of Zen's MozillaWindowClass: visible,
+                // ownerless, not minimized/cloaked, and these frame styles.
+                assert_eq!(
+                        style_rejection(0x16CF0000, 0x100, "MozillaWindowClass", "Zen"),
+                        None
+                );
+        }
+
+        #[test]
+        fn title_and_frame_readiness_can_be_retried_after_early_show() {
+                for class in [
+                        "MozillaWindowClass",
+                        "Chrome_WidgetWin_1",
+                        "ApplicationFrameWindow",
+                ] {
+                        assert_eq!(
+                                style_rejection(WS_CAPTION.0, 0, class, ""),
+                                Some("title not ready")
+                        );
+                        assert_eq!(
+                                style_rejection(0, 0, class, "Ready"),
+                                Some("frame not ready or borderless popup")
+                        );
+                        // No cached rejection: NAMECHANGE, foreground or the
+                        // next periodic discovery all use this same predicate.
+                        for _ in 0..3 {
+                                assert_eq!(style_rejection(WS_CAPTION.0, 0, class, "Ready"), None);
+                        }
+                }
+        }
+
+        #[test]
+        fn retry_does_not_relax_system_popup_and_child_filters() {
+                assert!(style_rejection(WS_CAPTION.0, 0, "Shell_TrayWnd", "taskbar").is_some());
+                assert!(style_rejection(WS_CAPTION.0 | WS_CHILD.0, 0, "Edit", "text").is_some());
+                assert!(style_rejection(
+                        WS_CAPTION.0,
+                        WS_EX_TOOLWINDOW.0,
+                        "MozillaDropShadowWindowClass",
+                        "shadow"
+                )
+                .is_some());
+                assert!(
+                        style_rejection(WS_CAPTION.0, WS_EX_NOACTIVATE.0, "overlay", "title")
+                                .is_some()
+                );
+        }
 }
 
 /// Registry of tracked windows, keyed by HWND value.

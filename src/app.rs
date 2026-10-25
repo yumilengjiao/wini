@@ -47,8 +47,12 @@ impl From<String> for AppError {
 }
 
 mod floating;
+mod focus;
+mod layering;
 mod tabs;
+mod tracking;
 mod window_mode;
+mod workspaces;
 use floating::{FloatState, FloatingFocus};
 
 mod overview;
@@ -78,8 +82,11 @@ struct AppState {
         config: Config,
         /// Mtime of the config file as last loaded (hot reload polling).
         config_mtime: Option<std::time::SystemTime>,
-        /// The window the OS currently considers foreground.
+        /// Internal selection; intentionally independent of OS foreground
+        /// while overview covers the source windows.
         focused: Option<HWND>,
+        /// Retain the selected output on empty workspaces.
+        focused_device: Option<String>,
         /// While the user drags/resizes this window, tiling is paused so we
         /// don't fight the user's mouse.
         interacting_window: Option<HWND>,
@@ -143,20 +150,9 @@ impl AppState {
                 match event {
                         WinEvent::Shown(hwnd)
                         | WinEvent::Uncloaked(hwnd)
-                        | WinEvent::MinimizeEnded(hwnd) => {
-                                if !self.windows.contains(hwnd)
-                                        && crate::win::window::is_manageable(hwnd)
-                                {
-                                        let info = crate::win::window::snapshot(hwnd);
-                                        log::info!(
-                                                "window opened: [{}] \"{}\" ({})",
-                                                info.exe,
-                                                info.title,
-                                                info.class
-                                        );
-                                        self.windows.insert(info.clone());
-                                        self.original_rects.insert(hwnd.0 as isize, info.rect);
-                                        self.layout_add_window(&info);
+                        | WinEvent::MinimizeEnded(hwnd)
+                        | WinEvent::NameChanged(hwnd) => {
+                                if self.try_adopt_window(hwnd) {
                                         self.reflow();
                                 }
                         },
@@ -257,6 +253,34 @@ impl AppState {
                         },
                         WinEvent::Foreground(hwnd) => {
                                 log::debug!("foreground event -> {hwnd:?}");
+                                let id = hwnd.0 as isize;
+                                let current = unsafe {
+                                        windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow(
+                                        )
+                                };
+                                if hwnd == current && self.try_adopt_window(hwnd) {
+                                        self.reflow();
+                                }
+                                if !focus::accept_foreground(
+                                        &self.layout,
+                                        &self.floating,
+                                        &self.overviews,
+                                        &self.hidden_by_us,
+                                        id,
+                                        current.0 as isize,
+                                ) {
+                                        log::debug!(
+                                                "foreground {id}: keeping selection (current={current:?})"
+                                        );
+                                        self.raise_overview_hosts();
+                                        placement::raise_bars(&self.monitors);
+                                        return;
+                                }
+                                if let Some(device) =
+                                        focus::window_device(&self.layout, &self.floating, id)
+                                {
+                                        self.focused_device = Some(device.to_owned());
+                                }
                                 if self.focused != Some(hwnd) {
                                         self.focused = Some(hwnd);
                                         let id = hwnd.0 as isize;
@@ -272,11 +296,17 @@ impl AppState {
                                                 self.update_focus_border();
                                         }
                                 }
-                                // The newly-foreground window raises itself while
-                                // processing WM_ACTIVATE (after our sync raises):
-                                // re-raise the overview backdrops (they must cover
-                                // the real windows) and the bars (yasb/zebar) on top
-                                // of everything (niri: layer-shell top).
+                                // Apps can raise themselves later while processing
+                                // WM_ACTIVATE. Repair tiled motion even when this
+                                // event confirms the focus we already recorded.
+                                if let Some(device) = self.layout.monitors.iter().find_map(|ml| {
+                                        ml.workspace_of(id).map(|_| ml.device.as_str())
+                                }) {
+                                        let moving =
+                                                self.transport.raised_windows(&self.layout, device);
+                                        self.raise_tiled_motion(&moving);
+                                }
+                                // Keep the overview hosts and bars over real windows.
                                 self.raise_overview_hosts();
                                 placement::raise_bars(&self.monitors);
                         },
@@ -471,6 +501,7 @@ impl AppState {
                 if self.interacting_window.is_some() || self.suspended {
                         return;
                 }
+                self.maintain_workspace_tails();
                 self.sync_fullscreen_decorations();
                 // Keep layout springs alive across overview entry. Only the
                 // workspace camera is replaced by the overview's own camera.
@@ -593,6 +624,8 @@ impl AppState {
                         "overview[{device}]: opening ({} workspaces)",
                         ov.finals.len()
                 );
+                self.focused = self.layout.focused_id(device).map(|id| HWND(id as *mut _));
+                self.focused_device = Some(device.to_owned());
                 self.overviews.insert(device.to_string(), ov);
                 self.overview_hosts.insert(device.to_string(), host);
                 self.refresh_overview(device);
@@ -659,27 +692,16 @@ impl AppState {
                 device: &str,
                 down: bool,
         ) {
-                let Some(ov) = self.overviews.get_mut(device) else {
-                        return;
-                };
                 let Some(ml) = self.layout.monitor(device) else {
                         return;
                 };
-                let max = ml.workspaces.len().saturating_sub(1) as f64;
-                let cur = ov.camera.target();
+                let cur = ml.active_workspace_idx;
                 let to = if down {
-                        (cur + 1.0).min(max)
+                        (cur + 1).min(ml.workspaces.len().saturating_sub(1))
                 } else {
-                        (cur - 1.0).max(0.0)
+                        cur.saturating_sub(1)
                 };
-                if (to - cur).abs() > f64::EPSILON {
-                        // A wheel event may arrive between prepare and reveal.
-                        // Keep the cover until a new final frame is prepared.
-                        ov.handoff_ready = false;
-                        let switch = self.config.animations.workspace_switch_params();
-                        ov.camera.retarget(to, switch);
-                        ov.sync_from_progress = None;
-                }
+                self.overview_activate(device, to, false);
         }
 
         /// Focus a workspace without leaving overview. Numbered shortcuts
@@ -696,14 +718,18 @@ impl AppState {
                 ) else {
                         return;
                 };
-                let new_focus = ov.activate_workspace(
-                        ml,
-                        idx,
-                        create,
-                        self.config.animations.workspace_switch_params(),
-                );
+                let anim = if ov.opening() {
+                        self.config.animations.workspace_switch_params()
+                } else {
+                        self.config.animations.overview_open_close_params()
+                };
+                let new_focus = ov.activate_workspace(ml, idx, create, anim);
                 // Internal focus follows; OS foreground remains under cover.
                 self.focused = new_focus.map(|id| HWND(id as *mut _));
+                self.focused_device = Some(device.to_owned());
+                if let Some(id) = new_focus {
+                        self.update_focus_view(id);
+                }
                 self.refresh_overview(device);
                 self.update_focus_border();
         }
@@ -776,12 +802,7 @@ impl AppState {
                         if !inside {
                                 return None;
                         }
-                        ov.current_rects()
-                                .into_iter()
-                                .find(|r| {
-                                        sx >= r.x && sx < r.x + r.w && sy >= r.y && sy < r.y + r.h
-                                })
-                                .map(|r| (d.clone(), r))
+                        ov.hit_test(sx, sy).map(|r| (d.clone(), r))
                 }) else {
                         return;
                 };
@@ -801,12 +822,11 @@ impl AppState {
                 // The transport retains the pre-click view and animates to
                 // the newly focused column, including while the zoom closes.
                 if let Some(ml) = self.layout.monitor_mut(&device) {
-                        ml.active_workspace_idx = ws_idx;
-                }
-                if let Some(ml) = self.layout.monitor_mut(&device) {
+                        ml.switch_workspace(ws_idx);
                         ml.active_workspace_mut().focus_window(id);
                 }
                 self.focused = Some(hwnd);
+                self.focused_device = Some(device.clone());
                 self.update_focus_view(id);
                 self.refresh_overview(&device);
                 self.close_overview_to(&device, Some(ws_idx));
@@ -873,6 +893,14 @@ impl AppState {
                 let Some(ov) = self.overviews.get_mut(device) else {
                         return;
                 };
+                if let Some(ml) = self.layout.monitor(device) {
+                        let anim = if ov.opening() {
+                                self.config.animations.workspace_switch_params()
+                        } else {
+                                self.config.animations.overview_open_close_params()
+                        };
+                        ov.follow_workspace(ml.active_workspace_idx, anim);
+                }
                 ov.handoff_ready = false;
                 ov.finals = finals;
                 // Real windows stay at their settled geometry, shown so DWM
@@ -1122,23 +1150,6 @@ impl AppState {
                 }
         }
 
-        /// niri dynamic-workspace cleanup: drop empty non-active workspaces
-        /// and keep one trailing empty. Skipped while a workspace switch is
-        /// still animating or an overview owns the monitor (both hold
-        /// workspace indices that reindexing would invalidate); the next
-        /// removal cleans up instead.
-        fn reclaim_workspaces(
-                &mut self,
-                device: &str,
-        ) {
-                if self.transport.switching(device) || self.overviews.contains_key(device) {
-                        return;
-                }
-                if let Some(ml) = self.layout.monitor_mut(device) {
-                        ml.normalize_workspaces();
-                }
-        }
-
         /// Handle a monitor-directional action. `kind`: 0 = focus-monitor,
         /// 1 = move-column-to-monitor, 2 = move-window-to-monitor.
         fn dispatch_monitor(
@@ -1186,6 +1197,7 @@ impl AppState {
                         self.reclaim_workspaces(device);
                 }
                 self.focused = new_focus.map(|id| HWND(id as *mut _));
+                self.focused_device = Some(target_device.clone());
                 if let Some(id) = new_focus {
                         self.update_focus_view(id);
                 }
@@ -1215,33 +1227,14 @@ impl AppState {
                         self.begin_screen_transition();
                         return;
                 }
-                // Resolve the device for this action: the monitor holding the
-                // focused window. When nothing is focused (e.g. we're on an
-                // empty workspace), fall back to the monitor under the cursor
-                // — workspace switches, spawn and quit must keep working on
-                // an empty workspace (niri semantics: you can always switch
-                // away from an empty one).
-                let focused_id = self.focused.map(|h| h.0 as isize).or_else(|| {
-                        let cursor_mon = monitor::monitor_at_cursor(&self.monitors)?;
-                        self.layout
-                                .monitor(&cursor_mon.device)
-                                .and_then(|m| m.active_workspace().focused_id())
-                });
-
-                let device = focused_id
-                        .and_then(|id| {
-                                self.layout
-                                        .monitors
-                                        .iter()
-                                        .find_map(|m| m.workspace_of(id).map(|_| m.device.clone()))
-                                        .or_else(|| {
-                                                self.floating.get(&id).map(|fs| fs.device.clone())
-                                        })
-                        })
-                        .or_else(|| {
-                                monitor::monitor_at_cursor(&self.monitors).map(|m| m.device.clone())
-                        });
-                let Some(device) = device else { return };
+                let Some(device) = self.focus_device() else {
+                        return;
+                };
+                self.focused_device = Some(device.clone());
+                let focused_id = self
+                        .focused
+                        .map(|h| h.0 as isize)
+                        .or_else(|| self.layout.focused_id(&device));
 
                 if matches!(action, SwitchFocusBetweenFloatingAndTiling) {
                         let Some(ml) = self.layout.monitor(&device) else {
@@ -1818,7 +1811,9 @@ impl AppState {
                                 let _ = ws_prev;
                                 self.reflow();
                         } else {
-                                if let Some(id) = focused_id
+                                let new_id = self.layout.focused_id(&device);
+                                self.focused = new_id.map(|id| HWND(id as *mut _));
+                                if let Some(id) = new_id
                                         && !skip_view_refresh
                                 {
                                         self.update_focus_view(id);
@@ -1892,12 +1887,10 @@ impl AppState {
                         fb.hide();
                         return;
                 }
-                // The focused window: OS foreground, else the layout focus of
-                // the monitor under the cursor.
+                // Use the same selected output as keyboard dispatch, including
+                // empty workspaces; the cursor must not move the ring elsewhere.
                 let candidate = self.focused.or_else(|| {
-                        let device = monitor::monitor_at_cursor(&self.monitors)
-                                .map(|m| m.device.clone())
-                                .or_else(|| self.monitors.first().map(|m| m.device.clone()))?;
+                        let device = self.focus_device()?;
                         let id = self.layout.focused_id(&device)?;
                         Some(HWND(id as *mut _))
                 });
@@ -1906,6 +1899,13 @@ impl AppState {
                         return;
                 };
                 let id = hwnd.0 as isize;
+                let mon = focus::window_device(&self.layout, &self.floating, id)
+                        .and_then(|d| self.monitors.iter().find(|m| m.device == d))
+                        .or_else(|| monitor::monitor_of_window(hwnd, &self.monitors));
+                let Some(mon) = mon else {
+                        fb.hide();
+                        return;
+                };
                 // Use the exact visible destination submitted to DWM, not a
                 // new spring sample a few milliseconds ahead of the thumbnail.
                 if let Some((x, y, w, h)) = self
@@ -1923,6 +1923,7 @@ impl AppState {
                                 ring.width,
                                 ring.radius,
                                 windows::Win32::Foundation::COLORREF(bgr),
+                                mon.work,
                         );
                         return;
                 }
@@ -1972,6 +1973,7 @@ impl AppState {
                                 ring.width,
                                 ring.radius,
                                 windows::Win32::Foundation::COLORREF(bgr),
+                                mon.work,
                         );
                 } else {
                         fb.hide();
@@ -2353,22 +2355,7 @@ impl AppState {
         /// After a layout-driven focus change, tell the OS: raise the
         /// focused window.
         fn sync_focus_to_os(&mut self) {
-                let Some(device) = self
-                        .focused
-                        .and_then(|h| {
-                                let id = h.0 as isize;
-                                self.layout
-                                        .monitors
-                                        .iter()
-                                        .find_map(|m| m.workspace_of(id).map(|_| m.device.clone()))
-                                        .or_else(|| {
-                                                self.floating.get(&id).map(|fs| fs.device.clone())
-                                        })
-                        })
-                        .or_else(|| {
-                                monitor::monitor_at_cursor(&self.monitors).map(|m| m.device.clone())
-                        })
-                else {
+                let Some(device) = self.focus_device() else {
                         return;
                 };
                 let float = self.focused.map(|h| h.0 as isize).filter(|id| {
@@ -2395,16 +2382,16 @@ impl AppState {
                         return;
                 }
                 let hwnd = windows::Win32::Foundation::HWND(focused_id as *mut _);
+                self.focused = Some(hwnd);
                 let ok = crate::win::api::force_set_foreground(hwnd);
                 log::debug!("sync_focus_to_os: force_set_foreground({focused_id}) -> {ok}");
-                // SetForegroundWindow/BringWindowToTop put the window above
-                // the desktop bar (yasb/zebar) and above an open overview's
-                // backdrop; bring both back up (niri: the layer-shell bar
-                // renders above tiled windows; the overview covers them).
-                if ok {
-                        self.raise_overview_hosts();
-                        placement::raise_bars(&self.monitors);
-                }
+                // BringWindowToTop may change the order even if activation
+                // fails. Repair it unconditionally, including instant motion's
+                // last submitted frame, without changing keyboard focus again.
+                let moving = self.transport.take_focus_raises(&self.layout, &device);
+                self.raise_tiled_motion(&moving);
+                self.raise_overview_hosts();
+                placement::raise_bars(&self.monitors);
         }
 
         /// Retarget the transport springs from the current layout and push
@@ -2414,6 +2401,7 @@ impl AppState {
                 if self.interacting_window.is_some() || self.suspended {
                         return;
                 }
+                self.maintain_workspace_tails();
                 // Sizing modes can change through tab/column moves as well
                 // as explicit fullscreen actions. Reconcile saved styles before
                 // measuring the geometry for this frame.
@@ -2531,6 +2519,7 @@ impl AppState {
                         .filter(|r| !self.shown.contains(&r.id))
                         .collect();
                 placement::apply_geometry_sync(&appearing);
+                self.raise_tiled_motion_before_show(&frame.raise, &frame.show);
                 for &id in &frame.show {
                         if self.shown.insert(id) {
                                 self.hidden_by_us.remove(&id);
@@ -2541,6 +2530,7 @@ impl AppState {
                         }
                 }
                 placement::apply_geometry(&moves);
+                self.raise_tiled_motion(&frame.raise);
 
                 // Fullscreen windows must cover their tile siblings, and the
                 // bars stay above them (niri: layer-shell top).
@@ -2551,6 +2541,8 @@ impl AppState {
                                         placement::raise(hwnd);
                                 }
                         }
+                }
+                if !fs_ids.is_empty() || !frame.raise.is_empty() {
                         placement::raise_bars(&self.monitors);
                 }
         }
@@ -2575,6 +2567,7 @@ impl AppState {
                         self.was_animating = anim;
                 }
                 self.tick_overviews();
+                self.compact_idle_workspaces();
                 self.update_tab_indicators();
                 // The ring follows the focused window's live rect, so it must
                 // move with every animation frame.
@@ -2719,7 +2712,9 @@ impl AppState {
                                 self.overview_hosts.remove(&device);
                                 self.sync_overview_regions();
                                 self.reflow();
-                                self.sync_focus_to_os();
+                                if self.focus_device().as_deref() == Some(device.as_str()) {
+                                        self.sync_focus_to_os();
+                                }
                                 log::debug!("overview[{device}]: revealed prepared frame");
                                 continue;
                         }
@@ -2760,7 +2755,10 @@ impl AppState {
                         }
                         // Restore OS focus under the cover, so activation repaint
                         // is not first triggered after the thumbnails disappear.
-                        if let Some(id) = self.layout.focused_id(&device) {
+                        if self.focus_device().as_deref() == Some(device.as_str())
+                                && let Some(id) = self.layout.focused_id(&device)
+                        {
+                                self.focused = Some(HWND(id as *mut _));
                                 crate::win::api::force_set_foreground(HWND(id as *mut _));
                         }
                         if let Some(ov) = self.overviews.get_mut(&device) {
@@ -2838,6 +2836,7 @@ impl App {
                         config: cfg,
                         config_mtime,
                         focused: None,
+                        focused_device: None,
                         interacting_window: None,
                         suspended: false,
                         interact_start_rect: None,
@@ -2937,7 +2936,9 @@ impl App {
                         });
                         let cfg_state = Rc::clone(&state);
                         msg_window.start_timer(TIMER_CONFIG, CONFIG_TIMER_MS, move || {
-                                cfg_state.borrow_mut().maybe_reload_config();
+                                let mut s = cfg_state.borrow_mut();
+                                s.maybe_reload_config();
+                                s.reconcile_new_windows();
                         });
                 }
                 // Display hotplug: WM_DISPLAYCHANGE arrives on the (top-level)

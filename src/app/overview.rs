@@ -77,21 +77,67 @@ impl Overview {
                 self.rects_at(self.zoom(), self.render_cam())
         }
 
+        /// Scene rectangles are bottom-to-top. During stack/tab transitions
+        /// siblings overlap; clicking must select the visible top surface.
+        pub(super) fn hit_test(
+                &self,
+                x: i32,
+                y: i32,
+        ) -> Option<TileRect> {
+                self.current_rects()
+                        .into_iter()
+                        .rev()
+                        .find(|r| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
+        }
+
+        /// Bake the close correction into camera coordinates before changing
+        /// its target (or reopening). Keeping the old zoom basis with a new
+        /// target jumps by (new_target - old_target) * (1 - scale).
+        fn rendered_camera_motion(&self) -> (f64, f64) {
+                let cam = self.camera.value();
+                let velocity = self.camera.velocity();
+                let Some(from) = self.sync_from_progress else {
+                        return (cam, velocity);
+                };
+                let zoom = self.zoom();
+                let from_zoom = (1.0 - from * (1.0 - self.zoom_target)).max(0.0001);
+                let scale = from_zoom / zoom;
+                let to = self.camera.target();
+                let raw_zoom = 1.0 - self.progress.value() * (1.0 - self.zoom_target);
+                let zoom_velocity = if raw_zoom > self.zoom_target && raw_zoom < 1.0 {
+                        -(1.0 - self.zoom_target) * self.progress.velocity()
+                } else {
+                        0.0
+                };
+                (
+                        to + (cam - to) * scale,
+                        scale * (velocity - (cam - to) * zoom_velocity / zoom),
+                )
+        }
+
         pub(super) fn close_to(
                 &mut self,
                 target: f64,
                 anim: AnimParams,
         ) {
+                if !self.opening() && self.camera.target() == target {
+                        return;
+                }
+                let (cam, velocity) = self.rendered_camera_motion();
+                let progress = self.progress.value();
                 self.handoff_ready = false;
                 self.progress.retarget(0.0, anim);
-                self.camera.retarget(target, anim);
-                self.sync_from_progress = Some(self.progress.from());
+                self.camera.retarget_from(cam, velocity, target, anim);
+                self.sync_from_progress = Some(progress);
         }
 
         pub(super) fn reopen(
                 &mut self,
                 anim: AnimParams,
         ) {
+                let (cam, velocity) = self.rendered_camera_motion();
+                self.camera
+                        .retarget_from(cam, velocity, self.camera.target(), anim);
                 self.handoff_ready = false;
                 self.progress.retarget(1.0, anim);
                 self.sync_from_progress = None;
@@ -113,9 +159,34 @@ impl Overview {
                 };
                 layout.switch_workspace(idx);
                 self.handoff_ready = false;
-                self.camera.retarget(idx as f64, anim);
-                self.sync_from_progress = None;
+                if self.opening() {
+                        self.camera.retarget(idx as f64, anim);
+                        self.sync_from_progress = None;
+                } else {
+                        // Navigation can interrupt the last prepare/reveal turn.
+                        // Keep the close camera synchronized with zoom, rather
+                        // than revealing one workspace with another selected.
+                        self.close_to(idx as f64, anim);
+                }
                 layout.active_workspace().focused_id()
+        }
+
+        /// Structural moves and tab clicks also change the active workspace.
+        pub(super) fn follow_workspace(
+                &mut self,
+                idx: usize,
+                anim: AnimParams,
+        ) {
+                if (self.camera.target() - idx as f64).abs() < f64::EPSILON {
+                        return;
+                }
+                self.handoff_ready = false;
+                if self.opening() {
+                        self.camera.retarget(idx as f64, anim);
+                        self.sync_from_progress = None;
+                } else {
+                        self.close_to(idx as f64, anim);
+                }
         }
 
         pub(super) fn settled(&self) -> bool {
@@ -212,6 +283,43 @@ mod tests {
         }
 
         #[test]
+        fn navigation_during_close_keeps_camera_zoom_and_selection_together() {
+                let mut layout = MonitorLayout::new("D".into());
+                layout.add_window(1);
+                layout.add_window_to_workspace(2, 1);
+                let mut ov = overview();
+                for idx in [1, 0, 1, 2, 0] {
+                        ov.close_to(layout.active_workspace_idx as f64, instant());
+                        ov.handoff_ready = true;
+                        let focus = ov.activate_workspace(&mut layout, idx, true, instant());
+                        assert_eq!(ov.camera.target(), layout.active_workspace_idx as f64);
+                        assert_eq!(focus, layout.active_workspace().focused_id());
+                        assert!(!ov.opening());
+                        assert!(!ov.handoff_ready);
+                        assert!(ov.sync_from_progress.is_some());
+                        ov.reopen(instant());
+                }
+        }
+
+        #[test]
+        fn moving_window_during_close_retargets_reveal_to_its_new_workspace() {
+                let mut layout = MonitorLayout::new("D".into());
+                layout.add_window(1);
+                let mut ov = overview();
+                for idx in [1, 0, 2, 0] {
+                        ov.close_to(layout.active_workspace_idx as f64, instant());
+                        ov.handoff_ready = true;
+                        layout.move_focused_window_to_workspace(idx, true);
+                        ov.follow_workspace(layout.active_workspace_idx, instant());
+                        assert_eq!(layout.active_workspace().focused_id(), Some(1));
+                        assert_eq!(ov.camera.target(), idx as f64);
+                        assert!(!ov.handoff_ready);
+                        assert!(!ov.opening());
+                        assert!(ov.sync_from_progress.is_some());
+                }
+        }
+
+        #[test]
         fn closing_retargets_and_invalidates_prepared_frame() {
                 let mut ov = overview();
                 ov.handoff_ready = true;
@@ -238,6 +346,86 @@ mod tests {
                 ov.close_to(1.0, instant());
                 assert_eq!(ov.camera.target(), 1.0);
                 assert!(!ov.handoff_ready);
+        }
+
+        #[test]
+        fn overlap_hit_testing_selects_top_surface_during_display_transition() {
+                let mut ov = overview();
+                ov.finals = vec![(
+                        0,
+                        vec![tile(2, 100, 60, 400, 700), tile(1, 100, 60, 400, 700)],
+                )];
+                assert_eq!(ov.hit_test(400, 300).map(|r| r.id), Some(1));
+                ov.close_to(0.0, instant());
+                assert_eq!(ov.hit_test(200, 100).map(|r| r.id), Some(1));
+                assert!(ov.hit_test(999, 799).is_none());
+        }
+
+        #[test]
+        fn workspace_navigation_at_close_tail_does_not_jump() {
+                let slow = AnimParams {
+                        kind: AnimKind::Easing {
+                                duration: Duration::from_secs(60),
+                                curve: Curve::Linear,
+                        },
+                        slowdown: 1.0,
+                };
+                for elapsed in [30, 59, 60] {
+                        let mut ov = overview();
+                        ov.close_to(0.0, slow);
+                        ov.progress.advance_for_test(Duration::from_secs(elapsed));
+                        ov.camera.advance_for_test(Duration::from_secs(elapsed));
+                        // Include the final prepared frame before its host is removed.
+                        ov.handoff_ready = elapsed == 60;
+                        let before = ov.current_rects();
+                        ov.close_to(1.0, slow);
+                        let after = ov.current_rects();
+                        for (a, b) in before.iter().zip(&after) {
+                                assert!(
+                                        (a.y - b.y).abs() <= 1,
+                                        "close tail {elapsed}s: {a:?} -> {b:?}"
+                                );
+                        }
+                        assert!(!ov.handoff_ready);
+                        assert_eq!(ov.camera.target(), 1.0);
+                }
+        }
+
+        #[test]
+        fn retargeting_and_reopening_a_moving_close_preserves_rendered_camera() {
+                for kind in [
+                        AnimKind::Spring(crate::anim::SpringParams::niri_default()),
+                        AnimKind::Easing {
+                                duration: Duration::from_secs(1),
+                                curve: Curve::Linear,
+                        },
+                ] {
+                        let params = AnimParams {
+                                kind,
+                                slowdown: 100.0,
+                        };
+                        let mut ov = overview();
+                        ov.close_to(1.0, params);
+                        for target in [0.0, 2.0, 1.0] {
+                                ov.progress.advance_for_test(Duration::from_secs(8));
+                                ov.camera.advance_for_test(Duration::from_secs(8));
+                                let before = ov.current_rects();
+                                ov.close_to(target, params);
+                                let after = ov.current_rects();
+                                for (a, b) in before.iter().zip(&after) {
+                                        assert!((a.y - b.y).abs() <= 1, "retarget: {a:?} -> {b:?}");
+                                }
+                        }
+                        ov.progress.advance_for_test(Duration::from_secs(8));
+                        ov.camera.advance_for_test(Duration::from_secs(8));
+                        let before = ov.current_rects();
+                        ov.reopen(params);
+                        let after = ov.current_rects();
+                        for (a, b) in before.iter().zip(&after) {
+                                assert!((a.y - b.y).abs() <= 1, "reopen: {a:?} -> {b:?}");
+                        }
+                        assert!(ov.sync_from_progress.is_none());
+                }
         }
 
         #[test]

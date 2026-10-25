@@ -18,10 +18,10 @@
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-        EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW,
-        EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-        EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
-        OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+        EVENT_OBJECT_CLOAKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_NAMECHANGE,
+        EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
+        EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+        EVENT_SYSTEM_MOVESIZESTART, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
 };
 
 /// A decoded, pre-filtered lifecycle event for one window.
@@ -29,6 +29,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub enum WinEvent {
         /// A window appeared / became visible.
         Shown(HWND),
+        /// A late title is often the first sign that a browser main window
+        /// has finished replacing its startup placeholder.
+        NameChanged(HWND),
         /// A window disappeared / lost visibility.
         Hidden(HWND),
         /// The window handle was destroyed.
@@ -72,6 +75,7 @@ impl EventHooks {
                 // amount of delivered events low.
                 for (min, max) in [
                         (EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY),
+                        (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
                         (EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE),
                         (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
                         (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
@@ -147,6 +151,24 @@ unsafe extern "system" fn win_event_proc(
         }
 }
 
+#[cfg(test)]
+mod tests {
+        use super::*;
+        #[test]
+        fn title_change_is_a_discovery_event_without_becoming_foreground() {
+                let hwnd = HWND(1 as *mut _);
+                assert_eq!(
+                        decode(EVENT_OBJECT_NAMECHANGE, hwnd),
+                        Some(WinEvent::NameChanged(hwnd))
+                );
+                assert_eq!(
+                        decode(EVENT_SYSTEM_FOREGROUND, hwnd),
+                        Some(WinEvent::Foreground(hwnd))
+                );
+                assert_eq!(decode(0, hwnd), None);
+        }
+}
+
 fn decode(
         event: u32,
         hwnd: HWND,
@@ -154,6 +176,7 @@ fn decode(
         use windows::Win32::UI::WindowsAndMessaging as m;
         let ev = match event {
                 m::EVENT_OBJECT_SHOW => WinEvent::Shown(hwnd),
+                m::EVENT_OBJECT_NAMECHANGE => WinEvent::NameChanged(hwnd),
                 m::EVENT_OBJECT_HIDE => WinEvent::Hidden(hwnd),
                 m::EVENT_OBJECT_DESTROY => WinEvent::Destroyed(hwnd),
                 m::EVENT_OBJECT_CLOAKED => WinEvent::Cloaked(hwnd),
